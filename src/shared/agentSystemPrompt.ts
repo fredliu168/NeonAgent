@@ -8,6 +8,7 @@ export function buildAgentSystemPrompt(context?: {
   memories?: string;
   skills?: string;
   scheduledTasks?: string;
+  scriptSkills?: string;
 }): string {
   const sections: string[] = [];
 
@@ -37,6 +38,18 @@ export function buildAgentSystemPrompt(context?: {
 - 技能适合保存的场景：重复性操作、固定流程的自动化、特定网站的标准操作等。
 - 使用 list_skills 搜索技能，使用 delete_skill 清理不再需要的技能。
 - 用户也可以通过界面手动编辑技能的名称、描述、步骤和标签，或导入/导出技能 JSON 文件进行分享。`);
+
+  sections.push(`# 脚本技能系统
+- 脚本技能是通过 JavaScript 代码实现的高级技能，可以调用外部 API、处理复杂数据等。
+- 脚本技能会注册额外的工具，你可以像使用内置工具一样直接调用它们。
+- 使用 install_script_skill 安装新的脚本技能，需要提供名称、描述、JS 代码和工具定义。
+- 代码格式为 CommonJS 风格：exports.tool_name = async function(args, env) { ... }
+- 脚本中可用的全局对象：fetch、console、JSON、Math、Date、URL 等。
+- 脚本可以通过 env 参数访问配置的环境变量（如 API 密钥）。
+- 使用 list_script_skills 查看已安装的脚本技能。
+- 使用 update_script_skill 更新脚本技能的代码或环境变量。
+- 使用 uninstall_script_skill 卸载不需要的脚本技能。
+- 脚本技能可以从 ClawHub 等技能市场获取，也可以用户自行编写。`);
 
   sections.push(`# 定时任务
 - 你可以创建定时任务，让智能体在指定时间自动执行指令。
@@ -73,6 +86,10 @@ export function buildAgentSystemPrompt(context?: {
 
   if (context?.scheduledTasks) {
     sections.push(context.scheduledTasks);
+  }
+
+  if (context?.scriptSkills) {
+    sections.push(context.scriptSkills);
   }
 
   if (context?.pageUrl || context?.pageTitle) {

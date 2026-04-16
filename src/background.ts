@@ -21,6 +21,12 @@ import {
   deleteScheduledTask, getScheduledTask, recordTaskRun,
   getAllScheduledTasks, computeAlarmParams, getAlarmName, parseAlarmName
 } from "./shared/agentScheduler.js";
+import {
+  getAllScriptSkills, createScriptSkill, updateScriptSkill,
+  deleteScriptSkill, listScriptSkills, findScriptSkillByToolName,
+  recordScriptSkillUsage
+} from "./shared/agentScriptSkill.js";
+import type { ScriptSkillToolDef } from "./shared/agentScriptSkill.js";
 
 interface BackgroundDependencies {
   invokeLLM?: typeof requestChatCompletion;
@@ -28,6 +34,45 @@ interface BackgroundDependencies {
   emitStreamEvent?: (event: RuntimeStreamEvent) => void | Promise<void>;
   emitAgentEvent?: (event: AgentProgressEvent) => void | Promise<void>;
   sendTabMessage?: (tabId: number, message: unknown) => Promise<unknown>;
+  /** Override sandbox execution for testing (bypasses offscreen document) */
+  executeInSandbox?: (code: string, toolName: string, args: Record<string, unknown>, envVars: Record<string, string>) => Promise<string>;
+}
+
+// ── Offscreen / Sandbox helpers ──
+
+async function ensureOffscreenDocument(): Promise<void> {
+  if (typeof chrome === "undefined" || !chrome.offscreen) return;
+  try {
+    await (chrome.offscreen as any).createDocument({
+      url: "offscreen.html",
+      reasons: ["IFRAME_SCRIPTING"],
+      justification: "Sandboxed script skill execution"
+    });
+  } catch {
+    // Already exists — ignore
+  }
+}
+
+async function executeScriptInSandbox(
+  code: string,
+  toolName: string,
+  args: Record<string, unknown>,
+  envVars: Record<string, string>
+): Promise<string> {
+  await ensureOffscreenDocument();
+  const execId = `exec-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const response = await chrome.runtime.sendMessage({
+    type: "SANDBOX_EXECUTE",
+    execId,
+    code,
+    toolName,
+    args,
+    envVars
+  }) as { ok: boolean; result?: string; error?: string };
+  if (!response?.ok) {
+    throw new Error(response?.error ?? "Sandbox execution failed");
+  }
+  return response.result ?? "";
 }
 
 export function createBackgroundMessageHandler(storage: StorageLike, deps: BackgroundDependencies = {}) {
@@ -36,6 +81,7 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
   const agentRepo = new AgentHistoryRepository(storage);
   const invokeLLM = deps.invokeLLM ?? requestChatCompletion;
   const invokeLLMStream = deps.invokeLLMStream ?? requestChatCompletionStream;
+  const runInSandbox = deps.executeInSandbox ?? executeScriptInSandbox;
   const activeStreamControllers = new Map<string, AbortController>();
   const emitStreamEvent =
     deps.emitStreamEvent ??
@@ -243,6 +289,125 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
           sendResponse({ ok: true, data: result });
         } catch (error) {
           sendResponse({ ok: false, errors: [error instanceof Error ? error.message : "Failed to import skills"] });
+        }
+        return;
+      }
+
+      // ── Script Skill UI Message Handlers ──
+
+      if (message.type === "LIST_SCRIPT_SKILLS") {
+        try {
+          const skills = await getAllScriptSkills(storage);
+          const summaries = skills.map((s) => ({
+            id: s.id,
+            name: s.name,
+            description: s.description,
+            tools: s.tools.map((t) => t.name),
+            envVars: Object.keys(s.envVars),
+            sourceUrl: s.sourceUrl,
+            version: s.version,
+            usageCount: s.usageCount,
+            tags: s.tags
+          }));
+          sendResponse({ ok: true, data: summaries });
+        } catch (error) {
+          sendResponse({ ok: false, errors: [error instanceof Error ? error.message : "Failed to list script skills"] });
+        }
+        return;
+      }
+
+      if (message.type === "GET_SCRIPT_SKILL") {
+        const payload = message.payload as { skillId?: string } | undefined;
+        if (!payload?.skillId) {
+          sendResponse({ ok: false, errors: ["skillId is required"] });
+          return;
+        }
+        try {
+          const { getScriptSkillById } = await import("./shared/agentScriptSkill.js");
+          const skill = await getScriptSkillById(storage, payload.skillId);
+          if (!skill) {
+            sendResponse({ ok: false, errors: ["Script skill not found"] });
+          } else {
+            sendResponse({ ok: true, data: skill });
+          }
+        } catch (error) {
+          sendResponse({ ok: false, errors: [error instanceof Error ? error.message : "Failed to get script skill"] });
+        }
+        return;
+      }
+
+      if (message.type === "INSTALL_SCRIPT_SKILL") {
+        const payload = message.payload as {
+          name?: string;
+          description?: string;
+          code?: string;
+          tools?: ScriptSkillToolDef[];
+          envVars?: Record<string, string>;
+          sourceUrl?: string;
+          tags?: string[];
+        } | undefined;
+        if (!payload?.name || !payload?.code || !Array.isArray(payload?.tools)) {
+          sendResponse({ ok: false, errors: ["name, code, and tools are required"] });
+          return;
+        }
+        try {
+          const skill = await createScriptSkill(storage, {
+            name: payload.name,
+            description: payload.description ?? "",
+            code: payload.code,
+            tools: payload.tools,
+            envVars: payload.envVars,
+            sourceUrl: payload.sourceUrl,
+            tags: payload.tags
+          });
+          sendResponse({ ok: true, data: skill });
+        } catch (error) {
+          sendResponse({ ok: false, errors: [error instanceof Error ? error.message : "Failed to install script skill"] });
+        }
+        return;
+      }
+
+      if (message.type === "UPDATE_SCRIPT_SKILL") {
+        const payload = message.payload as {
+          skillId?: string;
+          name?: string;
+          description?: string;
+          code?: string;
+          tools?: ScriptSkillToolDef[];
+          envVars?: Record<string, string>;
+          tags?: string[];
+        } | undefined;
+        if (!payload?.skillId) {
+          sendResponse({ ok: false, errors: ["skillId is required"] });
+          return;
+        }
+        try {
+          const skill = await updateScriptSkill(storage, payload.skillId, {
+            name: payload.name,
+            description: payload.description,
+            code: payload.code,
+            tools: payload.tools,
+            envVars: payload.envVars,
+            tags: payload.tags
+          });
+          sendResponse({ ok: true, data: skill });
+        } catch (error) {
+          sendResponse({ ok: false, errors: [error instanceof Error ? error.message : "Failed to update script skill"] });
+        }
+        return;
+      }
+
+      if (message.type === "UNINSTALL_SCRIPT_SKILL") {
+        const payload = message.payload as { skillId?: string } | undefined;
+        if (!payload?.skillId) {
+          sendResponse({ ok: false, errors: ["skillId is required"] });
+          return;
+        }
+        try {
+          const deleted = await deleteScriptSkill(storage, payload.skillId);
+          sendResponse({ ok: true, data: { deleted } });
+        } catch (error) {
+          sendResponse({ ok: false, errors: [error instanceof Error ? error.message : "Failed to uninstall script skill"] });
         }
         return;
       }
@@ -515,6 +680,19 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
                     }
                   }
 
+                  if (toolName === "get_current_time") {
+                    const now = new Date();
+                    const days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+                    const info = {
+                      datetime: now.toLocaleString("zh-CN", { hour12: false }),
+                      iso: now.toISOString(),
+                      timestamp: now.getTime(),
+                      dayOfWeek: days[now.getDay()],
+                      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
+                    };
+                    return { toolCallId: "", toolName, output: JSON.stringify(info), isError: false };
+                  }
+
                   // ── Skill Tools ──
 
                   if (toolName === "create_skill") {
@@ -597,6 +775,88 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
                       };
                     } catch (error) {
                       return { toolCallId: "", toolName, output: `Delete skill failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+                    }
+                  }
+
+                  // ── Script Skill Management Tools ──
+
+                  if (toolName === "install_script_skill") {
+                    const name = typeof args.name === "string" ? args.name : "";
+                    const description = typeof args.description === "string" ? args.description : "";
+                    const code = typeof args.code === "string" ? args.code : "";
+                    const tools = Array.isArray(args.tools) ? args.tools as ScriptSkillToolDef[] : [];
+                    if (!name || !code || tools.length === 0) {
+                      return { toolCallId: "", toolName, output: "Error: name, code, and tools are required", isError: true };
+                    }
+                    const envVars = (typeof args.envVars === "object" && args.envVars !== null)
+                      ? args.envVars as Record<string, string> : {};
+                    const sourceUrl = typeof args.sourceUrl === "string" ? args.sourceUrl : undefined;
+                    const tags = Array.isArray(args.tags) ? args.tags.map(String) : [];
+                    try {
+                      const skill = await createScriptSkill(storage, {
+                        name, description, code, tools, envVars, sourceUrl, tags
+                      });
+                      const toolNames = skill.tools.map((t) => t.name).join(", ");
+                      return { toolCallId: "", toolName, output: `Script skill installed (id: ${skill.id}): "${skill.name}" — tools: ${toolNames}\n注意：新安装的工具将在下一轮对话中可用。`, isError: false };
+                    } catch (error) {
+                      return { toolCallId: "", toolName, output: `Install script skill failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+                    }
+                  }
+
+                  if (toolName === "list_script_skills") {
+                    const query = typeof args.query === "string" ? args.query : "";
+                    try {
+                      const results = await listScriptSkills(storage, query);
+                      if (results.length === 0) {
+                        return { toolCallId: "", toolName, output: "No script skills installed.", isError: false };
+                      }
+                      const formatted = results.map((s) => {
+                        const toolNames = s.tools.map((t) => t.name).join(", ");
+                        const tagStr = s.tags.length > 0 ? ` [${s.tags.join(", ")}]` : "";
+                        const usage = s.usageCount > 0 ? ` (used ${s.usageCount}x)` : "";
+                        const source = s.sourceUrl ? ` (from: ${s.sourceUrl})` : "";
+                        return `- [${s.id}] ${s.name} (v${s.version}): ${s.description}${tagStr}${usage}${source}\n  Tools: ${toolNames}`;
+                      }).join("\n");
+                      return { toolCallId: "", toolName, output: `Found ${results.length} script skills:\n${formatted}`, isError: false };
+                    } catch (error) {
+                      return { toolCallId: "", toolName, output: `List script skills failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+                    }
+                  }
+
+                  if (toolName === "update_script_skill") {
+                    const skillId = typeof args.skillId === "string" ? args.skillId : "";
+                    if (!skillId) {
+                      return { toolCallId: "", toolName, output: "Error: skillId is required", isError: true };
+                    }
+                    const updates: Record<string, unknown> = {};
+                    if (typeof args.name === "string") updates.name = args.name;
+                    if (typeof args.description === "string") updates.description = args.description;
+                    if (typeof args.code === "string") updates.code = args.code;
+                    if (Array.isArray(args.tools)) updates.tools = args.tools;
+                    if (typeof args.envVars === "object" && args.envVars !== null) updates.envVars = args.envVars;
+                    if (Array.isArray(args.tags)) updates.tags = args.tags.map(String);
+                    try {
+                      const skill = await updateScriptSkill(storage, skillId, updates as Parameters<typeof updateScriptSkill>[2]);
+                      return { toolCallId: "", toolName, output: `Script skill updated (id: ${skill.id}, v${skill.version}): "${skill.name}"`, isError: false };
+                    } catch (error) {
+                      return { toolCallId: "", toolName, output: `Update script skill failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+                    }
+                  }
+
+                  if (toolName === "uninstall_script_skill") {
+                    const skillId = typeof args.skillId === "string" ? args.skillId : "";
+                    if (!skillId) {
+                      return { toolCallId: "", toolName, output: "Error: skillId is required", isError: true };
+                    }
+                    try {
+                      const deleted = await deleteScriptSkill(storage, skillId);
+                      return {
+                        toolCallId: "", toolName,
+                        output: deleted ? `Script skill ${skillId} uninstalled.` : `Script skill ${skillId} not found.`,
+                        isError: !deleted
+                      };
+                    } catch (error) {
+                      return { toolCallId: "", toolName, output: `Uninstall script skill failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
                     }
                   }
 
@@ -689,6 +949,24 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
                     }
                   }
 
+                  // ── Dynamic Script Skill Tool Execution (via sandbox) ──
+                  {
+                    const scriptSkill = await findScriptSkillByToolName(storage, toolName);
+                    if (scriptSkill) {
+                      try {
+                        const output = await runInSandbox(scriptSkill.code, toolName, args, scriptSkill.envVars);
+                        await recordScriptSkillUsage(storage, scriptSkill.id);
+                        return { toolCallId: "", toolName, output, isError: false };
+                      } catch (error) {
+                        return {
+                          toolCallId: "", toolName,
+                          output: `Script skill tool "${toolName}" failed: ${error instanceof Error ? error.message : String(error)}`,
+                          isError: true
+                        };
+                      }
+                    }
+                  }
+
                   return { toolCallId: "", toolName, output: `Unknown background tool: ${toolName}`, isError: true };
                 },
                 getPageContext: async (tabId) => {
@@ -711,6 +989,9 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
                 },
                 getScheduledTasks: async () => {
                   return getAllScheduledTasks(storage);
+                },
+                getScriptSkills: async () => {
+                  return getAllScriptSkills(storage);
                 }
               },
               controller.signal
@@ -865,6 +1146,18 @@ async function handleAlarmFired(alarm: chrome.alarms.Alarm): Promise<void> {
             } catch (error) {
               return { toolCallId: "", toolName, output: `Navigate failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
             }
+          }
+          if (toolName === "get_current_time") {
+            const now = new Date();
+            const days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+            const info = {
+              datetime: now.toLocaleString("zh-CN", { hour12: false }),
+              iso: now.toISOString(),
+              timestamp: now.getTime(),
+              dayOfWeek: days[now.getDay()],
+              timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
+            };
+            return { toolCallId: "", toolName, output: JSON.stringify(info), isError: false };
           }
           if (toolName === "save_memory") {
             const content = typeof args.content === "string" ? args.content : "";

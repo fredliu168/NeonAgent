@@ -3,7 +3,7 @@
   "name": "NeonAgent",
   "version": "0.1.0",
   "description": "AI assistant side panel for lawful and authorized learning scenarios.",
-  "permissions": ["storage", "sidePanel", "activeTab", "scripting", "alarms"],
+  "permissions": ["storage", "sidePanel", "activeTab", "scripting", "alarms", "offscreen"],
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "background.js",
@@ -21,5 +21,8 @@
   ],
   "action": {
     "default_title": "Open NeonAgent"
+  },
+  "sandbox": {
+    "pages": ["sandbox.html"]
   }
 }

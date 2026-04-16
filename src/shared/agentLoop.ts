@@ -20,6 +20,8 @@ import type { Skill } from "./agentSkills.js";
 import { formatSkillsForPrompt } from "./agentSkills.js";
 import type { ScheduledTask } from "./agentScheduler.js";
 import { formatScheduledTasksForPrompt } from "./agentScheduler.js";
+import type { ScriptSkill } from "./agentScriptSkill.js";
+import { formatScriptSkillsForPrompt, generateScriptSkillToolDefs, getScriptSkillToolNames } from "./agentScriptSkill.js";
 
 const DEFAULT_MAX_ITERATIONS = 100;
 
@@ -46,6 +48,8 @@ export interface AgentLoopDeps {
   getSkills?: () => Promise<Skill[]>;
   /** Load all scheduled tasks for system prompt injection */
   getScheduledTasks?: () => Promise<ScheduledTask[]>;
+  /** Load all installed script skills for dynamic tool injection */
+  getScriptSkills?: () => Promise<ScriptSkill[]>;
   /** Optional: custom fetch for testing */
   fetcher?: typeof fetch;
 }
@@ -110,13 +114,32 @@ export async function runAgentLoop(
     }
   }
 
-  const promptContext = (pageContext || memoriesPrompt || skillsPrompt || tasksPrompt)
+  // Load script skills for dynamic tool injection
+  let scriptSkills: ScriptSkill[] = [];
+  let scriptSkillsPrompt: string | undefined;
+  if (deps.getScriptSkills) {
+    try {
+      scriptSkills = await deps.getScriptSkills();
+      const formatted = formatScriptSkillsForPrompt(scriptSkills);
+      if (formatted) scriptSkillsPrompt = formatted;
+    } catch {
+      // Can't load script skills, proceed without them
+    }
+  }
+
+  // Generate dynamic tool definitions from script skills
+  const scriptSkillToolDefs = generateScriptSkillToolDefs(scriptSkills);
+  const scriptSkillToolNameSet = getScriptSkillToolNames(scriptSkills);
+  const allToolDefs = [...AGENT_TOOL_DEFINITIONS, ...scriptSkillToolDefs];
+
+  const promptContext = (pageContext || memoriesPrompt || skillsPrompt || tasksPrompt || scriptSkillsPrompt)
     ? {
         pageUrl: pageContext?.url,
         pageTitle: pageContext?.title,
         memories: memoriesPrompt,
         skills: skillsPrompt,
-        scheduledTasks: tasksPrompt
+        scheduledTasks: tasksPrompt,
+        scriptSkills: scriptSkillsPrompt
       }
     : undefined;
 
@@ -164,7 +187,7 @@ export async function runAgentLoop(
         {
           config: config.config,
           messages,
-          tools: AGENT_TOOL_DEFINITIONS,
+          tools: allToolDefs,
           signal
         },
         {
@@ -252,7 +275,7 @@ export async function runAgentLoop(
             config.toolTimeout ?? 30000,
             `Tool ${toolName} timed out`
           );
-        } else if (BACKGROUND_TOOLS.has(toolName)) {
+        } else if (BACKGROUND_TOOLS.has(toolName) || scriptSkillToolNameSet.has(toolName)) {
           result = await withTimeout(
             deps.executeBackgroundTool(config.tabId, toolName, args),
             config.toolTimeout ?? 30000,

@@ -470,6 +470,142 @@ export const AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
       }
     }
   },
+  // ── Script Skill Tools ──
+  {
+    type: "function",
+    function: {
+      name: "get_current_time",
+      description:
+        "获取当前的日期和时间信息，包括完整的日期时间字符串、时间戳、星期几、时区等。无需参数。",
+      parameters: {
+        type: "object",
+        properties: {},
+        required: [],
+        additionalProperties: false
+      }
+    }
+  },
+  // ── Script Skill Tools ──
+  {
+    type: "function",
+    function: {
+      name: "install_script_skill",
+      description:
+        "安装一个脚本技能。需要提供技能的名称、描述、JavaScript 代码和工具定义。脚本技能可以为智能体提供额外的工具能力（如调用外部 API）。代码格式为 CommonJS 风格，使用 exports.tool_name = async function(args, env) { ... } 导出工具函数。",
+      parameters: {
+        type: "object",
+        properties: {
+          name: {
+            type: "string",
+            description: "技能名称，如 'weather-pollen'"
+          },
+          description: {
+            type: "string",
+            description: "技能的详细描述"
+          },
+          code: {
+            type: "string",
+            description: "JavaScript 代码，使用 exports.toolName = async function(args, env) { ... } 格式导出工具函数"
+          },
+          tools: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                name: { type: "string", description: "工具名称" },
+                description: { type: "string", description: "工具描述" },
+                parameters: { type: "object", description: "工具参数的 JSON Schema" }
+              },
+              required: ["name", "description", "parameters"]
+            },
+            description: "该技能提供的工具定义列表"
+          },
+          envVars: {
+            type: "object",
+            description: "环境变量/配置，如 { \"API_KEY\": \"xxx\" }"
+          },
+          sourceUrl: {
+            type: "string",
+            description: "技能来源 URL（可选）"
+          },
+          tags: {
+            type: "array",
+            items: { type: "string" },
+            description: "标签列表"
+          }
+        },
+        required: ["name", "description", "code", "tools"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_script_skills",
+      description:
+        "列出已安装的脚本技能。可通过关键词搜索，不传 query 则返回全部。",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "搜索关键词，为空则返回全部脚本技能"
+          }
+        },
+        required: [],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "update_script_skill",
+      description:
+        "更新一个已安装的脚本技能的代码、工具定义或环境变量。",
+      parameters: {
+        type: "object",
+        properties: {
+          skillId: {
+            type: "string",
+            description: "脚本技能 ID"
+          },
+          name: { type: "string", description: "新名称（可选）" },
+          description: { type: "string", description: "新描述（可选）" },
+          code: { type: "string", description: "新代码（可选）" },
+          tools: {
+            type: "array",
+            items: { type: "object" },
+            description: "新工具定义列表（可选）"
+          },
+          envVars: { type: "object", description: "新环境变量（可选）" },
+          tags: { type: "array", items: { type: "string" }, description: "新标签（可选）" }
+        },
+        required: ["skillId"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "uninstall_script_skill",
+      description:
+        "卸载一个脚本技能。需要提供技能 ID（从 list_script_skills 结果中获取）。",
+      parameters: {
+        type: "object",
+        properties: {
+          skillId: {
+            type: "string",
+            description: "要卸载的脚本技能 ID"
+          }
+        },
+        required: ["skillId"],
+        additionalProperties: false
+      }
+    }
+  },
   // ── Scheduled Task Tools ──
   {
     type: "function",
@@ -604,7 +740,9 @@ export const PAGE_TOOLS = new Set([
 /** Tools that execute in the background service worker */
 export const BACKGROUND_TOOLS = new Set([
   "navigate",
+  "get_current_time",
   "save_memory", "search_memories", "delete_memory",
   "create_skill", "list_skills", "execute_skill", "update_skill", "delete_skill",
+  "install_script_skill", "list_script_skills", "update_script_skill", "uninstall_script_skill",
   "create_scheduled_task", "list_scheduled_tasks", "update_scheduled_task", "delete_scheduled_task"
 ]);

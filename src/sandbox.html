@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html>
+<head><title>NeonAgent Sandbox</title></head>
+<body>
+<script>
+/* Sandbox page — CSP allows unsafe-eval here.
+   Receives execution requests from the offscreen document via postMessage,
+   runs script skill code via new Function(), proxies fetch through parent. */
+
+const fetchPending = new Map();
+let fetchIdCounter = 0;
+
+window.addEventListener('message', async (event) => {
+  const data = event.data;
+  if (!data) return;
+
+  // ── Fetch proxy response from offscreen ──
+  if (data.type === 'fetchResponse') {
+    const pending = fetchPending.get(data.fetchId);
+    if (pending) {
+      fetchPending.delete(data.fetchId);
+      if (data.error) {
+        pending.reject(new Error(data.error));
+      } else {
+        pending.resolve(data.response);
+      }
+    }
+    return;
+  }
+
+  // ── Script execution request ──
+  if (data.type === 'execute') {
+    const { execId, code, toolName, args, envVars } = data;
+
+    const logs = [];
+    const safeConsole = {
+      log:   (...a) => logs.push(a.map(String).join(' ')),
+      warn:  (...a) => logs.push('[WARN] ' + a.map(String).join(' ')),
+      error: (...a) => logs.push('[ERROR] ' + a.map(String).join(' ')),
+      info:  (...a) => logs.push(a.map(String).join(' '))
+    };
+
+    // Fetch proxy — requests go through offscreen document (which has extension permissions)
+    function proxyFetch(input, init) {
+      const fetchId = fetchIdCounter++;
+      return new Promise((resolve, reject) => {
+        fetchPending.set(fetchId, { resolve, reject });
+        // Timeout individual fetch after 30s
+        const timer = setTimeout(() => {
+          if (fetchPending.has(fetchId)) {
+            fetchPending.delete(fetchId);
+            reject(new Error('Fetch timed out (30s)'));
+          }
+        }, 30000);
+        const origResolve = resolve;
+        const origReject = reject;
+        fetchPending.set(fetchId, {
+          resolve: (v) => { clearTimeout(timer); origResolve(v); },
+          reject:  (e) => { clearTimeout(timer); origReject(e); }
+        });
+        parent.postMessage({
+          type: 'fetchProxy',
+          fetchId,
+          url: String(input),
+          init: init ? {
+            method: init.method,
+            headers: init.headers instanceof Headers
+              ? Object.fromEntries(init.headers.entries())
+              : init.headers,
+            body: init.body
+          } : undefined
+        }, '*');
+      }).then(function (resp) {
+        return {
+          ok: resp.ok,
+          status: resp.status,
+          statusText: resp.statusText,
+          json: function () { return Promise.resolve(JSON.parse(resp.body)); },
+          text: function () { return Promise.resolve(resp.body); },
+          headers: new Headers(resp.headers || {})
+        };
+      });
+    }
+
+    try {
+      var exportsObj = {};
+      var fn = new Function(
+        'exports', 'env', 'fetch', 'console',
+        'JSON', 'Math', 'Date', 'URL', 'URLSearchParams',
+        'TextEncoder', 'TextDecoder', 'btoa', 'atob',
+        'setTimeout', 'encodeURIComponent', 'decodeURIComponent',
+        code
+      );
+      fn(
+        exportsObj, envVars || {}, proxyFetch, safeConsole,
+        JSON, Math, Date, URL, URLSearchParams,
+        TextEncoder, TextDecoder, btoa, atob,
+        setTimeout, encodeURIComponent, decodeURIComponent
+      );
+
+      var handler = exportsObj[toolName];
+      if (typeof handler !== 'function') {
+        parent.postMessage({
+          type: 'executeResult', execId,
+          error: 'Script does not export function "' + toolName + '"'
+        }, '*');
+        return;
+      }
+
+      var result = await handler(args || {}, envVars || {});
+      var output = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+      var finalOutput = logs.length > 0
+        ? output + '\n\n[Script logs]\n' + logs.join('\n')
+        : output;
+
+      parent.postMessage({ type: 'executeResult', execId, result: finalOutput }, '*');
+    } catch (e) {
+      var errMsg = logs.length > 0
+        ? (e.message || String(e)) + '\n\n[Script logs]\n' + logs.join('\n')
+        : (e.message || String(e));
+      parent.postMessage({ type: 'executeResult', execId, error: errMsg }, '*');
+    }
+  }
+});
+
+// Signal ready
+parent.postMessage({ type: 'sandboxReady' }, '*');
+</script>
+</body>
+</html>
