@@ -319,4 +319,4 @@ SOFTWARE.
 
 
 欢迎关注我的公众号
-![alt text](images/qrcode.jpg)
+![公众号头号AI玩家社](images/qrcode.jpg)

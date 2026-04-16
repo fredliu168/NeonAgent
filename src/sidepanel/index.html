@@ -743,6 +743,41 @@
         content: "尚未加载页面上下文";
         color: #94a3b8;
       }
+
+      .about-link {
+        font-size: 12px;
+        color: #0f766e;
+        word-break: break-all;
+      }
+
+      .about-link a {
+        color: inherit;
+        text-decoration: none;
+      }
+
+      .about-link a:hover {
+        text-decoration: underline;
+      }
+
+      .about-qrcode {
+        margin-top: 10px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .about-qrcode img {
+        width: 180px;
+        max-width: 100%;
+        border-radius: 8px;
+        border: 1px solid #e2e8f0;
+      }
+
+      .about-qrcode span {
+        font-size: 11px;
+        color: #64748b;
+      }
     </style>
   </head>
   <body>
@@ -910,6 +945,16 @@
           <p style="font-size:12px;color:#475569;line-height:1.6;margin-bottom:8px;">
             NeonAgent 是一款集成大语言模型能力的 Chrome 浏览器智能体插件，旨在通过 AI 能力和网页交互技术，为用户提供强大的自动化辅助工具。
           </p>
+          <p class="about-link">
+            开源地址：
+            <a href="https://github.com/fredliu168/NeonAgent" target="_blank" rel="noopener noreferrer">
+              https://github.com/fredliu168/NeonAgent
+            </a>
+          </p>
+          <div class="about-qrcode">
+            <img src="../images/qrcode.jpg" alt="NeonAgent 二维码" />
+            <span>扫码查看项目或联系方式</span>
+          </div>
         </section>
 
         <section class="card">
