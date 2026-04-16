@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "NeonAgent",
+  "version": "0.1.0",
+  "description": "AI assistant side panel for lawful and authorized learning scenarios.",
+  "permissions": ["storage", "sidePanel", "activeTab", "scripting", "alarms"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "side_panel": {
+    "default_path": "sidepanel/index.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "action": {
+    "default_title": "Open NeonAgent"
+  }
+}

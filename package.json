@@ -1,0 +1,18 @@
+{
+  "name": "neonagent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "npm run clean && tsc -p tsconfig.build.json && npm run copy:static",
+    "copy:static": "mkdir -p dist/sidepanel && cp src/manifest.json dist/manifest.json && cp src/sidepanel/index.html dist/sidepanel/index.html",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.292",
+    "typescript": "^5.8.3",
+    "vitest": "^2.1.8"
+  }
+}
