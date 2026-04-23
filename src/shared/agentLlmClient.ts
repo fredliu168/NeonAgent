@@ -24,6 +24,8 @@ export interface AgentStreamDelta {
   finishReason: string | null;
 }
 
+type TokenParamName = "max_tokens" | "max_completion_tokens";
+
 function parseAgentStreamLine(dataLine: string): AgentStreamDelta | null {
   const raw = dataLine.slice("data:".length).trim();
   if (!raw || raw === "[DONE]") {
@@ -91,18 +93,76 @@ function buildAgentRequestBody(input: {
   config: LLMConfig;
   messages: AgentMessage[];
   tools: ToolDefinition[];
-}): string {
+}, tokenParamName: TokenParamName): string {
   const body: Record<string, unknown> = {
     model: input.config.model,
     stream: true,
     temperature: input.config.temperature,
-    max_tokens: input.config.agentMaxTokens > 0 ? input.config.agentMaxTokens : 102400,
     messages: input.messages,
     tools: input.tools,
     tool_choice: "auto"
   };
 
+  body[tokenParamName] = input.config.agentMaxTokens;
+
   return JSON.stringify(body);
+}
+
+function shouldRetryWithAlternateTokenParam(details: string, currentParam: TokenParamName): boolean {
+  const normalized = details.toLowerCase();
+  return normalized.includes("unsupported parameter") && normalized.includes(currentParam);
+}
+
+async function postAgentStreamRequest(
+  input: {
+    config: LLMConfig;
+    messages: AgentMessage[];
+    tools: ToolDefinition[];
+    signal?: AbortSignal;
+  },
+  tokenParamName: TokenParamName,
+  fetcher: typeof fetch
+): Promise<Response> {
+  return fetcher(input.config.baseUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${input.config.apiKey}`
+    },
+    signal: input.signal,
+    body: buildAgentRequestBody(input, tokenParamName)
+  });
+}
+
+async function requestAgentWithTokenFallback(
+  input: {
+    config: LLMConfig;
+    messages: AgentMessage[];
+    tools: ToolDefinition[];
+    signal?: AbortSignal;
+  },
+  fetcher: typeof fetch
+): Promise<Response> {
+  const primaryParam: TokenParamName = "max_tokens";
+  const secondaryParam: TokenParamName = "max_completion_tokens";
+
+  const primaryResponse = await postAgentStreamRequest(input, primaryParam, fetcher);
+  if (primaryResponse.ok) {
+    return primaryResponse;
+  }
+
+  const primaryText = typeof primaryResponse.text === "function" ? await primaryResponse.text() : "";
+  if (!shouldRetryWithAlternateTokenParam(primaryText, primaryParam)) {
+    throw new Error(`Agent LLM request failed: ${primaryResponse.status} ${primaryText}`.trim());
+  }
+
+  const fallbackResponse = await postAgentStreamRequest(input, secondaryParam, fetcher);
+  if (fallbackResponse.ok) {
+    return fallbackResponse;
+  }
+
+  const fallbackText = typeof fallbackResponse.text === "function" ? await fallbackResponse.text() : "";
+  throw new Error(`Agent LLM request failed: ${fallbackResponse.status} ${fallbackText}`.trim());
 }
 
 export interface AgentStreamCallbacks {
@@ -125,21 +185,7 @@ export async function requestAgentStream(
   callbacks?: AgentStreamCallbacks,
   fetcher: typeof fetch = fetch
 ): Promise<AgentStreamResult> {
-  const response = await fetcher(input.config.baseUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${input.config.apiKey}`
-    },
-    signal: input.signal,
-    body: buildAgentRequestBody(input)
-  });
-
-  if (!response.ok) {
-    const text =
-      typeof response.text === "function" ? await response.text() : "";
-    throw new Error(`Agent LLM request failed: ${response.status} ${text}`.trim());
-  }
+  const response = await requestAgentWithTokenFallback(input, fetcher);
 
   if (!response.body) {
     throw new Error("Agent LLM stream response body is empty");

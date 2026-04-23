@@ -1,4 +1,4 @@
-import { DEFAULT_CONFIG } from "../shared/config.js";
+import { DEFAULT_CONFIG, migrateConfig, validateConfig } from "../shared/config.js";
 import { matchAnswersFromText } from "../shared/examAssistant.js";
 import {
   createLLMStreamCancelMessage,
@@ -31,7 +31,10 @@ function byId<T extends HTMLElement>(id: string): T {
 
 const baseUrlInput = byId<HTMLInputElement>("baseUrl");
 const apiKeyInput = byId<HTMLInputElement>("apiKey");
-const modelInput = byId<HTMLInputElement>("model");
+const modelInput = byId<HTMLSelectElement>("model");
+const newModelInput = byId<HTMLInputElement>("newModel");
+const addModelBtn = byId<HTMLButtonElement>("addModel");
+const removeModelBtn = byId<HTMLButtonElement>("removeModel");
 const agentMaxTokensInput = byId<HTMLInputElement>("agentMaxTokens");
 const unlockContextMenuInput = byId<HTMLInputElement>("unlockContextMenu");
 const blockVisibilityDetectionInput = byId<HTMLInputElement>("blockVisibilityDetection");
@@ -67,6 +70,7 @@ const streamCompletionResolvers = new Map<string, (ok: boolean) => void>();
 let chatSessions: ChatSession[] = [];
 let activeSessionId: string | null = null;
 let latestExamQuestions: ExamQuestion[] = [];
+let currentModels: string[] = [DEFAULT_CONFIG.model];
 
 // ── Agent State ──
 interface AgentToolCallEntry {
@@ -396,7 +400,8 @@ function toConfig(): LLMConfig {
   return {
     baseUrl: baseUrlInput.value.trim(),
     apiKey: apiKeyInput.value.trim(),
-    model: modelInput.value.trim(),
+    model: modelInput.value,
+    models: [...currentModels],
     temperature: DEFAULT_CONFIG.temperature,
     maxTokens: DEFAULT_CONFIG.maxTokens,
     agentMaxTokens: parseInt(agentMaxTokensInput.value, 10) || DEFAULT_CONFIG.agentMaxTokens,
@@ -406,6 +411,21 @@ function toConfig(): LLMConfig {
     aggressiveVisibilityBypass: aggressiveVisibilityBypassInput.checked,
     enableFloatingBall: DEFAULT_CONFIG.enableFloatingBall
   };
+}
+
+function renderModelSelect(selected?: string): void {
+  modelInput.innerHTML = "";
+  for (const m of currentModels) {
+    const opt = document.createElement("option");
+    opt.value = m;
+    opt.textContent = m;
+    modelInput.appendChild(opt);
+  }
+  if (selected && currentModels.includes(selected)) {
+    modelInput.value = selected;
+  } else if (currentModels.length > 0) {
+    modelInput.value = currentModels[0];
+  }
 }
 
 function toFeatureFlags(config: LLMConfig) {
@@ -427,7 +447,10 @@ async function loadConfig(): Promise<void> {
   const config = response.data as LLMConfig;
   baseUrlInput.value = config.baseUrl;
   apiKeyInput.value = config.apiKey;
-  modelInput.value = config.model;
+  currentModels = Array.isArray(config.models) && config.models.length > 0
+    ? config.models
+    : [config.model || DEFAULT_CONFIG.model];
+  renderModelSelect(config.model);
   agentMaxTokensInput.value = String(config.agentMaxTokens ?? DEFAULT_CONFIG.agentMaxTokens);
   unlockContextMenuInput.checked = config.unlockContextMenu;
   blockVisibilityDetectionInput.checked = config.blockVisibilityDetection;
@@ -482,6 +505,92 @@ async function saveConfig(): Promise<void> {
   setStatus("Config saved");
 }
 
+async function exportConfig(): Promise<void> {
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "GET_CONFIG" });
+    if (!response?.ok) {
+      setStatus("导出失败", true);
+      return;
+    }
+    const config = response.data as LLMConfig;
+    const blob = new Blob([JSON.stringify(config, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `neonagent-config-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    setStatus("配置已导出");
+  } catch {
+    setStatus("导出失败", true);
+  }
+}
+
+const configImportFileEl = byId<HTMLInputElement>("configImportFile");
+
+function triggerImportConfig(): void {
+  configImportFileEl.value = "";
+  configImportFileEl.click();
+}
+
+configImportFileEl.addEventListener("change", () => {
+  const file = configImportFileEl.files?.[0];
+  if (!file) return;
+
+  const reader = new FileReader();
+  reader.onload = async () => {
+    try {
+      const text = reader.result as string;
+      const parsed = JSON.parse(text);
+      if (typeof parsed !== "object" || parsed === null || typeof parsed.baseUrl !== "string") {
+        setStatus("无效的配置文件", true);
+        return;
+      }
+
+      const config = migrateConfig(parsed as LLMConfig);
+      const validation = validateConfig(config);
+      if (!validation.valid) {
+        setStatus("配置校验失败: " + validation.errors.join(", "), true);
+        return;
+      }
+
+      const response = await chrome.runtime.sendMessage({
+        type: "SAVE_CONFIG",
+        payload: config
+      });
+
+      if (!response?.ok) {
+        const message = Array.isArray(response?.errors)
+          ? response.errors.join(", ")
+          : "导入失败";
+        setStatus(message, true);
+        return;
+      }
+
+      // Reload UI with imported config
+      baseUrlInput.value = config.baseUrl;
+      apiKeyInput.value = config.apiKey;
+      currentModels = [...config.models];
+      renderModelSelect(config.model);
+      agentMaxTokensInput.value = String(config.agentMaxTokens ?? DEFAULT_CONFIG.agentMaxTokens);
+      unlockContextMenuInput.checked = config.unlockContextMenu;
+      blockVisibilityDetectionInput.checked = config.blockVisibilityDetection;
+      aggressiveVisibilityBypassInput.checked = config.aggressiveVisibilityBypass;
+
+      try {
+        await applyConfigToActiveTab(config);
+      } catch {
+        // ignored
+      }
+
+      setStatus("配置已导入");
+    } catch {
+      setStatus("文件解析失败", true);
+    }
+  };
+  reader.readAsText(file);
+});
+
 const loadPageContext = createLoadPageContextAction(
   {
     getCurrentTabId,
@@ -516,7 +625,11 @@ async function sendChatMessage(): Promise<void> {
   await sendChatMessageWithContent(input);
 }
 
-async function sendChatMessageWithContent(input: string): Promise<boolean> {
+async function sendChatMessageWithContent(
+  input: string,
+  options?: { includePageContext?: boolean }
+): Promise<boolean> {
+  const includePageContext = options?.includePageContext ?? true;
   dispatchChat({ type: "SEND_USER_MESSAGE", content: input });
 
   const outboundMessages = chatState.messages;
@@ -536,7 +649,7 @@ async function sendChatMessageWithContent(input: string): Promise<boolean> {
         requestId,
         config: toConfig(),
         messages: outboundMessages,
-        pageContext: contextEl.textContent || undefined
+        pageContext: includePageContext ? (contextEl.textContent || undefined) : undefined
       })
     );
 
@@ -713,7 +826,9 @@ async function askAndAutoFill(): Promise<void> {
     }
 
     setExamStatus("Asking assistant for answers...");
-    const success = await sendChatMessageWithContent(buildExamPrompt(questions));
+    const success = await sendChatMessageWithContent(buildExamPrompt(questions), {
+      includePageContext: false
+    });
     if (!success) {
       setExamStatus("Ask step failed.");
       return;
@@ -1802,6 +1917,37 @@ function maybeHandleRuntimeMessage(message: unknown): void {
 
 byId<HTMLButtonElement>("saveConfig").addEventListener("click", () => {
   void saveConfig();
+});
+
+addModelBtn.addEventListener("click", () => {
+  const name = newModelInput.value.trim();
+  if (!name) return;
+  if (currentModels.includes(name)) {
+    setStatus("模型已存在", true);
+    return;
+  }
+  currentModels.push(name);
+  newModelInput.value = "";
+  renderModelSelect(name);
+});
+
+removeModelBtn.addEventListener("click", () => {
+  const selected = modelInput.value;
+  if (!selected) return;
+  if (currentModels.length <= 1) {
+    setStatus("至少保留一个模型", true);
+    return;
+  }
+  currentModels = currentModels.filter((m) => m !== selected);
+  renderModelSelect();
+});
+
+byId<HTMLButtonElement>("exportConfig").addEventListener("click", () => {
+  void exportConfig();
+});
+
+byId<HTMLButtonElement>("importConfigBtn").addEventListener("click", () => {
+  triggerImportConfig();
 });
 
 byId<HTMLButtonElement>("loadContext").addEventListener("click", () => {

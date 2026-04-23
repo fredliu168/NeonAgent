@@ -7,14 +7,69 @@ interface RequestChatCompletionInput {
   signal?: AbortSignal;
 }
 
-function buildRequestBody(input: RequestChatCompletionInput, stream: boolean): string {
+type TokenParamName = "max_tokens" | "max_completion_tokens";
+
+function buildRequestBody(
+  input: RequestChatCompletionInput,
+  stream: boolean,
+  tokenParamName: TokenParamName
+): string {
   return JSON.stringify({
     model: input.config.model,
     stream,
     temperature: input.config.temperature,
-    max_tokens: input.config.maxTokens,
+    [tokenParamName]: input.config.agentMaxTokens,
     messages: buildMessages(input)
   });
+}
+
+function shouldRetryWithAlternateTokenParam(details: string, currentParam: TokenParamName): boolean {
+  const normalized = details.toLowerCase();
+  return normalized.includes("unsupported parameter") && normalized.includes(currentParam);
+}
+
+async function postChatCompletion(
+  input: RequestChatCompletionInput,
+  stream: boolean,
+  tokenParamName: TokenParamName,
+  fetcher: typeof fetch
+): Promise<Response> {
+  return fetcher(input.config.baseUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${input.config.apiKey}`
+    },
+    signal: input.signal,
+    body: buildRequestBody(input, stream, tokenParamName)
+  });
+}
+
+async function requestWithTokenFallback(
+  input: RequestChatCompletionInput,
+  stream: boolean,
+  fetcher: typeof fetch
+): Promise<Response> {
+  const primaryParam: TokenParamName = "max_tokens";
+  const secondaryParam: TokenParamName = "max_completion_tokens";
+
+  const primaryResponse = await postChatCompletion(input, stream, primaryParam, fetcher);
+  if (primaryResponse.ok) {
+    return primaryResponse;
+  }
+
+  const primaryDetails = typeof primaryResponse.text === "function" ? await primaryResponse.text() : "";
+  if (!shouldRetryWithAlternateTokenParam(primaryDetails, primaryParam)) {
+    throw new Error(`LLM request failed: ${primaryResponse.status} ${primaryDetails}`.trim());
+  }
+
+  const fallbackResponse = await postChatCompletion(input, stream, secondaryParam, fetcher);
+  if (fallbackResponse.ok) {
+    return fallbackResponse;
+  }
+
+  const fallbackDetails = typeof fallbackResponse.text === "function" ? await fallbackResponse.text() : "";
+  throw new Error(`LLM request failed: ${fallbackResponse.status} ${fallbackDetails}`.trim());
 }
 
 export interface StreamDelta {
@@ -68,19 +123,7 @@ export async function requestChatCompletion(
   input: RequestChatCompletionInput,
   fetcher: typeof fetch = fetch
 ): Promise<string> {
-  const response = await fetcher(input.config.baseUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${input.config.apiKey}`
-    },
-    body: buildRequestBody(input, false)
-  });
-
-  if (!response.ok) {
-    const details = typeof response.text === "function" ? await response.text() : "";
-    throw new Error(`LLM request failed: ${response.status} ${details}`.trim());
-  }
+  const response = await requestWithTokenFallback(input, false, fetcher);
 
   const data = (await response.json()) as {
     choices?: Array<{ message?: { content?: string } }>;
@@ -98,20 +141,7 @@ export async function* requestChatCompletionStream(
   input: RequestChatCompletionInput,
   fetcher: typeof fetch = fetch
 ): AsyncGenerator<StreamDelta> {
-  const response = await fetcher(input.config.baseUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${input.config.apiKey}`
-    },
-    signal: input.signal,
-    body: buildRequestBody(input, true)
-  });
-
-  if (!response.ok) {
-    const details = typeof response.text === "function" ? await response.text() : "";
-    throw new Error(`LLM request failed: ${response.status} ${details}`.trim());
-  }
+  const response = await requestWithTokenFallback(input, true, fetcher);
 
   if (!response.body) {
     throw new Error("LLM stream response body is empty");
