@@ -1,4 +1,4 @@
-import { DEFAULT_CONFIG } from "./config.js";
+import { DEFAULT_CONFIG, migrateConfig } from "./config.js";
 import type { ChatSession, LLMConfig } from "./types.js";
 import type { AgentSession } from "./agentTypes.js";
 
@@ -15,7 +15,7 @@ export class ConfigRepository {
 
   async getConfig(): Promise<LLMConfig> {
     const cfg = await this.storage.get<LLMConfig>(CONFIG_KEY);
-    return cfg ?? DEFAULT_CONFIG;
+    return cfg ? migrateConfig(cfg) : DEFAULT_CONFIG;
   }
 
   async saveConfig(config: LLMConfig): Promise<void> {

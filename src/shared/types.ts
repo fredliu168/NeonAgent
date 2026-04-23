@@ -2,6 +2,7 @@ export interface LLMConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
+  models: string[];
   temperature: number;
   maxTokens: number;
   agentMaxTokens: number;

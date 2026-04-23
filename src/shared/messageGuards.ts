@@ -24,6 +24,7 @@ function isLLMConfig(value: unknown): boolean {
     typeof value.baseUrl === "string" &&
     typeof value.apiKey === "string" &&
     typeof value.model === "string" &&
+    Array.isArray(value.models) &&
     typeof value.temperature === "number" &&
     typeof value.maxTokens === "number" &&
     typeof value.systemPrompt === "string"

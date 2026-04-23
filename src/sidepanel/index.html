@@ -900,12 +900,22 @@
           <input id="apiKey" type="password" placeholder="sk-***" />
 
           <label for="model">Model</label>
-          <input id="model" type="text" placeholder="gpt-4o-mini" />
+          <select id="model" style="width:100%;padding:6px 8px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;background:#fff;"></select>
+          <div style="display:flex;gap:4px;margin-top:4px;">
+            <input id="newModel" type="text" placeholder="输入新模型名称" style="flex:1;" />
+            <button id="addModel" class="btn-primary" style="padding:4px 10px;font-size:12px;white-space:nowrap;">添加</button>
+            <button id="removeModel" class="btn-primary" style="padding:4px 10px;font-size:12px;white-space:nowrap;background:#b91c1c;">删除</button>
+          </div>
 
           <label for="agentMaxTokens">智能体 Max Tokens</label>
           <input id="agentMaxTokens" type="number" placeholder="102400" min="1" />
 
           <button id="saveConfig" class="btn-primary" style="margin-top: 4px;">保存配置</button>
+          <div style="display:flex;gap:4px;margin-top:4px;">
+            <button id="exportConfig" class="btn-secondary" style="flex:1;padding:4px 10px;font-size:12px;">导出配置</button>
+            <button id="importConfigBtn" class="btn-secondary" style="flex:1;padding:4px 10px;font-size:12px;">导入配置</button>
+            <input id="configImportFile" type="file" accept=".json" hidden />
+          </div>
           <div id="status"></div>
         </section>
 

@@ -1,9 +1,22 @@
 import type { LLMConfig, ValidationResult } from "./types.js";
 
+/** Ensure a loaded config has the `models` array, migrating from old single-model format */
+export function migrateConfig(config: LLMConfig): LLMConfig {
+  if (!Array.isArray(config.models) || config.models.length === 0) {
+    const model = config.model?.trim() || DEFAULT_CONFIG.model;
+    return { ...config, model, models: [model] };
+  }
+  if (!config.models.includes(config.model)) {
+    return { ...config, model: config.models[0] };
+  }
+  return config;
+}
+
 export const DEFAULT_CONFIG: LLMConfig = {
   baseUrl: "",
   apiKey: "",
   model: "gpt-4o-mini",
+  models: ["gpt-4o-mini"],
   temperature: 0.2,
   maxTokens: 1024,
   agentMaxTokens: 102400,
@@ -27,6 +40,12 @@ export function validateConfig(input: LLMConfig): ValidationResult {
 
   if (!input.model.trim()) {
     errors.push("model is required");
+  }
+
+  if (!Array.isArray(input.models) || input.models.length === 0) {
+    errors.push("models must be a non-empty array");
+  } else if (!input.models.every((m) => typeof m === "string" && m.trim())) {
+    errors.push("each model in models must be a non-empty string");
   }
 
   if (input.temperature < 0 || input.temperature > 2) {
