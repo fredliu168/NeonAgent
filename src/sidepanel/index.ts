@@ -36,6 +36,16 @@ const newModelInput = byId<HTMLInputElement>("newModel");
 const addModelBtn = byId<HTMLButtonElement>("addModel");
 const removeModelBtn = byId<HTMLButtonElement>("removeModel");
 const agentMaxTokensInput = byId<HTMLInputElement>("agentMaxTokens");
+const translationEnabledInput = byId<HTMLInputElement>("translationEnabled");
+const translationTargetLanguageInput = byId<HTMLInputElement>("translationTargetLanguage");
+const translationDisplayModeInput = byId<HTMLSelectElement>("translationDisplayMode");
+const translationDebounceMsInput = byId<HTMLInputElement>("translationDebounceMs");
+const translationBatchSizeInput = byId<HTMLInputElement>("translationBatchSize");
+const translationStyleFontSizeInput = byId<HTMLInputElement>("translationStyleFontSize");
+const translationStyleColorInput = byId<HTMLInputElement>("translationStyleColor");
+const translationStyleBackgroundInput = byId<HTMLInputElement>("translationStyleBackground");
+const translationStyleBoldInput = byId<HTMLInputElement>("translationStyleBold");
+const translationStyleItalicInput = byId<HTMLInputElement>("translationStyleItalic");
 const unlockContextMenuInput = byId<HTMLInputElement>("unlockContextMenu");
 const blockVisibilityDetectionInput = byId<HTMLInputElement>("blockVisibilityDetection");
 const aggressiveVisibilityBypassInput = byId<HTMLInputElement>("aggressiveVisibilityBypass");
@@ -167,8 +177,8 @@ function renderChatFull(): void {
   chatStatusEl.textContent = chatState.pending ? "AI 思考中..." : "";
 }
 
-function appendChatMessageDOM(msg: { role: string; content: string; thinking?: string }, isLast: boolean): void {
-  const thinking = (msg as { thinking?: string }).thinking;
+function appendChatMessageDOM(msg: { role: string; content: string; reasoning_content?: string }, isLast: boolean): void {
+  const thinking = msg.reasoning_content;
 
   // Thinking block
   if (msg.role === "assistant" && thinking) {
@@ -228,10 +238,10 @@ function renderChat(): void {
 
   // Incremental update for the last (streaming) assistant message
   if (msgs.length > 0) {
-    const last = msgs[msgs.length - 1] as { role: string; content: string; thinking?: string };
+    const last = msgs[msgs.length - 1] as { role: string; content: string; reasoning_content?: string };
     if (last.role === "assistant") {
       // Update thinking in-place
-      const thinking = last.thinking;
+      const thinking = last.reasoning_content;
       if (thinking) {
         if (chatStreamingThinkingPre) {
           chatStreamingThinkingPre.textContent = thinking;
@@ -406,6 +416,16 @@ function toConfig(): LLMConfig {
     maxTokens: DEFAULT_CONFIG.maxTokens,
     agentMaxTokens: parseInt(agentMaxTokensInput.value, 10) || DEFAULT_CONFIG.agentMaxTokens,
     systemPrompt: DEFAULT_CONFIG.systemPrompt,
+    translationEnabled: translationEnabledInput.checked,
+    translationTargetLanguage: translationTargetLanguageInput.value.trim() || DEFAULT_CONFIG.translationTargetLanguage,
+    translationDisplayMode: translationDisplayModeInput.value === "hover" ? "hover" : "below",
+    translationStyleColor: translationStyleColorInput.value || DEFAULT_CONFIG.translationStyleColor,
+    translationStyleBackground: translationStyleBackgroundInput.value || DEFAULT_CONFIG.translationStyleBackground,
+    translationStyleFontSize: parseInt(translationStyleFontSizeInput.value, 10) || DEFAULT_CONFIG.translationStyleFontSize,
+    translationStyleBold: translationStyleBoldInput.checked,
+    translationStyleItalic: translationStyleItalicInput.checked,
+    translationDebounceMs: parseInt(translationDebounceMsInput.value, 10) || DEFAULT_CONFIG.translationDebounceMs,
+    translationBatchSize: parseInt(translationBatchSizeInput.value, 10) || DEFAULT_CONFIG.translationBatchSize,
     unlockContextMenu: unlockContextMenuInput.checked,
     blockVisibilityDetection: blockVisibilityDetectionInput.checked,
     aggressiveVisibilityBypass: aggressiveVisibilityBypassInput.checked,
@@ -452,9 +472,34 @@ async function loadConfig(): Promise<void> {
     : [config.model || DEFAULT_CONFIG.model];
   renderModelSelect(config.model);
   agentMaxTokensInput.value = String(config.agentMaxTokens ?? DEFAULT_CONFIG.agentMaxTokens);
+  translationEnabledInput.checked = !!config.translationEnabled;
+  translationTargetLanguageInput.value = config.translationTargetLanguage ?? DEFAULT_CONFIG.translationTargetLanguage;
+  translationDisplayModeInput.value = config.translationDisplayMode ?? DEFAULT_CONFIG.translationDisplayMode;
+  translationDebounceMsInput.value = String(config.translationDebounceMs ?? DEFAULT_CONFIG.translationDebounceMs);
+  translationBatchSizeInput.value = String(config.translationBatchSize ?? DEFAULT_CONFIG.translationBatchSize);
+  translationStyleFontSizeInput.value = String(config.translationStyleFontSize ?? DEFAULT_CONFIG.translationStyleFontSize);
+  translationStyleColorInput.value = config.translationStyleColor ?? DEFAULT_CONFIG.translationStyleColor;
+  translationStyleBackgroundInput.value = config.translationStyleBackground ?? DEFAULT_CONFIG.translationStyleBackground;
+  translationStyleBoldInput.checked = !!config.translationStyleBold;
+  translationStyleItalicInput.checked = !!config.translationStyleItalic;
   unlockContextMenuInput.checked = config.unlockContextMenu;
   blockVisibilityDetectionInput.checked = config.blockVisibilityDetection;
   aggressiveVisibilityBypassInput.checked = config.aggressiveVisibilityBypass;
+}
+
+function toTranslationPayload(config: LLMConfig) {
+  return {
+    translationEnabled: config.translationEnabled,
+    translationTargetLanguage: config.translationTargetLanguage,
+    translationDisplayMode: config.translationDisplayMode,
+    translationStyleColor: config.translationStyleColor,
+    translationStyleBackground: config.translationStyleBackground,
+    translationStyleFontSize: config.translationStyleFontSize,
+    translationStyleBold: config.translationStyleBold,
+    translationStyleItalic: config.translationStyleItalic,
+    translationDebounceMs: config.translationDebounceMs,
+    translationBatchSize: config.translationBatchSize
+  };
 }
 
 async function applyConfigToActiveTab(config: LLMConfig): Promise<void> {
@@ -479,6 +524,85 @@ async function applyConfigToActiveTab(config: LLMConfig): Promise<void> {
   }
 
   setInjectionNotice(null);
+
+  const translationResponse = await sendTabMessageWithAutoInject(tabId, {
+    type: "APPLY_TRANSLATION_SETTINGS",
+    payload: toTranslationPayload(config)
+  });
+
+  if (!translationResponse.response) {
+    setInjectionNotice(
+      translationResponse.diagnosis
+        ? formatInjectionDiagnosisNotice(translationResponse.diagnosis)
+        : "当前页面不支持应用翻译设置。"
+    );
+    return;
+  }
+
+  setInjectionNotice(null);
+}
+
+async function applyTranslationToActiveTab(): Promise<void> {
+  const tabId = await getCurrentTabId();
+  if (!tabId) {
+    setInjectionNotice("当前没有可用标签页，无法应用翻译。");
+    return;
+  }
+
+  const config = toConfig();
+  const saveResponse = await chrome.runtime.sendMessage({
+    type: "SAVE_CONFIG",
+    payload: config
+  });
+
+  if (!saveResponse?.ok) {
+    const message = Array.isArray(saveResponse?.errors)
+      ? saveResponse.errors.join(", ")
+      : "Save config failed";
+    setStatus(message, true);
+    return;
+  }
+
+  const response = await sendTabMessageWithAutoInject(tabId, {
+    type: "APPLY_TRANSLATION_SETTINGS",
+    payload: toTranslationPayload(config)
+  });
+
+  if (!response.response) {
+    setInjectionNotice(
+      response.diagnosis
+        ? formatInjectionDiagnosisNotice(response.diagnosis)
+        : "当前页面不支持应用翻译设置。"
+    );
+    return;
+  }
+
+  setInjectionNotice(null);
+  setStatus("翻译设置已保存并应用到当前页");
+}
+
+async function clearTranslationsFromActiveTab(): Promise<void> {
+  const tabId = await getCurrentTabId();
+  if (!tabId) {
+    setInjectionNotice("当前没有可用标签页，无法清除译文。");
+    return;
+  }
+
+  const response = await sendTabMessageWithAutoInject(tabId, {
+    type: "CLEAR_TRANSLATIONS"
+  });
+
+  if (!response.response) {
+    setInjectionNotice(
+      response.diagnosis
+        ? formatInjectionDiagnosisNotice(response.diagnosis)
+        : "当前页面不支持清除译文。"
+    );
+    return;
+  }
+
+  setInjectionNotice(null);
+  setStatus("当前页译文已清除");
 }
 
 async function saveConfig(): Promise<void> {
@@ -573,6 +697,16 @@ configImportFileEl.addEventListener("change", () => {
       currentModels = [...config.models];
       renderModelSelect(config.model);
       agentMaxTokensInput.value = String(config.agentMaxTokens ?? DEFAULT_CONFIG.agentMaxTokens);
+      translationEnabledInput.checked = !!config.translationEnabled;
+      translationTargetLanguageInput.value = config.translationTargetLanguage ?? DEFAULT_CONFIG.translationTargetLanguage;
+      translationDisplayModeInput.value = config.translationDisplayMode ?? DEFAULT_CONFIG.translationDisplayMode;
+      translationDebounceMsInput.value = String(config.translationDebounceMs ?? DEFAULT_CONFIG.translationDebounceMs);
+      translationBatchSizeInput.value = String(config.translationBatchSize ?? DEFAULT_CONFIG.translationBatchSize);
+      translationStyleFontSizeInput.value = String(config.translationStyleFontSize ?? DEFAULT_CONFIG.translationStyleFontSize);
+      translationStyleColorInput.value = config.translationStyleColor ?? DEFAULT_CONFIG.translationStyleColor;
+      translationStyleBackgroundInput.value = config.translationStyleBackground ?? DEFAULT_CONFIG.translationStyleBackground;
+      translationStyleBoldInput.checked = !!config.translationStyleBold;
+      translationStyleItalicInput.checked = !!config.translationStyleItalic;
       unlockContextMenuInput.checked = config.unlockContextMenu;
       blockVisibilityDetectionInput.checked = config.blockVisibilityDetection;
       aggressiveVisibilityBypassInput.checked = config.aggressiveVisibilityBypass;
@@ -1948,6 +2082,14 @@ byId<HTMLButtonElement>("exportConfig").addEventListener("click", () => {
 
 byId<HTMLButtonElement>("importConfigBtn").addEventListener("click", () => {
   triggerImportConfig();
+});
+
+byId<HTMLButtonElement>("applyTranslation").addEventListener("click", () => {
+  void applyTranslationToActiveTab();
+});
+
+byId<HTMLButtonElement>("clearTranslation").addEventListener("click", () => {
+  void clearTranslationsFromActiveTab();
 });
 
 byId<HTMLButtonElement>("loadContext").addEventListener("click", () => {

@@ -52,11 +52,11 @@ export function reduceChatState(state: ChatState, action: ChatStateAction): Chat
     }
 
     const messages = state.messages.slice();
-    const existingThinking = (last as { thinking?: string }).thinking ?? "";
+    const existingThinking = last.reasoning_content ?? "";
     messages[lastIndex] = {
       ...last,
-      thinking: `${existingThinking}${delta}`
-    } as ChatMessage & { thinking: string };
+      reasoning_content: `${existingThinking}${delta}`
+    } as ChatMessage;
     return {
       ...state,
       messages

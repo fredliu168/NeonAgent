@@ -673,7 +673,10 @@
       }
 
       .card input[type="text"],
-      .card input[type="password"] {
+      .card input[type="password"],
+      .card input[type="number"],
+      .card input[type="color"],
+      .card select {
         width: 100%;
         padding: 7px 10px;
         border: 1px solid #e2e8f0;
@@ -937,6 +940,58 @@
             </div>
             <div class="setting-hint">仅在"屏蔽切屏检测"开启时生效</div>
 
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>对照翻译</h2>
+
+          <div class="switch-row">
+            <label><input id="translationEnabled" type="checkbox" /> 启用当前网页对照翻译</label>
+          </div>
+          <div class="setting-hint">以段落为单位翻译，动态内容会自动续译。</div>
+
+          <label for="translationTargetLanguage">目标语言</label>
+          <input id="translationTargetLanguage" type="text" placeholder="中文 / English / 日本語" />
+
+          <label for="translationDisplayMode">显示模式</label>
+          <select id="translationDisplayMode">
+            <option value="below">原文下方显示译文</option>
+            <option value="hover">悬停时显示译文</option>
+          </select>
+
+          <label for="translationDebounceMs">翻译防抖（毫秒）</label>
+          <input id="translationDebounceMs" type="number" min="0" step="50" placeholder="600" />
+
+          <label for="translationBatchSize">单批段落数</label>
+          <input id="translationBatchSize" type="number" min="1" max="20" placeholder="8" />
+
+          <label for="translationStyleFontSize">译文字号</label>
+          <input id="translationStyleFontSize" type="number" min="10" max="28" placeholder="14" />
+
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;align-items:end;">
+            <div>
+              <label for="translationStyleColor">译文颜色</label>
+              <input id="translationStyleColor" type="color" value="#0f172a" />
+            </div>
+            <div>
+              <label for="translationStyleBackground">背景高亮</label>
+              <input id="translationStyleBackground" type="color" value="#f8fafc" />
+            </div>
+          </div>
+
+          <div class="switch-group">
+            <div class="switch-row">
+              <label><input id="translationStyleBold" type="checkbox" /> 译文加粗</label>
+            </div>
+            <div class="switch-row">
+              <label><input id="translationStyleItalic" type="checkbox" /> 译文斜体</label>
+            </div>
+          </div>
+
+          <div style="display:flex;gap:6px;margin-top:10px;">
+            <button id="applyTranslation" class="btn-primary" style="flex:1;">应用到当前页</button>
+            <button id="clearTranslation" class="btn-secondary" style="flex:1;">清除当前页译文</button>
           </div>
         </section>
 

@@ -25,6 +25,7 @@ export interface ToolCall {
 export interface AgentMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string | null;
+  reasoning_content?: string;
   tool_calls?: ToolCall[];
   tool_call_id?: string;
 }

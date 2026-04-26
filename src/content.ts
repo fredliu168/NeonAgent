@@ -6,6 +6,16 @@ type FeatureFlags = {
 };
 
 type LLMConfig = {
+  translationEnabled: boolean;
+  translationTargetLanguage: string;
+  translationDisplayMode: "below" | "hover";
+  translationStyleColor: string;
+  translationStyleBackground: string;
+  translationStyleFontSize: number;
+  translationStyleBold: boolean;
+  translationStyleItalic: boolean;
+  translationDebounceMs: number;
+  translationBatchSize: number;
   unlockContextMenu: boolean;
   blockVisibilityDetection: boolean;
   aggressiveVisibilityBypass: boolean;
@@ -294,6 +304,33 @@ function createVisibilityBypassRuntime(input: {
 }
 
 const FLOATING_BALL_ID = "neonagent-floating-ball";
+const TRANSLATION_SOURCE_ATTR = "data-neonagent-translation-source";
+const TRANSLATION_HOST_ATTR = "data-neonagent-translation-host";
+const TRANSLATION_TEXT_ATTR = "data-neonagent-translation-text";
+
+type TranslationSettings = {
+  enabled: boolean;
+  targetLanguage: string;
+  displayMode: "below" | "hover";
+  styleColor: string;
+  styleBackground: string;
+  styleFontSize: number;
+  styleBold: boolean;
+  styleItalic: boolean;
+  debounceMs: number;
+  batchSize: number;
+};
+
+type TranslationRecord = {
+  id: string;
+  source: HTMLElement;
+  host: HTMLDivElement;
+  body: HTMLDivElement;
+  sourceText: string;
+  translatedText: string;
+  onMouseEnter?: () => void;
+  onMouseLeave?: () => void;
+};
 
 const defaultFeatureFlags: FeatureFlags = {
   unlockContextMenu: false,
@@ -302,7 +339,26 @@ const defaultFeatureFlags: FeatureFlags = {
   enableFloatingBall: false
 };
 
+const defaultTranslationSettings: TranslationSettings = {
+  enabled: false,
+  targetLanguage: "中文",
+  displayMode: "below",
+  styleColor: "#0f172a",
+  styleBackground: "#f8fafc",
+  styleFontSize: 14,
+  styleBold: false,
+  styleItalic: false,
+  debounceMs: 600,
+  batchSize: 8
+};
+
 const cleanupFns: Array<() => void> = [];
+const translationRecords = new Map<string, TranslationRecord>();
+let translationSettings: TranslationSettings = { ...defaultTranslationSettings };
+let translationObserver: MutationObserver | null = null;
+let translationTimer: ReturnType<typeof setTimeout> | null = null;
+let translationRunId = 0;
+let translationCounter = 0;
 
 function buildPageContext(): string {
   const title = document.title || "Untitled";
@@ -674,6 +730,381 @@ function flagsFromConfig(config: Partial<LLMConfig>): FeatureFlags {
   };
 }
 
+function translationSettingsFromConfig(config: Partial<LLMConfig>): TranslationSettings {
+  const targetLanguage = typeof config.translationTargetLanguage === "string" && config.translationTargetLanguage.trim()
+    ? config.translationTargetLanguage.trim()
+    : defaultTranslationSettings.targetLanguage;
+
+  return {
+    enabled: !!config.translationEnabled,
+    targetLanguage,
+    displayMode: config.translationDisplayMode === "hover" ? "hover" : "below",
+    styleColor: typeof config.translationStyleColor === "string" && config.translationStyleColor.trim()
+      ? config.translationStyleColor.trim()
+      : defaultTranslationSettings.styleColor,
+    styleBackground: typeof config.translationStyleBackground === "string" && config.translationStyleBackground.trim()
+      ? config.translationStyleBackground.trim()
+      : defaultTranslationSettings.styleBackground,
+    styleFontSize: typeof config.translationStyleFontSize === "number" && config.translationStyleFontSize > 0
+      ? config.translationStyleFontSize
+      : defaultTranslationSettings.styleFontSize,
+    styleBold: !!config.translationStyleBold,
+    styleItalic: !!config.translationStyleItalic,
+    debounceMs: typeof config.translationDebounceMs === "number" && config.translationDebounceMs >= 0
+      ? Math.round(config.translationDebounceMs)
+      : defaultTranslationSettings.debounceMs,
+    batchSize: typeof config.translationBatchSize === "number" && config.translationBatchSize > 0
+      ? Math.round(config.translationBatchSize)
+      : defaultTranslationSettings.batchSize
+  };
+}
+
+function isTranslationHost(node: Element | null): boolean {
+  return !!node?.hasAttribute?.(TRANSLATION_HOST_ATTR);
+}
+
+function isTranslatableElement(node: HTMLElement): boolean {
+  const tag = node.tagName.toLowerCase();
+  const allowedTags = new Set(["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "figcaption", "td", "th"]);
+  if (!allowedTags.has(tag)) {
+    return false;
+  }
+
+  if (node.closest("pre, code, nav, header, footer, aside, script, style, noscript, textarea, button, input, select")) {
+    return false;
+  }
+
+  if (isTranslationHost(node) || node.closest(`[${TRANSLATION_HOST_ATTR}]`)) {
+    return false;
+  }
+
+  const text = normalizeText(node.innerText || node.textContent || "");
+  return text.length >= 2;
+}
+
+function collectTranslatableElements(): HTMLElement[] {
+  return Array.from(document.querySelectorAll<HTMLElement>("p, h1, h2, h3, h4, h5, h6, li, blockquote, figcaption, td, th"))
+    .filter((node) => isTranslatableElement(node));
+}
+
+function ensureTranslationId(node: HTMLElement): string {
+  const existing = node.getAttribute(TRANSLATION_SOURCE_ATTR);
+  if (existing) {
+    return existing;
+  }
+
+  translationCounter += 1;
+  const id = `neonagent-translation-${translationCounter}`;
+  node.setAttribute(TRANSLATION_SOURCE_ATTR, id);
+  return id;
+}
+
+function removeTranslationRecord(id: string): void {
+  const record = translationRecords.get(id);
+  if (!record) {
+    return;
+  }
+
+  if (record.onMouseEnter) {
+    record.source.removeEventListener("mouseenter", record.onMouseEnter);
+  }
+  if (record.onMouseLeave) {
+    record.source.removeEventListener("mouseleave", record.onMouseLeave);
+  }
+  record.host.remove();
+  translationRecords.delete(id);
+}
+
+function clearAllTranslations(): void {
+  translationRunId += 1;
+  if (translationTimer) {
+    clearTimeout(translationTimer);
+    translationTimer = null;
+  }
+  translationObserver?.disconnect();
+  translationObserver = null;
+
+  for (const id of Array.from(translationRecords.keys())) {
+    removeTranslationRecord(id);
+  }
+
+  document.querySelectorAll(`[${TRANSLATION_SOURCE_ATTR}]`).forEach((node) => {
+    node.removeAttribute(TRANSLATION_SOURCE_ATTR);
+  });
+}
+
+function getTranslationInsertPosition(node: HTMLElement): InsertPosition {
+  const tagName = node.tagName.toLowerCase();
+  if (["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "figcaption"].includes(tagName)) {
+    return "afterend";
+  }
+
+  return "beforeend";
+}
+
+function ensureTranslationRecord(node: HTMLElement, id: string, position?: InsertPosition): TranslationRecord {
+  const existing = translationRecords.get(id);
+  if (existing) {
+    if (position) {
+      node.insertAdjacentElement(position, existing.host);
+    }
+    return existing;
+  }
+
+  const host = document.createElement("div");
+  host.setAttribute(TRANSLATION_HOST_ATTR, "true");
+  host.style.display = "block";
+  host.style.width = "100%";
+  host.style.margin = "6px 0 10px";
+  host.style.pointerEvents = "none";
+
+  const shadow = host.attachShadow({ mode: "open" });
+  const style = document.createElement("style");
+  style.textContent = [
+    ":host { all: initial; display: block; }",
+    ".translation { display: block; line-height: 1.6; border-radius: 8px; padding: 8px 10px; white-space: pre-wrap; word-break: break-word; box-sizing: border-box; }"
+  ].join("\n");
+  const body = document.createElement("div");
+  body.className = "translation";
+  shadow.appendChild(style);
+  shadow.appendChild(body);
+
+  node.insertAdjacentElement(position || getTranslationInsertPosition(node), host);
+
+  const record: TranslationRecord = {
+    id,
+    source: node,
+    host,
+    body,
+    sourceText: "",
+    translatedText: ""
+  };
+  translationRecords.set(id, record);
+  return record;
+}
+
+function renderTranslationRecord(record: TranslationRecord): void {
+  record.body.textContent = record.translatedText;
+  record.body.style.color = translationSettings.styleColor;
+  record.body.style.background = translationSettings.styleBackground;
+  record.body.style.fontSize = `${translationSettings.styleFontSize}px`;
+  record.body.style.fontWeight = translationSettings.styleBold ? "700" : "400";
+  record.body.style.fontStyle = translationSettings.styleItalic ? "italic" : "normal";
+  record.body.style.display = "block";
+  record.body.style.lineHeight = "1.6";
+
+  if (!record.onMouseEnter) {
+    record.onMouseEnter = () => {
+      if (translationSettings.displayMode === "hover") {
+        record.host.style.display = "block";
+      }
+    };
+    record.onMouseLeave = () => {
+      if (translationSettings.displayMode === "hover") {
+        record.host.style.display = "none";
+      }
+    };
+    record.source.addEventListener("mouseenter", record.onMouseEnter);
+    record.source.addEventListener("mouseleave", record.onMouseLeave);
+  }
+
+  record.host.style.display = translationSettings.displayMode === "hover" ? "none" : "block";
+}
+
+function resolvePageElement(selector: string, index: number): { element: HTMLElement } | { error: string } {
+  const elements = Array.from(document.querySelectorAll<HTMLElement>(selector));
+  if (elements.length === 0) {
+    return { error: `No elements found for selector: ${selector}` };
+  }
+  if (index >= elements.length) {
+    return { error: `Index ${index} out of range (found ${elements.length})` };
+  }
+  return { element: elements[index] };
+}
+
+function applyTranslationDisplayMode(record: TranslationRecord, displayMode: "below" | "hover"): void {
+  if (!record.onMouseEnter) {
+    record.onMouseEnter = () => {
+      if (displayMode === "hover") {
+        record.host.style.display = "block";
+      }
+    };
+    record.onMouseLeave = () => {
+      if (displayMode === "hover") {
+        record.host.style.display = "none";
+      }
+    };
+    record.source.addEventListener("mouseenter", record.onMouseEnter);
+    record.source.addEventListener("mouseleave", record.onMouseLeave);
+  }
+
+  record.host.style.display = displayMode === "hover" ? "none" : "block";
+}
+
+function createInsertedTextBlock(text: string): HTMLDivElement {
+  const block = document.createElement("div");
+  block.setAttribute(TRANSLATION_HOST_ATTR, "true");
+  block.style.display = "block";
+  block.style.margin = "6px 0 10px";
+  block.style.padding = "8px 10px";
+  block.style.borderRadius = "8px";
+  block.style.lineHeight = "1.6";
+  block.style.whiteSpace = "pre-wrap";
+  block.style.wordBreak = "break-word";
+  block.style.color = translationSettings.styleColor;
+  block.style.background = translationSettings.styleBackground;
+  block.style.fontSize = `${translationSettings.styleFontSize}px`;
+  block.style.fontWeight = translationSettings.styleBold ? "700" : "400";
+  block.style.fontStyle = translationSettings.styleItalic ? "italic" : "normal";
+  block.textContent = text;
+  return block;
+}
+
+async function requestTranslationsBatch(texts: string[]): Promise<string[]> {
+  const response = await chrome.runtime.sendMessage({
+    type: "TRANSLATE_SEGMENTS",
+    payload: {
+      segments: texts,
+      targetLanguage: translationSettings.targetLanguage
+    }
+  }) as { ok?: boolean; data?: { translations?: string[] }; errors?: string[] };
+
+  if (!response?.ok || !Array.isArray(response.data?.translations)) {
+    const message = Array.isArray(response?.errors) ? response.errors.join(", ") : "Translation failed";
+    throw new Error(message);
+  }
+
+  return response.data.translations;
+}
+
+async function runTranslationScan(): Promise<void> {
+  if (!translationSettings.enabled) {
+    return;
+  }
+
+  const runId = ++translationRunId;
+  const nodes = collectTranslatableElements();
+  const activeIds = new Set<string>();
+  const pending: Array<{ id: string; node: HTMLElement; text: string }> = [];
+
+  for (const node of nodes) {
+    const id = ensureTranslationId(node);
+    activeIds.add(id);
+
+    const text = normalizeText(node.innerText || node.textContent || "");
+    if (!text) {
+      continue;
+    }
+
+    const record = ensureTranslationRecord(node, id);
+    if (record.sourceText === text && record.translatedText) {
+      renderTranslationRecord(record);
+      continue;
+    }
+
+    record.source = node;
+    record.sourceText = text;
+    pending.push({ id, node, text });
+  }
+
+  for (const [id, record] of translationRecords.entries()) {
+    if (!activeIds.has(id) || !record.source.isConnected) {
+      removeTranslationRecord(id);
+    }
+  }
+
+  for (let start = 0; start < pending.length; start += translationSettings.batchSize) {
+    if (runId !== translationRunId || !translationSettings.enabled) {
+      return;
+    }
+
+    const batch = pending.slice(start, start + translationSettings.batchSize);
+    const translations = await requestTranslationsBatch(batch.map((item) => item.text));
+    if (runId !== translationRunId || !translationSettings.enabled) {
+      return;
+    }
+
+    translations.forEach((translatedText, index) => {
+      const item = batch[index];
+      if (!item) {
+        return;
+      }
+      const record = ensureTranslationRecord(item.node, item.id);
+      record.sourceText = item.text;
+      record.translatedText = translatedText;
+      renderTranslationRecord(record);
+      item.node.setAttribute(TRANSLATION_TEXT_ATTR, item.text);
+    });
+  }
+}
+
+function scheduleTranslationScan(): void {
+  if (!translationSettings.enabled) {
+    return;
+  }
+
+  if (translationTimer) {
+    clearTimeout(translationTimer);
+  }
+
+  translationTimer = setTimeout(() => {
+    translationTimer = null;
+    void runTranslationScan().catch(() => {
+      // ignored
+    });
+  }, translationSettings.debounceMs);
+}
+
+function ensureTranslationObserver(): void {
+  if (translationObserver || !document.body) {
+    return;
+  }
+
+  translationObserver = new MutationObserver((mutations) => {
+    const hasRelevantChange = mutations.some((mutation) => {
+      if (mutation.type === "characterData") {
+        return true;
+      }
+
+      return Array.from(mutation.addedNodes).some((node) => {
+        return node instanceof HTMLElement && !isTranslationHost(node);
+      });
+    });
+
+    if (hasRelevantChange) {
+      scheduleTranslationScan();
+    }
+  });
+
+  translationObserver.observe(document.body, {
+    childList: true,
+    subtree: true,
+    characterData: true
+  });
+}
+
+function applyTranslationSettings(next: TranslationSettings): void {
+  translationSettings = next;
+
+  if (!translationSettings.enabled) {
+    clearAllTranslations();
+    return;
+  }
+
+  if (!document.body) {
+    document.addEventListener("DOMContentLoaded", () => {
+      if (translationSettings.enabled) {
+        ensureTranslationObserver();
+        scheduleTranslationScan();
+      }
+    }, { once: true });
+    return;
+  }
+
+  ensureTranslationObserver();
+  scheduleTranslationScan();
+}
+
 // ── Agent Page Tool Handlers ──
 
 function agentGetPageInfo(): { url: string; title: string; description: string } {
@@ -725,6 +1156,365 @@ function agentQuerySelector(args: Record<string, unknown>): string {
   });
 
   return `Found ${elements.length} element(s):\n${results.join("\n")}`;
+}
+
+function agentWriteTranslationToPage(args: Record<string, unknown>): string {
+  const selector = typeof args.selector === "string" ? args.selector : "";
+  const text = typeof args.text === "string" ? args.text : "";
+  const index = typeof args.index === "number" ? args.index : 0;
+  const displayMode = args.displayMode === "hover" ? "hover" : "below";
+  const position = typeof args.position === "string" ? (args.position as InsertPosition) : undefined;
+
+  if (!selector) return "Error: selector is required";
+  if (!text.trim()) return "Error: text is required";
+
+  const resolved = resolvePageElement(selector, index);
+  if ("error" in resolved) return resolved.error;
+
+  const id = ensureTranslationId(resolved.element);
+  const record = ensureTranslationRecord(resolved.element, id, position);
+  record.source = resolved.element;
+  record.sourceText = normalizeText(resolved.element.innerText || resolved.element.textContent || "");
+  record.translatedText = text.trim();
+  renderTranslationRecord(record);
+  applyTranslationDisplayMode(record, displayMode);
+
+  return `Wrote translation near ${selector}[${index}] using ${displayMode} mode`;
+}
+
+function agentRemoveTranslationFromPage(args: Record<string, unknown>): string {
+  const selector = typeof args.selector === "string" ? args.selector : "";
+  const index = typeof args.index === "number" ? args.index : 0;
+
+  if (!selector) {
+    const count = translationRecords.size;
+    clearAllTranslations();
+    return `Removed ${count} translation block(s) from page`;
+  }
+
+  const resolved = resolvePageElement(selector, index);
+  if ("error" in resolved) return resolved.error;
+
+  const id = resolved.element.getAttribute(TRANSLATION_SOURCE_ATTR);
+  if (!id) {
+    return `No translation block found for ${selector}[${index}]`;
+  }
+
+  removeTranslationRecord(id);
+  resolved.element.removeAttribute(TRANSLATION_SOURCE_ATTR);
+  resolved.element.removeAttribute(TRANSLATION_TEXT_ATTR);
+  return `Removed translation for ${selector}[${index}]`;
+}
+
+function agentUpdateTranslationOnPage(args: Record<string, unknown>): string {
+  const selector = typeof args.selector === "string" ? args.selector : "";
+  const text = typeof args.text === "string" ? args.text : "";
+  const index = typeof args.index === "number" ? args.index : 0;
+  const displayMode = args.displayMode === "hover" ? "hover" : "below";
+  const position = typeof args.position === "string" ? (args.position as InsertPosition) : undefined;
+
+  if (!selector) return "Error: selector is required";
+  if (!text.trim()) return "Error: text is required";
+
+  const resolved = resolvePageElement(selector, index);
+  if ("error" in resolved) return resolved.error;
+
+  const existingId = resolved.element.getAttribute(TRANSLATION_SOURCE_ATTR);
+  const id = existingId || ensureTranslationId(resolved.element);
+  const record = ensureTranslationRecord(resolved.element, id, position);
+
+  record.source = resolved.element;
+  record.sourceText = normalizeText(resolved.element.innerText || resolved.element.textContent || "");
+  record.translatedText = text.trim();
+  renderTranslationRecord(record);
+  applyTranslationDisplayMode(record, displayMode);
+
+  return existingId
+    ? `Updated translation for ${selector}[${index}] in place`
+    : `Created translation for ${selector}[${index}] using ${displayMode} mode`;
+}
+
+function agentInsertTextBlock(args: Record<string, unknown>): string {
+  const selector = typeof args.selector === "string" ? args.selector : "";
+  const text = typeof args.text === "string" ? args.text : "";
+  const index = typeof args.index === "number" ? args.index : 0;
+  const position = typeof args.position === "string" ? args.position : "afterend";
+
+  if (!selector) return "Error: selector is required";
+  if (!text.trim()) return "Error: text is required";
+  if (!["beforebegin", "afterbegin", "beforeend", "afterend"].includes(position)) {
+    return `Error: unsupported position ${position}`;
+  }
+
+  const resolved = resolvePageElement(selector, index);
+  if ("error" in resolved) return resolved.error;
+
+  const block = createInsertedTextBlock(text.trim());
+  resolved.element.insertAdjacentElement(position as InsertPosition, block);
+  return `Inserted text block ${position} of ${selector}[${index}]`;
+}
+
+function getCanvasButtonMask(button: number): number {
+  switch (button) {
+    case 1:
+      return 4;
+    case 2:
+      return 2;
+    default:
+      return 1;
+  }
+}
+
+function parseCanvasCellReference(cell: string): { row: number; col: number } | null {
+  const normalized = cell.trim().toUpperCase();
+  const match = /^([A-Z]+)(\d+)$/.exec(normalized);
+  if (!match) return null;
+
+  const [, letters, rowDigits] = match;
+  let col = 0;
+  for (const char of letters) {
+    col = (col * 26) + (char.charCodeAt(0) - 64);
+  }
+
+  return {
+    row: Number.parseInt(rowDigits, 10) - 1,
+    col: col - 1
+  };
+}
+
+function getCanvasElements(selector: string): HTMLCanvasElement[] {
+  return Array.from(document.querySelectorAll(selector)).filter((element): element is HTMLCanvasElement => {
+    if (typeof HTMLCanvasElement === "function") {
+      return element instanceof HTMLCanvasElement;
+    }
+    return element.tagName.toLowerCase() === "canvas";
+  });
+}
+
+function resolveCanvasTarget(
+  selector: string,
+  index: number
+): { canvas: HTMLCanvasElement; rect: DOMRect | ReturnType<HTMLCanvasElement["getBoundingClientRect"]> } | { error: string } {
+  const canvases = getCanvasElements(selector);
+  if (canvases.length === 0) {
+    return { error: `No canvas elements found for selector: ${selector}` };
+  }
+  if (index >= canvases.length) {
+    return { error: `Index ${index} out of range (found ${canvases.length})` };
+  }
+
+  const canvas = canvases[index];
+  return { canvas, rect: canvas.getBoundingClientRect() };
+}
+
+function resolveCanvasCoordinates(
+  canvas: HTMLCanvasElement,
+  rect: { width: number; height: number },
+  x: number,
+  y: number,
+  coordinateMode: "css" | "ratio"
+): { cssX: number; cssY: number; bufferX: number; bufferY: number } | { error: string } {
+  const cssX = coordinateMode === "ratio" ? rect.width * x : x;
+  const cssY = coordinateMode === "ratio" ? rect.height * y : y;
+
+  if (cssX < 0 || cssY < 0 || cssX > rect.width || cssY > rect.height) {
+    return {
+      error: `Point (${cssX.toFixed(1)}, ${cssY.toFixed(1)}) is outside canvas bounds ${rect.width.toFixed(1)}x${rect.height.toFixed(1)}`
+    };
+  }
+
+  const scaleX = rect.width > 0 ? canvas.width / rect.width : 1;
+  const scaleY = rect.height > 0 ? canvas.height / rect.height : 1;
+  const maxBufferX = Math.max(0, canvas.width - 1);
+  const maxBufferY = Math.max(0, canvas.height - 1);
+  const bufferX = Math.min(maxBufferX, Math.max(0, Math.floor(cssX * scaleX)));
+  const bufferY = Math.min(maxBufferY, Math.max(0, Math.floor(cssY * scaleY)));
+
+  return { cssX, cssY, bufferX, bufferY };
+}
+
+function toHexChannel(value: number): string {
+  return value.toString(16).padStart(2, "0");
+}
+
+function dispatchCanvasMouseSequence(
+  canvas: HTMLCanvasElement,
+  x: number,
+  y: number,
+  button: number
+): void {
+  const rect = canvas.getBoundingClientRect();
+  const clientX = rect.left + x;
+  const clientY = rect.top + y;
+  const commonInit: MouseEventInit = {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    clientX,
+    clientY,
+    button,
+    buttons: getCanvasButtonMask(button),
+    detail: 1
+  };
+
+  canvas.focus?.();
+
+  if (typeof PointerEvent === "function") {
+    canvas.dispatchEvent(new PointerEvent("pointermove", commonInit));
+    canvas.dispatchEvent(new PointerEvent("pointerdown", commonInit));
+  }
+  canvas.dispatchEvent(new MouseEvent("mousemove", commonInit));
+  canvas.dispatchEvent(new MouseEvent("mousedown", commonInit));
+
+  const releaseInit: MouseEventInit = {
+    ...commonInit,
+    buttons: 0
+  };
+
+  if (typeof PointerEvent === "function") {
+    canvas.dispatchEvent(new PointerEvent("pointerup", releaseInit));
+  }
+  canvas.dispatchEvent(new MouseEvent("mouseup", releaseInit));
+  canvas.dispatchEvent(new MouseEvent("click", releaseInit));
+}
+
+function agentQueryCanvas(args: Record<string, unknown>): string {
+  const selector = typeof args.selector === "string" ? args.selector : "canvas";
+  const limit = typeof args.limit === "number" ? args.limit : 10;
+  const canvases = getCanvasElements(selector).slice(0, limit);
+
+  if (canvases.length === 0) {
+    return `No canvas elements found for selector: ${selector}`;
+  }
+
+  const lines = canvases.map((canvas, index) => {
+    const rect = canvas.getBoundingClientRect();
+    const id = canvas.id ? `#${canvas.id}` : "";
+    const cls = canvas.className && typeof canvas.className === "string"
+      ? `.${canvas.className.trim().split(/\s+/).join(".")}`
+      : "";
+    return `[${index}] <canvas${id}${cls}> css=${Math.round(rect.width)}x${Math.round(rect.height)} px buffer=${canvas.width}x${canvas.height} at (${Math.round(rect.left)}, ${Math.round(rect.top)})`;
+  });
+
+  return `Found ${canvases.length} canvas element(s):\n${lines.join("\n")}`;
+}
+
+function agentInspectCanvasPixel(args: Record<string, unknown>): string {
+  const selector = typeof args.selector === "string" ? args.selector : "canvas";
+  const index = typeof args.index === "number" ? args.index : 0;
+  const x = typeof args.x === "number" ? args.x : NaN;
+  const y = typeof args.y === "number" ? args.y : NaN;
+  const coordinateMode = args.coordinateMode === "ratio" ? "ratio" : "css";
+
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    return "Error: x and y are required";
+  }
+
+  const target = resolveCanvasTarget(selector, index);
+  if ("error" in target) return target.error;
+
+  const { canvas, rect } = target;
+  const point = resolveCanvasCoordinates(canvas, rect, x, y, coordinateMode);
+  if ("error" in point) return point.error;
+
+  const context = canvas.getContext("2d");
+  if (!context) {
+    return "Error: canvas does not expose a 2d context";
+  }
+
+  try {
+    const imageData = context.getImageData(point.bufferX, point.bufferY, 1, 1).data;
+    const [r, g, b, a] = imageData;
+    return JSON.stringify({
+      selector,
+      index,
+      coordinateMode,
+      cssPoint: {
+        x: Number(point.cssX.toFixed(2)),
+        y: Number(point.cssY.toFixed(2))
+      },
+      canvasPixel: {
+        x: point.bufferX,
+        y: point.bufferY
+      },
+      rgba: { r, g, b, a },
+      hex: `#${toHexChannel(r)}${toHexChannel(g)}${toHexChannel(b)}${toHexChannel(a)}`
+    });
+  } catch (error) {
+    return `Inspect canvas pixel failed: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
+function agentClickCanvas(args: Record<string, unknown>): string {
+  const selector = typeof args.selector === "string" ? args.selector : "canvas";
+  const index = typeof args.index === "number" ? args.index : 0;
+  const x = typeof args.x === "number" ? args.x : NaN;
+  const y = typeof args.y === "number" ? args.y : NaN;
+  const coordinateMode = args.coordinateMode === "ratio" ? "ratio" : "css";
+  const button = typeof args.button === "number" ? args.button : 0;
+
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    return "Error: x and y are required";
+  }
+
+  const target = resolveCanvasTarget(selector, index);
+  if ("error" in target) return target.error;
+
+  const { canvas, rect } = target;
+  const point = resolveCanvasCoordinates(canvas, rect, x, y, coordinateMode);
+  if ("error" in point) return point.error;
+
+  dispatchCanvasMouseSequence(canvas, point.cssX, point.cssY, button);
+  return `Clicked canvas ${selector}[${index}] at (${point.cssX.toFixed(1)}, ${point.cssY.toFixed(1)}) using ${coordinateMode} coordinates`;
+}
+
+function agentClickCanvasCell(args: Record<string, unknown>): string {
+  const selector = typeof args.selector === "string" ? args.selector : "canvas";
+  const index = typeof args.index === "number" ? args.index : 0;
+  const rows = typeof args.rows === "number" && args.rows > 0 ? args.rows : 8;
+  const cols = typeof args.cols === "number" && args.cols > 0 ? args.cols : 8;
+  const origin = args.origin === "top-left" ? "top-left" : "bottom-left";
+  const button = typeof args.button === "number" ? args.button : 0;
+  const paddingTop = typeof args.paddingTop === "number" ? args.paddingTop : 0;
+  const paddingRight = typeof args.paddingRight === "number" ? args.paddingRight : 0;
+  const paddingBottom = typeof args.paddingBottom === "number" ? args.paddingBottom : 0;
+  const paddingLeft = typeof args.paddingLeft === "number" ? args.paddingLeft : 0;
+
+  const fromCell = typeof args.cell === "string" ? parseCanvasCellReference(args.cell) : null;
+  const inputRow = fromCell?.row ?? (typeof args.row === "number" ? args.row : NaN);
+  const col = fromCell?.col ?? (typeof args.col === "number" ? args.col : NaN);
+  if (!Number.isInteger(inputRow) || !Number.isInteger(col)) {
+    return "Error: provide row/col or a cell like A1";
+  }
+  if (inputRow < 0 || col < 0) {
+    return "Error: row and col must be >= 0";
+  }
+
+  const displayRow = inputRow;
+  const normalizedRow = origin === "bottom-left" ? (rows - 1 - inputRow) : inputRow;
+  if (normalizedRow < 0 || normalizedRow >= rows || col >= cols) {
+    return `Grid position out of range: row=${displayRow}, col=${col}, grid=${rows}x${cols}`;
+  }
+
+  const canvases = getCanvasElements(selector);
+  if (canvases.length === 0) return `No canvas elements found for selector: ${selector}`;
+  if (index >= canvases.length) return `Index ${index} out of range (found ${canvases.length})`;
+
+  const canvas = canvases[index];
+  const rect = canvas.getBoundingClientRect();
+  const usableWidth = rect.width - paddingLeft - paddingRight;
+  const usableHeight = rect.height - paddingTop - paddingBottom;
+  if (usableWidth <= 0 || usableHeight <= 0) {
+    return "Error: canvas padding leaves no usable area";
+  }
+
+  const cellWidth = usableWidth / cols;
+  const cellHeight = usableHeight / rows;
+  const clickX = paddingLeft + ((col + 0.5) * cellWidth);
+  const clickY = paddingTop + ((normalizedRow + 0.5) * cellHeight);
+
+  dispatchCanvasMouseSequence(canvas, clickX, clickY, button);
+  return `Clicked canvas cell row=${displayRow}, col=${col} on ${selector}[${index}] at (${clickX.toFixed(1)}, ${clickY.toFixed(1)})`;
 }
 
 function agentClickElement(args: Record<string, unknown>): string {
@@ -941,6 +1731,22 @@ function executeAgentTool(
       return agentQuerySelector(args);
     case "click_element":
       return agentClickElement(args);
+    case "query_canvas":
+      return agentQueryCanvas(args);
+    case "inspect_canvas_pixel":
+      return agentInspectCanvasPixel(args);
+    case "click_canvas":
+      return agentClickCanvas(args);
+    case "click_canvas_cell":
+      return agentClickCanvasCell(args);
+    case "write_translation_to_page":
+      return agentWriteTranslationToPage(args);
+    case "remove_translation_from_page":
+      return agentRemoveTranslationFromPage(args);
+    case "update_translation_on_page":
+      return agentUpdateTranslationOnPage(args);
+    case "insert_text_block":
+      return agentInsertTextBlock(args);
     case "type_text":
       return agentTypeText(args);
     case "select_option":
@@ -976,6 +1782,22 @@ function createContentMessageHandler(options?: {
     if (message.type === "APPLY_FEATURE_FLAGS") {
       const payload = message.payload as FeatureFlags | undefined;
       applyFlags(payload ?? defaultFeatureFlags);
+      sendResponse({ ok: true });
+      return;
+    }
+
+    if (message.type === "APPLY_TRANSLATION_SETTINGS") {
+      const payload = message.payload as Partial<LLMConfig> | undefined;
+      applyTranslationSettings(translationSettingsFromConfig(payload ?? {}));
+      sendResponse({ ok: true });
+      return;
+    }
+
+    if (message.type === "CLEAR_TRANSLATIONS") {
+      applyTranslationSettings({
+        ...translationSettings,
+        enabled: false
+      });
       sendResponse({ ok: true });
       return;
     }
@@ -1023,6 +1845,7 @@ if (typeof chrome !== "undefined" && chrome.runtime?.onMessage) {
       if (response?.ok) {
         const config = response.data as Partial<LLMConfig>;
         applyFeatureFlags(flagsFromConfig(config));
+        applyTranslationSettings(translationSettingsFromConfig(config));
       }
     } catch {
       // ignored

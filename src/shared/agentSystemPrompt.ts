@@ -19,6 +19,7 @@ export function buildAgentSystemPrompt(context?: {
 - 你可以通过工具读取页面内容、查找元素、点击按钮、填写表单、执行 JavaScript 等。
 - 所有文本输出都会直接展示给用户，用简洁明了的语言描述你在做什么。
 - 工具执行结果会自动反馈给你，你根据结果决定下一步操作。
+- 为了避免单次加载过多工具，部分领域工具（如 translation, canvas, memory, skill, script_skill, task）是按需加载的，需要时请先调用 load_tool_category 加载它们，随后即可使用。
 - 如果某个操作失败，先分析原因再尝试其他方法，不要盲目重试。
 - 对于不确定的操作，先用 query_selector 或 read_page_content 了解页面结构。`);
 
@@ -69,6 +70,11 @@ export function buildAgentSystemPrompt(context?: {
 - 如果工具不够用，使用 execute_script 执行自定义 JavaScript。
 - 不要一次做太多操作，分步执行以便在出错时定位问题。
 - 遇到页面跳转或动态加载时，使用 wait_for_element 等待目标元素出现。`);
+
+  sections.push(`# 译文展示约定
+- 当任务涉及在页面上展示、替换或清理译文时，优先使用 write_translation_to_page、update_translation_on_page 和 remove_translation_from_page，不要先用 insert_text_block 或 execute_script 拼接临时 DOM。
+- 初次展示译文时优先用 write_translation_to_page；如果目标元素附近已经有插件注入的译文块，优先用 update_translation_on_page 原地更新。
+- 用户要求撤销、清理或隐藏译文时，优先用 remove_translation_from_page；只有在需要插入普通备注或非译文提示时才使用 insert_text_block。`);
 
   sections.push(`# 安全守则
 - 不要在页面上执行可能造成数据丢失的操作，除非用户明确要求。

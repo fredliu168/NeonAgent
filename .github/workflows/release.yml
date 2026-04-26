@@ -1,0 +1,40 @@
+name: Auto Release
+
+on:
+  push:
+    tags:
+      - 'v*' # Trigger on tag push like v1.0.0
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Build Extension
+        run: npm run build
+
+      - name: Package Extension
+        run: |
+          cd dist
+          zip -r ../omniagent-extension.zip .
+          cd ..
+
+      - name: Create Release and Upload Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: omniagent-extension.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

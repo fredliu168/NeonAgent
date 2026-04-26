@@ -1,4 +1,4 @@
-import { validateConfig } from "./shared/config.js";
+import { DEFAULT_CONFIG, validateConfig } from "./shared/config.js";
 import { chromeStorageAdapter } from "./shared/chromeStorageAdapter.js";
 import { ChatHistoryRepository, ConfigRepository, AgentHistoryRepository } from "./shared/storage.js";
 import { isRuntimeMessage } from "./shared/messageGuards.js";
@@ -38,6 +38,13 @@ interface BackgroundDependencies {
   executeInSandbox?: (code: string, toolName: string, args: Record<string, unknown>, envVars: Record<string, string>) => Promise<string>;
 }
 
+const TRANSLATION_CACHE_KEY = "neonagent.translationCache";
+
+type TranslationCache = Record<string, {
+  translatedText: string;
+  updatedAt: number;
+}>;
+
 // ── Offscreen / Sandbox helpers ──
 
 async function ensureOffscreenDocument(): Promise<void> {
@@ -73,6 +80,127 @@ async function executeScriptInSandbox(
     throw new Error(response?.error ?? "Sandbox execution failed");
   }
   return response.result ?? "";
+}
+
+function buildTranslationCacheKey(targetLanguage: string, text: string): string {
+  return `${targetLanguage.trim()}::${text}`;
+}
+
+async function getTranslationCache(storage: StorageLike): Promise<TranslationCache> {
+  const cache = await storage.get<TranslationCache>(TRANSLATION_CACHE_KEY);
+  return cache && typeof cache === "object" ? cache : {};
+}
+
+async function saveTranslationCache(storage: StorageLike, cache: TranslationCache): Promise<void> {
+  await storage.set(TRANSLATION_CACHE_KEY, cache);
+}
+
+function buildTranslationPrompt(targetLanguage: string, segments: string[]): string {
+  return [
+    `Translate each text segment into ${targetLanguage}.`,
+    "Keep the meaning, tone, and paragraph boundaries natural.",
+    "Return strict JSON only with this shape:",
+    '{"translations":["translated text 1","translated text 2"]}',
+    "Do not include markdown fences, comments, or explanations.",
+    JSON.stringify({ segments })
+  ].join("\n");
+}
+
+function parseTranslationResponse(content: string, expectedCount: number): string[] {
+  const trimmed = content.trim();
+  let parsed: unknown;
+
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    throw new Error("Translation response is not valid JSON");
+  }
+
+  const translations = Array.isArray(parsed)
+    ? parsed
+    : (typeof parsed === "object" && parsed !== null && Array.isArray((parsed as { translations?: unknown[] }).translations)
+      ? (parsed as { translations: unknown[] }).translations
+      : null);
+
+  if (!translations || !translations.every((item) => typeof item === "string")) {
+    throw new Error("Translation response missing translations array");
+  }
+
+  if (translations.length !== expectedCount) {
+    throw new Error(`Translation response count mismatch: expected ${expectedCount}, got ${translations.length}`);
+  }
+
+  return translations.map((item) => item.trim());
+}
+
+async function translateSegmentsWithCache(
+  storage: StorageLike,
+  config: LLMConfig,
+  targetLanguage: string,
+  segments: string[],
+  invokeLLM: typeof requestChatCompletion
+): Promise<string[]> {
+  const cache = await getTranslationCache(storage);
+  const results = new Array<string>(segments.length);
+  const missingByText = new Map<string, number[]>();
+  let cacheUpdated = false;
+
+  for (let index = 0; index < segments.length; index += 1) {
+    const text = segments[index];
+    const cacheKey = buildTranslationCacheKey(targetLanguage, text);
+    const cached = cache[cacheKey]?.translatedText;
+    if (cached) {
+      results[index] = cached;
+      continue;
+    }
+
+    const bucket = missingByText.get(text);
+    if (bucket) {
+      bucket.push(index);
+    } else {
+      missingByText.set(text, [index]);
+    }
+  }
+
+  const missingTexts = Array.from(missingByText.keys());
+  const batchSize = Math.max(1, config.translationBatchSize || DEFAULT_CONFIG.translationBatchSize);
+
+  for (let start = 0; start < missingTexts.length; start += batchSize) {
+    const batch = missingTexts.slice(start, start + batchSize);
+    const translated = await invokeLLM({
+      config: {
+        ...config,
+        systemPrompt: [
+          "You are a professional translation engine for bilingual reading.",
+          "Translate accurately and naturally.",
+          "Preserve original meaning and paragraph boundaries.",
+          "Output strict JSON only."
+        ].join(" ")
+      },
+      messages: [{ role: "user", content: buildTranslationPrompt(targetLanguage, batch) }]
+    });
+
+    const translations = parseTranslationResponse(translated, batch.length);
+    translations.forEach((translatedText, batchIndex) => {
+      const sourceText = batch[batchIndex];
+      const positions = missingByText.get(sourceText) ?? [];
+      const cacheKey = buildTranslationCacheKey(targetLanguage, sourceText);
+      cache[cacheKey] = {
+        translatedText,
+        updatedAt: Date.now()
+      };
+      positions.forEach((position) => {
+        results[position] = translatedText;
+      });
+      cacheUpdated = true;
+    });
+  }
+
+  if (cacheUpdated) {
+    await saveTranslationCache(storage, cache);
+  }
+
+  return results;
 }
 
 export function createBackgroundMessageHandler(storage: StorageLike, deps: BackgroundDependencies = {}) {
@@ -484,6 +612,50 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
           sendResponse({ ok: true, data: tasks });
         } catch (error) {
           sendResponse({ ok: false, errors: [error instanceof Error ? error.message : "Failed to list tasks"] });
+        }
+        return;
+      }
+
+      if (message.type === "TRANSLATE_SEGMENTS") {
+        const payload = message.payload as { segments?: unknown[]; targetLanguage?: string } | undefined;
+        if (!Array.isArray(payload?.segments)) {
+          sendResponse({ ok: false, errors: ["segments array is required"] });
+          return;
+        }
+
+        const segments = payload.segments.map((segment) => String(segment).trim()).filter(Boolean);
+        if (segments.length === 0) {
+          sendResponse({ ok: true, data: { translations: [], targetLanguage: payload?.targetLanguage ?? "" } });
+          return;
+        }
+
+        try {
+          const config = await repo.getConfig();
+          if (!config.baseUrl.trim() || !config.apiKey.trim()) {
+            sendResponse({ ok: false, errors: ["Translation requires a configured Base URL and API Key"] });
+            return;
+          }
+
+          const targetLanguage = typeof payload.targetLanguage === "string" && payload.targetLanguage.trim()
+            ? payload.targetLanguage.trim()
+            : config.translationTargetLanguage.trim();
+
+          if (!targetLanguage) {
+            sendResponse({ ok: false, errors: ["targetLanguage is required"] });
+            return;
+          }
+
+          const translations = await translateSegmentsWithCache(
+            storage,
+            config,
+            targetLanguage,
+            segments,
+            invokeLLM
+          );
+
+          sendResponse({ ok: true, data: { translations, targetLanguage } });
+        } catch (error) {
+          sendResponse({ ok: false, errors: [error instanceof Error ? error.message : "Translation failed"] });
         }
         return;
       }

@@ -11,7 +11,7 @@ import type {
   ToolCall,
   ToolResult
 } from "./agentTypes.js";
-import { AGENT_TOOL_DEFINITIONS, BACKGROUND_TOOLS, PAGE_TOOLS } from "./agentTools.js";
+import { AGENT_TOOL_DEFINITIONS, BACKGROUND_TOOLS, PAGE_TOOLS, CORE_TOOLS, TOOL_CATEGORIES, type ToolCategory } from "./agentTools.js";
 import { buildAgentSystemPrompt } from "./agentSystemPrompt.js";
 import { requestAgentStream } from "./agentLlmClient.js";
 import type { MemoryEntry } from "./agentMemory.js";
@@ -131,6 +131,9 @@ export async function runAgentLoop(
   const scriptSkillToolDefs = generateScriptSkillToolDefs(scriptSkills);
   const scriptSkillToolNameSet = getScriptSkillToolNames(scriptSkills);
   const allToolDefs = [...AGENT_TOOL_DEFINITIONS, ...scriptSkillToolDefs];
+  const currentToolDefs = allToolDefs.filter(t => CORE_TOOLS.has(t.function.name));
+  const loadedCategories = new Set<string>();
+
 
   const promptContext = (pageContext || memoriesPrompt || skillsPrompt || tasksPrompt || scriptSkillsPrompt)
     ? {
@@ -187,7 +190,7 @@ export async function runAgentLoop(
         {
           config: config.config,
           messages,
-          tools: allToolDefs,
+          tools: currentToolDefs,
           signal
         },
         {
@@ -233,6 +236,7 @@ export async function runAgentLoop(
     const assistantMsg: AgentMessage = {
       role: "assistant",
       content: streamResult.content || null,
+      reasoning_content: streamResult.thinking || undefined,
       tool_calls:
         streamResult.toolCalls.length > 0 ? streamResult.toolCalls : undefined
     };
@@ -269,7 +273,42 @@ export async function runAgentLoop(
         const args = safeParseArgs(tc.function.arguments);
         const toolName = tc.function.name;
 
-        if (PAGE_TOOLS.has(toolName)) {
+        if (toolName === "load_tool_category") {
+          const category = String(args.category);
+          if (!TOOL_CATEGORIES[category as ToolCategory]) {
+            result = {
+              toolCallId: tc.id,
+              toolName,
+              output: `Error: Unknown category '${category}'. Available: ${Object.keys(TOOL_CATEGORIES).join(", ")}`,
+              isError: true
+            };
+          } else if (loadedCategories.has(category)) {
+            result = { toolCallId: tc.id, toolName, output: `Category '${category}' is already loaded.`, isError: false };
+          } else {
+            loadedCategories.add(category);
+            const toolsToAdd = TOOL_CATEGORIES[category as ToolCategory];
+            for (const t of toolsToAdd) {
+              const def = allToolDefs.find(def => def.function.name === t);
+              if (def && !currentToolDefs.some(d => d.function.name === t)) {
+                currentToolDefs.push(def);
+              }
+            }
+            if (category === "script_skill") {
+              const dynDefs = allToolDefs.filter(d => scriptSkillToolNameSet.has(d.function.name));
+              for (const def of dynDefs) {
+                if (!currentToolDefs.some(d => d.function.name === def.function.name)) {
+                  currentToolDefs.push(def);
+                }
+              }
+            }
+            result = {
+              toolCallId: tc.id,
+              toolName,
+              output: `Successfully loaded tools for category '${category}'. Tool definitions are now available in the next turn.`,
+              isError: false
+            };
+          }
+        } else if (PAGE_TOOLS.has(toolName)) {
           result = await withTimeout(
             deps.executePageTool(config.tabId, toolName, args),
             config.toolTimeout ?? 30000,

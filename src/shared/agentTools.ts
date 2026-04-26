@@ -92,6 +92,302 @@ export const AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: "function",
     function: {
+      name: "query_canvas",
+      description:
+        "查询页面上的 Canvas 元素，返回位置、CSS 尺寸和实际像素尺寸。用于确认棋盘所在的 canvas 以及点击坐标范围。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "Canvas 的 CSS 选择器，默认 'canvas'"
+          },
+          limit: {
+            type: "integer",
+            description: "最多返回的 Canvas 数量，默认 10"
+          }
+        },
+        required: [],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "inspect_canvas_pixel",
+      description:
+        "读取 Canvas 上某个点的像素颜色。支持 CSS 像素坐标或比例坐标，返回 RGBA、十六进制颜色和对应的 canvas buffer 像素位置，适合先识别棋盘状态再决定落点。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "Canvas 的 CSS 选择器，默认 'canvas'"
+          },
+          index: {
+            type: "integer",
+            description: "匹配到多个 Canvas 时的索引（从 0 开始），默认 0"
+          },
+          x: {
+            type: "number",
+            description: "横坐标；coordinateMode='css' 时为 CSS 像素，coordinateMode='ratio' 时为 0 到 1 的比例"
+          },
+          y: {
+            type: "number",
+            description: "纵坐标；coordinateMode='css' 时为 CSS 像素，coordinateMode='ratio' 时为 0 到 1 的比例"
+          },
+          coordinateMode: {
+            type: "string",
+            enum: ["css", "ratio"],
+            description: "坐标模式：css=CSS 像素，ratio=相对比例，默认 css"
+          }
+        },
+        required: ["x", "y"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "click_canvas",
+      description:
+        "按坐标点击 Canvas。支持 CSS 像素坐标，或 0 到 1 的相对比例坐标，适合精确点击棋盘上的棋子或格点。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "Canvas 的 CSS 选择器，默认 'canvas'"
+          },
+          index: {
+            type: "integer",
+            description: "匹配到多个 Canvas 时的索引（从 0 开始），默认 0"
+          },
+          x: {
+            type: "number",
+            description: "横坐标；coordinateMode='css' 时为 CSS 像素，coordinateMode='ratio' 时为 0 到 1 的比例"
+          },
+          y: {
+            type: "number",
+            description: "纵坐标；coordinateMode='css' 时为 CSS 像素，coordinateMode='ratio' 时为 0 到 1 的比例"
+          },
+          coordinateMode: {
+            type: "string",
+            enum: ["css", "ratio"],
+            description: "坐标模式：css=CSS 像素，ratio=相对比例，默认 css"
+          },
+          button: {
+            type: "integer",
+            description: "鼠标按键，0=左键，1=中键，2=右键，默认 0"
+          }
+        },
+        required: ["x", "y"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "click_canvas_cell",
+      description:
+        "按棋盘或网格坐标点击 Canvas 中的某个格子。支持直接传 row/col，或用 A1 这类棋盘坐标。默认按 8x8 棋盘计算格子中心。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "Canvas 的 CSS 选择器，默认 'canvas'"
+          },
+          index: {
+            type: "integer",
+            description: "匹配到多个 Canvas 时的索引（从 0 开始），默认 0"
+          },
+          row: {
+            type: "integer",
+            description: "网格行号（从 0 开始）"
+          },
+          col: {
+            type: "integer",
+            description: "网格列号（从 0 开始）"
+          },
+          cell: {
+            type: "string",
+            description: "棋盘坐标，如 A1、H8；提供后可替代 row/col"
+          },
+          rows: {
+            type: "integer",
+            description: "总行数，默认 8"
+          },
+          cols: {
+            type: "integer",
+            description: "总列数，默认 8"
+          },
+          origin: {
+            type: "string",
+            enum: ["top-left", "bottom-left"],
+            description: "行号原点；bottom-left 适合国际象棋/棋盘坐标，默认 bottom-left"
+          },
+          paddingTop: {
+            type: "number",
+            description: "棋盘内容距 Canvas 顶部的内边距，默认 0"
+          },
+          paddingRight: {
+            type: "number",
+            description: "棋盘内容距 Canvas 右侧的内边距，默认 0"
+          },
+          paddingBottom: {
+            type: "number",
+            description: "棋盘内容距 Canvas 底部的内边距，默认 0"
+          },
+          paddingLeft: {
+            type: "number",
+            description: "棋盘内容距 Canvas 左侧的内边距，默认 0"
+          },
+          button: {
+            type: "integer",
+            description: "鼠标按键，0=左键，1=中键，2=右键，默认 0"
+          }
+        },
+        required: [],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "write_translation_to_page",
+      description:
+        "将指定译文写回原页面，默认插入到目标元素下方，并使用插件自己的隔离样式显示。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "目标元素的 CSS 选择器"
+          },
+          text: {
+            type: "string",
+            description: "要写回页面的译文内容"
+          },
+          index: {
+            type: "integer",
+            description: "匹配到多个元素时的索引（从 0 开始），默认 0"
+          },
+          displayMode: {
+            type: "string",
+            enum: ["below", "hover"],
+            description: "显示模式：below=始终显示，hover=悬停原文时显示，默认 below"
+          },
+          position: {
+            type: "string",
+            enum: ["beforebegin", "afterbegin", "beforeend", "afterend"],
+            description: "指定插入位置，不传则由系统根据目标元素类型自动决定最佳位置"
+          }
+        },
+        required: ["selector", "text"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "remove_translation_from_page",
+      description:
+        "移除插件注入到页面中的译文块。可按选择器删除某一条，也可不传 selector 直接清空当前页面全部插件译文。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "原文元素的 CSS 选择器；不传则清空所有插件插入的译文"
+          },
+          index: {
+            type: "integer",
+            description: "匹配到多个元素时的索引（从 0 开始），默认 0"
+          }
+        },
+        required: [],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "update_translation_on_page",
+      description:
+        "原地更新页面上已有的插件译文块；如果目标元素还没有对应译文，则自动创建一个新的译文块。优先用于二次润色/纠错。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "原文元素的 CSS 选择器"
+          },
+          text: {
+            type: "string",
+            description: "新的译文内容"
+          },
+          index: {
+            type: "integer",
+            description: "匹配到多个元素时的索引（从 0 开始），默认 0"
+          },
+          displayMode: {
+            type: "string",
+            enum: ["below", "hover"],
+            description: "显示模式：below=始终显示，hover=悬停原文时显示；不传则保持原模式或默认 below"
+          },
+          position: {
+            type: "string",
+            enum: ["beforebegin", "afterbegin", "beforeend", "afterend"],
+            description: "指定插入位置，不传则由系统根据目标元素类型自动决定最佳位置"
+          }
+        },
+        required: ["selector", "text"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "insert_text_block",
+      description:
+        "在页面上指定元素的前后或内部插入一段纯文本块，可用于备注、提示或临时翻译结果。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "目标元素的 CSS 选择器"
+          },
+          text: {
+            type: "string",
+            description: "要插入的文本内容"
+          },
+          index: {
+            type: "integer",
+            description: "匹配到多个元素时的索引（从 0 开始），默认 0"
+          },
+          position: {
+            type: "string",
+            enum: ["beforebegin", "afterbegin", "beforeend", "afterend"],
+            description: "插入位置，默认 afterend"
+          }
+        },
+        required: ["selector", "text"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "type_text",
       description:
         "在页面上的输入框或文本域中输入文字。如果 clear 为 true 则先清空原有内容。",
@@ -279,6 +575,25 @@ export const AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
         additionalProperties: false
       }
     }
+  },
+  {
+    type: "function",
+    function: {
+      name: "load_tool_category",
+      description: "按需加载特定领域的工具。可用领域包括：'canvas'（画布）、'translation'（页面翻译）、'memory'（长期记忆）、'skill'（原生技能）、'script_skill'（脚本技能）和 'task'（定时任务）。",
+      parameters: {
+        type: "object",
+        properties: {
+          category: {
+            type: "string",
+            enum: ["canvas", "translation", "memory", "skill", "script_skill", "task"],
+            description: "要加载的工具领域类别",
+          },
+        },
+        required: ["category"],
+        additionalProperties: false,
+      },
+    },
   },
   {
     type: "function",
@@ -728,6 +1043,14 @@ export const PAGE_TOOLS = new Set([
   "read_page_content",
   "query_selector",
   "click_element",
+  "query_canvas",
+  "inspect_canvas_pixel",
+  "click_canvas",
+  "click_canvas_cell",
+  "write_translation_to_page",
+  "remove_translation_from_page",
+  "update_translation_on_page",
+  "insert_text_block",
   "type_text",
   "select_option",
   "scroll_page",
@@ -741,8 +1064,26 @@ export const PAGE_TOOLS = new Set([
 export const BACKGROUND_TOOLS = new Set([
   "navigate",
   "get_current_time",
+  "load_tool_category",
   "save_memory", "search_memories", "delete_memory",
   "create_skill", "list_skills", "execute_skill", "update_skill", "delete_skill",
   "install_script_skill", "list_script_skills", "update_script_skill", "uninstall_script_skill",
   "create_scheduled_task", "list_scheduled_tasks", "update_scheduled_task", "delete_scheduled_task"
+]);
+
+export type ToolCategory = "canvas" | "translation" | "memory" | "skill" | "script_skill" | "task";
+
+export const TOOL_CATEGORIES: Record<ToolCategory, string[]> = {
+  canvas: ["query_canvas", "inspect_canvas_pixel", "click_canvas", "click_canvas_cell"],
+  translation: ["write_translation_to_page", "remove_translation_from_page", "update_translation_on_page", "insert_text_block"],
+  memory: ["save_memory", "search_memories", "delete_memory"],
+  skill: ["create_skill", "list_skills", "execute_skill", "update_skill", "delete_skill"],
+  script_skill: ["install_script_skill", "list_script_skills", "update_script_skill", "uninstall_script_skill"],
+  task: ["create_scheduled_task", "list_scheduled_tasks", "update_scheduled_task", "delete_scheduled_task"]
+};
+
+export const CORE_TOOLS = new Set([
+  "get_page_info", "read_page_content", "query_selector", "click_element",
+  "type_text", "wait_for_element", "navigate", "scroll_page", "execute_script",
+  "press_key", "get_form_data", "select_option", "get_current_time", "load_tool_category"
 ]);

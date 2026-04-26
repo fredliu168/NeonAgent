@@ -7,6 +7,16 @@ export interface LLMConfig {
   maxTokens: number;
   agentMaxTokens: number;
   systemPrompt: string;
+  translationEnabled: boolean;
+  translationTargetLanguage: string;
+  translationDisplayMode: "below" | "hover";
+  translationStyleColor: string;
+  translationStyleBackground: string;
+  translationStyleFontSize: number;
+  translationStyleBold: boolean;
+  translationStyleItalic: boolean;
+  translationDebounceMs: number;
+  translationBatchSize: number;
   unlockContextMenu: boolean;
   blockVisibilityDetection: boolean;
   aggressiveVisibilityBypass: boolean;
@@ -28,6 +38,7 @@ export interface ValidationResult {
 export interface ChatMessage {
   role: "system" | "user" | "assistant";
   content: string;
+  reasoning_content?: string;
 }
 
 export interface ChatSession {
