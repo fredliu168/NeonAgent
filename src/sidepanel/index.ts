@@ -1,4 +1,4 @@
-import { DEFAULT_CONFIG, migrateConfig, validateConfig } from "../shared/config.js";
+import { DEFAULT_CONFIG, migrateConfig, normalizeBaseUrl, validateConfig } from "../shared/config.js";
 import { matchAnswersFromText } from "../shared/examAssistant.js";
 import {
   createLLMStreamCancelMessage,
@@ -408,10 +408,10 @@ function dispatchChat(action: ChatStateAction): void {
 
 function toConfig(): LLMConfig {
   return {
-    baseUrl: baseUrlInput.value.trim(),
+    baseUrl: normalizeBaseUrl(baseUrlInput.value.trim()),
     apiKey: apiKeyInput.value.trim(),
-    model: modelInput.value,
-    models: [...currentModels],
+    model: modelInput.value.replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, ""),
+    models: currentModels.map(m => m.replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, "")).filter(Boolean),
     temperature: DEFAULT_CONFIG.temperature,
     maxTokens: DEFAULT_CONFIG.maxTokens,
     agentMaxTokens: parseInt(agentMaxTokensInput.value, 10) || DEFAULT_CONFIG.agentMaxTokens,

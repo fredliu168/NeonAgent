@@ -89,6 +89,28 @@ function parseAgentStreamLine(dataLine: string): AgentStreamDelta | null {
   return { content, reasoning, toolCalls, finishReason };
 }
 
+/**
+ * Serialize messages for the API request.
+ * DeepSeek thinking mode requires assistant messages with reasoning_content
+ * to pass the thinking block back as content[].thinking, otherwise the API
+ * returns a 400 "content[].thinking must be passed back" error.
+ */
+function serializeMessages(messages: AgentMessage[]): unknown[] {
+  return messages.map((msg) => {
+    if (msg.role === "assistant" && msg.reasoning_content) {
+      const contentBlocks: unknown[] = [
+        { type: "thinking", thinking: msg.reasoning_content }
+      ];
+      if (msg.content) {
+        contentBlocks.push({ type: "text", text: msg.content });
+      }
+      const { reasoning_content: _rc, content: _c, ...rest } = msg;
+      return { ...rest, content: contentBlocks };
+    }
+    return msg;
+  });
+}
+
 function buildAgentRequestBody(input: {
   config: LLMConfig;
   messages: AgentMessage[];
@@ -98,7 +120,7 @@ function buildAgentRequestBody(input: {
     model: input.config.model,
     stream: true,
     temperature: input.config.temperature,
-    messages: input.messages,
+    messages: serializeMessages(input.messages),
     tools: input.tools,
     tool_choice: "auto"
   };

@@ -1,5 +1,23 @@
 import type { LLMConfig, ValidationResult } from "./types.js";
 
+/**
+ * Normalize a baseUrl: if the user only entered a host/IP (path is "/" or empty),
+ * automatically append "/v1/chat/completions".
+ */
+export function normalizeBaseUrl(url: string): string {
+  const trimmed = url.trim();
+  if (!trimmed) return trimmed;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.pathname === "/" || parsed.pathname === "") {
+      return trimmed.replace(/\/$/, "") + "/v1/chat/completions";
+    }
+  } catch {
+    // Not a valid full URL — return as-is for validation to catch
+  }
+  return trimmed;
+}
+
 /** Ensure a loaded config has the `models` array, migrating from old single-model format */
 export function migrateConfig(config: LLMConfig): LLMConfig {
   const incomingModels = Array.isArray(config.models) ? config.models : undefined;
@@ -9,15 +27,26 @@ export function migrateConfig(config: LLMConfig): LLMConfig {
     ...config
   };
 
+  // Normalize models: strip surrounding whitespace and non-printable/special characters
+  const sanitizeModel = (m: string) => m.replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, "");
+
   if (!incomingModels || incomingModels.length === 0) {
-    const model = incomingModel || DEFAULT_CONFIG.model;
+    const model = sanitizeModel(incomingModel) || DEFAULT_CONFIG.model;
     next.model = model;
     next.models = [model];
+  } else {
+    next.models = incomingModels.map(sanitizeModel).filter(Boolean);
+    if (next.models.length === 0) next.models = [DEFAULT_CONFIG.model];
   }
+
+  next.model = sanitizeModel(next.model) || DEFAULT_CONFIG.model;
 
   if (!next.models.includes(next.model)) {
     next.model = next.models[0];
   }
+
+  // Normalize baseUrl
+  next.baseUrl = normalizeBaseUrl(next.baseUrl);
 
   if (!next.translationTargetLanguage.trim()) {
     next.translationTargetLanguage = DEFAULT_CONFIG.translationTargetLanguage;
