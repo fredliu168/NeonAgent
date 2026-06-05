@@ -16,6 +16,7 @@ import {
   createSkill, listSkills, executeSkill, updateSkill, deleteSkill,
   getAllSkills, getSkillById, importSkills, formatSkillForExecution
 } from "./shared/agentSkills.js";
+import type { SkillStep } from "./shared/agentSkills.js";
 import {
   createScheduledTask, listScheduledTasks, updateScheduledTask,
   deleteScheduledTask, getScheduledTask, recordTaskRun,
@@ -27,10 +28,12 @@ import {
   recordScriptSkillUsage
 } from "./shared/agentScriptSkill.js";
 import type { ScriptSkillToolDef } from "./shared/agentScriptSkill.js";
+import { BACKGROUND_TOOLS, PAGE_TOOLS } from "./shared/agentTools.js";
 
 interface BackgroundDependencies {
   invokeLLM?: typeof requestChatCompletion;
   invokeLLMStream?: typeof requestChatCompletionStream;
+  runAgent?: typeof runAgentLoop;
   emitStreamEvent?: (event: RuntimeStreamEvent) => void | Promise<void>;
   emitAgentEvent?: (event: AgentProgressEvent) => void | Promise<void>;
   sendTabMessage?: (tabId: number, message: unknown) => Promise<unknown>;
@@ -39,11 +42,80 @@ interface BackgroundDependencies {
 }
 
 const TRANSLATION_CACHE_KEY = "neonagent.translationCache";
+const AUTO_SOLVE_HANDLED_KEY = "neonagent.autoSolveHandled";
 
 type TranslationCache = Record<string, {
   translatedText: string;
   updatedAt: number;
 }>;
+
+interface AgentExternalCommandPayload {
+  requestId?: string;
+  tabId?: number;
+  userMessage?: string;
+  config?: LLMConfig;
+  history?: AgentRunConfig["history"];
+  maxIterations?: number;
+  toolTimeout?: number;
+}
+
+interface AgentExternalToolCallPayload {
+  requestId?: string;
+  tabId?: number;
+  toolName?: string;
+  arguments?: Record<string, unknown>;
+  config?: LLMConfig;
+}
+
+interface AgentExternalGetResultPayload {
+  requestId?: string;
+}
+
+interface LocalCommandEnvelope {
+  type?: string;
+  requestId?: string;
+  token?: string;
+  tabId?: number;
+  userMessage?: string;
+  toolName?: string;
+  arguments?: Record<string, unknown>;
+  skillId?: string;
+  stopOnError?: boolean;
+  waitForResult?: boolean;
+  waitTimeoutMs?: number;
+  pollIntervalMs?: number;
+  maxIterations?: number;
+  toolTimeout?: number;
+  config?: LLMConfig;
+  history?: AgentRunConfig["history"];
+}
+
+type ExternalAgentRunStatus = "running" | "completed" | "error";
+
+interface ExternalAgentToolCallState {
+  id: string;
+  name: string;
+  arguments: string;
+  result?: string;
+  isError?: boolean;
+  status: "running" | "success" | "error";
+}
+
+interface ExternalAgentRunState {
+  requestId: string;
+  senderId: string;
+  tabId: number;
+  userMessage: string;
+  status: ExternalAgentRunStatus;
+  createdAt: number;
+  updatedAt: number;
+  finishedAt?: number;
+  iterations?: number;
+  assistantText: string;
+  thinkingText: string;
+  error?: string;
+  toolCalls: ExternalAgentToolCallState[];
+}
 
 // ── Offscreen / Sandbox helpers ──
 
@@ -104,6 +176,20 @@ function buildTranslationPrompt(targetLanguage: string, segments: string[]): str
     "Do not include markdown fences, comments, or explanations.",
     JSON.stringify({ segments })
   ].join("\n");
+}
+
+function buildStreamingTranslationPrompt(targetLanguage: string, text: string): string {
+  return [
+    `Translate SOURCE_TEXT into ${targetLanguage}.`,
+    "SOURCE_TEXT may be a single word, a short phrase, a sentence, or a paragraph. Always translate the provided SOURCE_TEXT directly.",
+    "Keep the meaning, tone, punctuation, and inline formatting natural.",
+    "Return only the translated text itself. Do not include labels such as Translation/译文/翻译结果, quotes, JSON, markdown fences, comments, source text, or explanations.",
+    "SOURCE_TEXT:",
+    "```text",
+    text,
+    "```",
+    "Translate the exact SOURCE_TEXT above."
+  ].join("\n\n");
 }
 
 function parseTranslationResponse(content: string, expectedCount: number): string[] {
@@ -203,14 +289,338 @@ async function translateSegmentsWithCache(
   return results;
 }
 
+function safePostPortMessage(port: chrome.runtime.Port, message: unknown): void {
+  try {
+    port.postMessage(message);
+  } catch {
+    // Port may have been disconnected by the page.
+  }
+}
+
+export function createBackgroundConnectHandler(storage: StorageLike, deps: BackgroundDependencies = {}) {
+  const repo = new ConfigRepository(storage);
+  const invokeLLMStream = deps.invokeLLMStream ?? requestChatCompletionStream;
+
+  return (port: chrome.runtime.Port): void => {
+    if (port.name !== "TRANSLATE_SEGMENT_STREAM") {
+      return;
+    }
+
+    let disconnected = false;
+    port.onDisconnect.addListener(() => {
+      disconnected = true;
+    });
+
+    port.onMessage.addListener((message: { text?: unknown; targetLanguage?: unknown }) => {
+      void (async () => {
+        const text = typeof message.text === "string" ? message.text.trim() : "";
+        if (!text) {
+          safePostPortMessage(port, { type: "error", error: "text is required" });
+          return;
+        }
+
+        try {
+          const config = await repo.getConfig();
+          if (!config.baseUrl.trim() || !config.apiKey.trim()) {
+            safePostPortMessage(port, { type: "error", error: "Translation requires a configured Base URL and API Key" });
+            return;
+          }
+
+          const targetLanguage = typeof message.targetLanguage === "string" && message.targetLanguage.trim()
+            ? message.targetLanguage.trim()
+            : config.translationTargetLanguage.trim();
+          if (!targetLanguage) {
+            safePostPortMessage(port, { type: "error", error: "targetLanguage is required" });
+            return;
+          }
+
+          const cache = await getTranslationCache(storage);
+          const cacheKey = buildTranslationCacheKey(targetLanguage, text);
+          const cached = cache[cacheKey]?.translatedText;
+          if (cached) {
+            safePostPortMessage(port, { type: "done", text: cached, cached: true });
+            return;
+          }
+
+          let translatedText = "";
+          for await (const delta of invokeLLMStream({
+            config: {
+              ...config,
+              systemPrompt: [
+                "You are a professional streaming translation engine for bilingual reading.",
+                "Translate accurately and naturally.",
+                "The user message always contains SOURCE_TEXT; translate it even when it is a single word or short phrase.",
+                "Output only the translation text itself, with no labels, source text, comments, or explanations."
+              ].join(" ")
+            },
+            messages: [{ role: "user", content: buildStreamingTranslationPrompt(targetLanguage, text) }]
+          })) {
+            if (disconnected) return;
+            const chunk = delta.content ?? "";
+            if (!chunk) continue;
+            translatedText += chunk;
+            safePostPortMessage(port, { type: "delta", delta: chunk });
+          }
+
+          const finalText = translatedText.trim();
+          if (finalText) {
+            cache[cacheKey] = {
+              translatedText: finalText,
+              updatedAt: Date.now()
+            };
+            await saveTranslationCache(storage, cache);
+          }
+          safePostPortMessage(port, { type: "done", text: finalText });
+        } catch (error) {
+          safePostPortMessage(port, {
+            type: "error",
+            error: error instanceof Error ? error.message : "Translation failed"
+          });
+        }
+      })();
+    });
+  };
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function resolveExternalSenderId(sender: unknown): string | null {
+  if (!isObjectRecord(sender)) return null;
+  return typeof sender.id === "string" && sender.id.trim() ? sender.id : null;
+}
+
 export function createBackgroundMessageHandler(storage: StorageLike, deps: BackgroundDependencies = {}) {
   const repo = new ConfigRepository(storage);
   const chatRepo = new ChatHistoryRepository(storage);
   const agentRepo = new AgentHistoryRepository(storage);
   const invokeLLM = deps.invokeLLM ?? requestChatCompletion;
   const invokeLLMStream = deps.invokeLLMStream ?? requestChatCompletionStream;
+  const runAgent = deps.runAgent ?? runAgentLoop;
   const runInSandbox = deps.executeInSandbox ?? executeScriptInSandbox;
   const activeStreamControllers = new Map<string, AbortController>();
+  const MAX_EXTERNAL_AGENT_RUNS = 100;
+  const LOCAL_COMMAND_RECONNECT_ALARM = "neonagent.localCommandReconnect";
+  const LOCAL_COMMAND_RECONNECT_DELAY_MS = 3000;
+  const LOCAL_COMMAND_WATCHDOG_MS = 15000;
+  const LOCAL_COMMAND_CONNECTING_TIMEOUT_MS = 20000;
+  const externalAgentRuns = new Map<string, ExternalAgentRunState>();
+  type AutoSolveHandledRun = { url: string; signatures: string[]; claimedAt: number };
+  const handledAutoSolveRuns = new Map<number, AutoSolveHandledRun>();
+  let pendingAutoSolveRequest: {
+    type: "AUTO_SOLVE_CURRENT_PAGE_REQUESTED";
+    payload: {
+      tabId: number | null;
+      questionCount: number;
+      signature: string;
+      reason: string;
+      title: string;
+      url: string;
+      createdAt: number;
+    };
+  } | null = null;
+  let localCommandSocket: WebSocket | null = null;
+  let localCommandReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let localCommandWatchdogTimer: ReturnType<typeof setInterval> | null = null;
+  let localCommandConnectionKey = "";
+  let localCommandStatus = {
+    enabled: false,
+    state: "disabled" as "disabled" | "connecting" | "connected" | "reconnecting" | "error",
+    url: "",
+    updatedAt: Date.now(),
+    lastConnectedAt: null as number | null,
+    lastError: ""
+  };
+
+  const setLocalCommandStatus = (updates: Partial<typeof localCommandStatus>): void => {
+    localCommandStatus = {
+      ...localCommandStatus,
+      ...updates,
+      updatedAt: Date.now()
+    };
+  };
+
+  const getLocalCommandStatus = () => ({
+    ...localCommandStatus,
+    readyState: localCommandSocket?.readyState ?? null
+  });
+
+  const normalizeAutoSolveUrl = (url: string): string => {
+    try {
+      const parsed = new URL(url);
+      parsed.hash = "";
+      return parsed.toString();
+    } catch {
+      return url.trim();
+    }
+  };
+
+  const normalizeAutoSolveSignature = (signature: string): string => {
+    return signature.replace(/\s+/g, " ").trim();
+  };
+
+  const shouldRunAutoSolve = async (tabId: number | null, url: string, signature: string): Promise<boolean> => {
+    if (tabId === null || !url || !signature) {
+      return false;
+    }
+    const normalized = {
+      url: normalizeAutoSolveUrl(url),
+      signature: normalizeAutoSolveSignature(signature)
+    };
+    const previous = handledAutoSolveRuns.get(tabId);
+    if (
+      previous &&
+      previous.url === normalized.url &&
+      previous.signatures.includes(normalized.signature)
+    ) {
+      return false;
+    }
+
+    const stored = await storage.get<Record<string, AutoSolveHandledRun | { url: string; signature: string; claimedAt: number }>>(AUTO_SOLVE_HANDLED_KEY);
+    const rawExisting = stored?.[String(tabId)];
+    const existing: AutoSolveHandledRun | undefined = rawExisting
+      ? {
+          url: rawExisting.url,
+          signatures: "signatures" in rawExisting
+            ? rawExisting.signatures
+            : [rawExisting.signature],
+          claimedAt: rawExisting.claimedAt
+        }
+      : undefined;
+    if (
+      existing &&
+      existing.url === normalized.url &&
+      existing.signatures.includes(normalized.signature)
+    ) {
+      handledAutoSolveRuns.set(tabId, existing);
+      return false;
+    }
+
+    const signatures = existing && existing.url === normalized.url
+      ? [...existing.signatures, normalized.signature]
+      : [normalized.signature];
+    const next: AutoSolveHandledRun = {
+      url: normalized.url,
+      signatures: Array.from(new Set(signatures)).slice(-50),
+      claimedAt: Date.now()
+    };
+    handledAutoSolveRuns.set(tabId, next);
+    await storage.set(AUTO_SOLVE_HANDLED_KEY, {
+      ...(stored ?? {}),
+      [String(tabId)]: next
+    });
+    return true;
+  };
+
+  const isLocalCommandSocketActive = (): boolean => {
+    return Boolean(
+      localCommandSocket &&
+      (localCommandSocket.readyState === WebSocket.OPEN ||
+        localCommandSocket.readyState === WebSocket.CONNECTING)
+    );
+  };
+
+  const clearLocalCommandReconnectTimer = (): void => {
+    if (localCommandReconnectTimer) {
+      clearTimeout(localCommandReconnectTimer);
+      localCommandReconnectTimer = null;
+    }
+  };
+
+  const pruneExternalAgentRuns = (): void => {
+    if (externalAgentRuns.size < MAX_EXTERNAL_AGENT_RUNS) return;
+    let oldestKey: string | undefined;
+    let oldestTs = Number.POSITIVE_INFINITY;
+    for (const [key, state] of externalAgentRuns.entries()) {
+      if (state.updatedAt < oldestTs) {
+        oldestTs = state.updatedAt;
+        oldestKey = key;
+      }
+    }
+    if (oldestKey) externalAgentRuns.delete(oldestKey);
+  };
+
+  const upsertExternalToolCall = (
+    run: ExternalAgentRunState,
+    toolCallId: string,
+    defaults: Omit<ExternalAgentToolCallState, "id">
+  ): ExternalAgentToolCallState => {
+    const existing = run.toolCalls.find((t) => t.id === toolCallId);
+    if (existing) return existing;
+    const created: ExternalAgentToolCallState = { id: toolCallId, ...defaults };
+    run.toolCalls.push(created);
+    return created;
+  };
+
+  const trackExternalAgentEvent = (event: AgentProgressEvent): void => {
+    const requestId = event.payload.requestId;
+    const run = externalAgentRuns.get(requestId);
+    if (!run) return;
+
+    const now = Date.now();
+    run.updatedAt = now;
+
+    if (event.type === "AGENT_TEXT_DELTA") {
+      run.assistantText += event.payload.delta;
+      return;
+    }
+    if (event.type === "AGENT_THINKING_DELTA") {
+      run.thinkingText += event.payload.delta;
+      return;
+    }
+    if (event.type === "AGENT_TOOL_CALL") {
+      upsertExternalToolCall(run, event.payload.toolCallId, {
+        name: event.payload.name,
+        arguments: event.payload.arguments,
+        status: "running"
+      });
+      return;
+    }
+    if (event.type === "AGENT_TOOL_RESULT") {
+      const tc = upsertExternalToolCall(run, event.payload.toolCallId, {
+        name: event.payload.name,
+        arguments: "",
+        status: event.payload.isError ? "error" : "success"
+      });
+      tc.result = event.payload.result;
+      tc.isError = event.payload.isError;
+      tc.status = event.payload.isError ? "error" : "success";
+      return;
+    }
+    if (event.type === "AGENT_ITERATION_START") {
+      run.iterations = event.payload.iteration;
+      return;
+    }
+    if (event.type === "AGENT_TURN_COMPLETE") {
+      run.status = "completed";
+      run.iterations = event.payload.iterations;
+      run.finishedAt = now;
+      return;
+    }
+    if (event.type === "AGENT_ERROR") {
+      run.status = "error";
+      run.error = event.payload.error;
+      run.finishedAt = now;
+    }
+  };
+
+  const serializeExternalRun = (run: ExternalAgentRunState) => ({
+    requestId: run.requestId,
+    senderId: run.senderId,
+    tabId: run.tabId,
+    userMessage: run.userMessage,
+    status: run.status,
+    createdAt: run.createdAt,
+    updatedAt: run.updatedAt,
+    finishedAt: run.finishedAt,
+    iterations: run.iterations,
+    assistantText: run.assistantText,
+    thinkingText: run.thinkingText,
+    error: run.error,
+    toolCalls: run.toolCalls
+  });
+
   const emitStreamEvent =
     deps.emitStreamEvent ??
     ((event: RuntimeStreamEvent) => {
@@ -219,13 +629,38 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
       }
     });
 
-  const emitAgentEvent =
+  const emitAgentEventRaw =
     deps.emitAgentEvent ??
     ((event: AgentProgressEvent) => {
       if (typeof chrome !== "undefined" && chrome.runtime?.sendMessage) {
         chrome.runtime.sendMessage(event).catch(() => {/* receiver not ready */});
       }
     });
+
+  const emitAgentEvent = async (event: AgentProgressEvent): Promise<void> => {
+    trackExternalAgentEvent(event);
+    await emitAgentEventRaw(event);
+  };
+
+  const emitExternalAgentRunStarted = (input: {
+    requestId: string;
+    senderId: string;
+    tabId: number;
+    userMessage: string;
+  }): void => {
+    if (typeof chrome !== "undefined" && chrome.runtime?.sendMessage) {
+      chrome.runtime.sendMessage({
+        type: "AGENT_EXTERNAL_RUN_STARTED",
+        payload: {
+          requestId: input.requestId,
+          senderId: input.senderId,
+          tabId: input.tabId,
+          userMessage: input.userMessage,
+          createdAt: Date.now()
+        }
+      }).catch(() => {/* receiver not ready */});
+    }
+  };
 
   const sendTabMessage =
     deps.sendTabMessage ??
@@ -238,7 +673,878 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
 
   const activeAgentControllers = new Map<string, AbortController>();
 
-  return (message: { type?: string; payload?: unknown }, _sender: unknown, sendResponse: (response: unknown) => void) => {
+  const executePageTool = async (
+    tabId: number,
+    toolName: string,
+    args: Record<string, unknown>
+  ): Promise<ToolResult> => {
+    const response = await sendTabMessage(tabId, {
+      type: "AGENT_TOOL_EXECUTE",
+      payload: { toolName, arguments: args }
+    }) as { ok?: boolean; data?: string } | undefined;
+
+    return {
+      toolCallId: "",
+      toolName,
+      output: response?.ok
+        ? (typeof response.data === "string" ? response.data : JSON.stringify(response.data))
+        : `Tool execution failed: ${JSON.stringify(response)}`,
+      isError: !response?.ok
+    };
+  };
+
+  const executeBackgroundTool = async (
+    tabId: number,
+    toolName: string,
+    args: Record<string, unknown>,
+    activeConfig: LLMConfig
+  ): Promise<ToolResult> => {
+    if (toolName === "save_memory") {
+      const content = typeof args.content === "string" ? args.content : "";
+      if (!content) {
+        return { toolCallId: "", toolName, output: "Error: content is required", isError: true };
+      }
+      const tags = Array.isArray(args.tags) ? args.tags.map(String) : [];
+      try {
+        const entry = await addMemory(storage, content, tags);
+        // Auto-compress if threshold exceeded
+        const allMem = await getAllMemories(storage);
+        if (needsCompression(allMem) && activeConfig.baseUrl && activeConfig.apiKey) {
+          const callLLM = async (prompt: string): Promise<string> => {
+            return invokeLLM({ config: activeConfig, messages: [{ role: "user", content: prompt }] });
+          };
+          try {
+            const cr = await compressMemories(storage, callLLM);
+            return { toolCallId: "", toolName, output: `Memory saved (id: ${entry.id}): ${entry.content}\n[自动压缩] ${cr.originalCount} → ${cr.compressedCount} 条`, isError: false };
+          } catch {
+            // Compression failed, still return success for save
+          }
+        }
+        return { toolCallId: "", toolName, output: `Memory saved (id: ${entry.id}): ${entry.content}`, isError: false };
+      } catch (error) {
+        return { toolCallId: "", toolName, output: `Save memory failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+      }
+    }
+
+    if (toolName === "search_memories") {
+      const query = typeof args.query === "string" ? args.query : "";
+      try {
+        const results = await searchMemories(storage, query);
+        if (results.length === 0) {
+          return { toolCallId: "", toolName, output: "No memories found.", isError: false };
+        }
+        const formatted = results.map((e) => {
+          const tagStr = e.tags.length > 0 ? ` [${e.tags.join(", ")}]` : "";
+          return `- [${e.id}] ${e.content}${tagStr}`;
+        }).join("\n");
+        return { toolCallId: "", toolName, output: `Found ${results.length} memories:\n${formatted}`, isError: false };
+      } catch (error) {
+        return { toolCallId: "", toolName, output: `Search memories failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+      }
+    }
+
+    if (toolName === "delete_memory") {
+      const memoryId = typeof args.memoryId === "string" ? args.memoryId : "";
+      if (!memoryId) {
+        return { toolCallId: "", toolName, output: "Error: memoryId is required", isError: true };
+      }
+      try {
+        const deleted = await deleteMemory(storage, memoryId);
+        return {
+          toolCallId: "", toolName,
+          output: deleted ? `Memory ${memoryId} deleted.` : `Memory ${memoryId} not found.`,
+          isError: !deleted
+        };
+      } catch (error) {
+        return { toolCallId: "", toolName, output: `Delete memory failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+      }
+    }
+
+    if (toolName === "navigate") {
+      const url = typeof args.url === "string" ? args.url : "";
+      if (!url) {
+        return { toolCallId: "", toolName, output: "Error: url is required", isError: true };
+      }
+      try {
+        if (typeof chrome === "undefined" || !chrome.tabs?.update) {
+          throw new Error("chrome.tabs.update not available");
+        }
+        await chrome.tabs.update(tabId, { url });
+        return { toolCallId: "", toolName, output: `Navigating to ${url}`, isError: false };
+      } catch (error) {
+        return {
+          toolCallId: "",
+          toolName,
+          output: `Navigate failed: ${error instanceof Error ? error.message : String(error)}`,
+          isError: true
+        };
+      }
+    }
+
+    if (toolName === "get_current_time") {
+      const now = new Date();
+      const days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+      const info = {
+        datetime: now.toLocaleString("zh-CN", { hour12: false }),
+        iso: now.toISOString(),
+        timestamp: now.getTime(),
+        dayOfWeek: days[now.getDay()],
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
+      };
+      return { toolCallId: "", toolName, output: JSON.stringify(info), isError: false };
+    }
+
+    // ── Skill Tools ──
+
+    if (toolName === "create_skill") {
+      const name = typeof args.name === "string" ? args.name : "";
+      const description = typeof args.description === "string" ? args.description : "";
+      const steps = Array.isArray(args.steps) ? args.steps as Array<string | SkillStep> : [];
+      if (!name || !description || steps.length === 0) {
+        return { toolCallId: "", toolName, output: "Error: name, description, and steps are required", isError: true };
+      }
+      const tags = Array.isArray(args.tags) ? args.tags.map(String) : [];
+      try {
+        const skill = await createSkill(storage, name, description, steps, tags);
+        return { toolCallId: "", toolName, output: `Skill created (id: ${skill.id}, v${skill.version}): ${skill.name} — ${skill.steps.length} steps`, isError: false };
+      } catch (error) {
+        return { toolCallId: "", toolName, output: `Create skill failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+      }
+    }
+
+    if (toolName === "list_skills") {
+      const query = typeof args.query === "string" ? args.query : "";
+      try {
+        const results = await listSkills(storage, query);
+        if (results.length === 0) {
+          return { toolCallId: "", toolName, output: "No skills found.", isError: false };
+        }
+        const formatted = results.map((s) => {
+          const tagStr = s.tags.length > 0 ? ` [${s.tags.join(", ")}]` : "";
+          const usage = s.usageCount > 0 ? ` (used ${s.usageCount}x)` : "";
+          return `- [${s.id}] ${s.name} (v${s.version}): ${s.description}${tagStr}${usage}`;
+        }).join("\n");
+        return { toolCallId: "", toolName, output: `Found ${results.length} skills:\n${formatted}`, isError: false };
+      } catch (error) {
+        return { toolCallId: "", toolName, output: `List skills failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+      }
+    }
+
+    if (toolName === "execute_skill") {
+      const skillId = typeof args.skillId === "string" ? args.skillId : "";
+      if (!skillId) {
+        return { toolCallId: "", toolName, output: "Error: skillId is required", isError: true };
+      }
+      try {
+        const skill = await executeSkill(storage, skillId);
+        const playbook = formatSkillForExecution(skill);
+        return { toolCallId: "", toolName, output: playbook, isError: false };
+      } catch (error) {
+        return { toolCallId: "", toolName, output: `Execute skill failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+      }
+    }
+
+    if (toolName === "run_skill") {
+      const skillId = typeof args.skillId === "string" ? args.skillId : "";
+      const stopOnError = typeof args.stopOnError === "boolean" ? args.stopOnError : true;
+      if (!skillId) {
+        return { toolCallId: "", toolName, output: "Error: skillId is required", isError: true };
+      }
+
+      try {
+        const skill = await executeSkill(storage, skillId);
+        const lines: string[] = [`Running skill "${skill.name}" (id: ${skill.id}, v${skill.version})`];
+        let hasError = false;
+
+        for (let i = 0; i < skill.steps.length; i += 1) {
+          const step = skill.steps[i];
+          if (step.type !== "tool" || !step.toolName) {
+            lines.push(`${i + 1}. instruction: ${step.instruction}`);
+            continue;
+          }
+
+          const stepToolName = step.toolName;
+          if (stepToolName === "run_skill") {
+            hasError = true;
+            lines.push(`${i + 1}. tool:${stepToolName} -> blocked recursive run_skill call`);
+            if (stopOnError) break;
+            continue;
+          }
+
+          const stepArgs = step.arguments && typeof step.arguments === "object" ? step.arguments : {};
+          const isPageTool = PAGE_TOOLS.has(stepToolName);
+          const isBackgroundTool = BACKGROUND_TOOLS.has(stepToolName);
+          const scriptSkill = !isPageTool && !isBackgroundTool
+            ? await findScriptSkillByToolName(storage, stepToolName)
+            : null;
+
+          if (!isPageTool && !isBackgroundTool && !scriptSkill) {
+            hasError = true;
+            lines.push(`${i + 1}. tool:${stepToolName} -> unknown tool`);
+            if (stopOnError) break;
+            continue;
+          }
+
+          const result = isPageTool
+            ? await executePageTool(tabId, stepToolName, stepArgs)
+            : await executeBackgroundTool(tabId, stepToolName, stepArgs, activeConfig);
+          hasError = hasError || result.isError;
+          lines.push(`${i + 1}. tool:${stepToolName} -> ${result.isError ? "error" : "ok"}\n${result.output}`);
+          if (result.isError && stopOnError) break;
+        }
+
+        return { toolCallId: "", toolName, output: lines.join("\n"), isError: hasError };
+      } catch (error) {
+        return { toolCallId: "", toolName, output: `Run skill failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+      }
+    }
+
+    if (toolName === "update_skill") {
+      const skillId = typeof args.skillId === "string" ? args.skillId : "";
+      if (!skillId) {
+        return { toolCallId: "", toolName, output: "Error: skillId is required", isError: true };
+      }
+      const updates: { name?: string; description?: string; steps?: Array<string | SkillStep>; tags?: string[] } = {};
+      if (typeof args.name === "string") updates.name = args.name;
+      if (typeof args.description === "string") updates.description = args.description;
+      if (Array.isArray(args.steps)) updates.steps = args.steps as Array<string | SkillStep>;
+      if (Array.isArray(args.tags)) updates.tags = args.tags.map(String);
+      try {
+        const skill = await updateSkill(storage, skillId, updates);
+        return { toolCallId: "", toolName, output: `Skill updated (id: ${skill.id}, v${skill.version}): ${skill.name} — ${skill.steps.length} steps`, isError: false };
+      } catch (error) {
+        return { toolCallId: "", toolName, output: `Update skill failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+      }
+    }
+
+    if (toolName === "delete_skill") {
+      const skillId = typeof args.skillId === "string" ? args.skillId : "";
+      if (!skillId) {
+        return { toolCallId: "", toolName, output: "Error: skillId is required", isError: true };
+      }
+      try {
+        const deleted = await deleteSkill(storage, skillId);
+        return {
+          toolCallId: "", toolName,
+          output: deleted ? `Skill ${skillId} deleted.` : `Skill ${skillId} not found.`,
+          isError: !deleted
+        };
+      } catch (error) {
+        return { toolCallId: "", toolName, output: `Delete skill failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+      }
+    }
+
+    // ── Script Skill Management Tools ──
+
+    if (toolName === "install_script_skill") {
+      const name = typeof args.name === "string" ? args.name : "";
+      const description = typeof args.description === "string" ? args.description : "";
+      const code = typeof args.code === "string" ? args.code : "";
+      const tools = Array.isArray(args.tools) ? args.tools as ScriptSkillToolDef[] : [];
+      if (!name || !code || tools.length === 0) {
+        return { toolCallId: "", toolName, output: "Error: name, code, and tools are required", isError: true };
+      }
+      const envVars = (typeof args.envVars === "object" && args.envVars !== null)
+        ? args.envVars as Record<string, string> : {};
+      const sourceUrl = typeof args.sourceUrl === "string" ? args.sourceUrl : undefined;
+      const tags = Array.isArray(args.tags) ? args.tags.map(String) : [];
+      try {
+        const skill = await createScriptSkill(storage, {
+          name, description, code, tools, envVars, sourceUrl, tags
+        });
+        const toolNames = skill.tools.map((t) => t.name).join(", ");
+        return { toolCallId: "", toolName, output: `Script skill installed (id: ${skill.id}): "${skill.name}" — tools: ${toolNames}\n注意：新安装的工具将在下一轮对话中可用。`, isError: false };
+      } catch (error) {
+        return { toolCallId: "", toolName, output: `Install script skill failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+      }
+    }
+
+    if (toolName === "list_script_skills") {
+      const query = typeof args.query === "string" ? args.query : "";
+      try {
+        const results = await listScriptSkills(storage, query);
+        if (results.length === 0) {
+          return { toolCallId: "", toolName, output: "No script skills installed.", isError: false };
+        }
+        const formatted = results.map((s) => {
+          const toolNames = s.tools.map((t) => t.name).join(", ");
+          const tagStr = s.tags.length > 0 ? ` [${s.tags.join(", ")}]` : "";
+          const usage = s.usageCount > 0 ? ` (used ${s.usageCount}x)` : "";
+          const source = s.sourceUrl ? ` (from: ${s.sourceUrl})` : "";
+          return `- [${s.id}] ${s.name} (v${s.version}): ${s.description}${tagStr}${usage}${source}\n  Tools: ${toolNames}`;
+        }).join("\n");
+        return { toolCallId: "", toolName, output: `Found ${results.length} script skills:\n${formatted}`, isError: false };
+      } catch (error) {
+        return { toolCallId: "", toolName, output: `List script skills failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+      }
+    }
+
+    if (toolName === "update_script_skill") {
+      const skillId = typeof args.skillId === "string" ? args.skillId : "";
+      if (!skillId) {
+        return { toolCallId: "", toolName, output: "Error: skillId is required", isError: true };
+      }
+      const updates: Record<string, unknown> = {};
+      if (typeof args.name === "string") updates.name = args.name;
+      if (typeof args.description === "string") updates.description = args.description;
+      if (typeof args.code === "string") updates.code = args.code;
+      if (Array.isArray(args.tools)) updates.tools = args.tools;
+      if (typeof args.envVars === "object" && args.envVars !== null) updates.envVars = args.envVars;
+      if (Array.isArray(args.tags)) updates.tags = args.tags.map(String);
+      try {
+        const skill = await updateScriptSkill(storage, skillId, updates as Parameters<typeof updateScriptSkill>[2]);
+        return { toolCallId: "", toolName, output: `Script skill updated (id: ${skill.id}, v${skill.version}): "${skill.name}"`, isError: false };
+      } catch (error) {
+        return { toolCallId: "", toolName, output: `Update script skill failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+      }
+    }
+
+    if (toolName === "uninstall_script_skill") {
+      const skillId = typeof args.skillId === "string" ? args.skillId : "";
+      if (!skillId) {
+        return { toolCallId: "", toolName, output: "Error: skillId is required", isError: true };
+      }
+      try {
+        const deleted = await deleteScriptSkill(storage, skillId);
+        return {
+          toolCallId: "", toolName,
+          output: deleted ? `Script skill ${skillId} uninstalled.` : `Script skill ${skillId} not found.`,
+          isError: !deleted
+        };
+      } catch (error) {
+        return { toolCallId: "", toolName, output: `Uninstall script skill failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+      }
+    }
+
+    // ── Scheduled Task Tools ──
+
+    if (toolName === "create_scheduled_task") {
+      const name = typeof args.name === "string" ? args.name : "";
+      const instruction = typeof args.instruction === "string" ? args.instruction : "";
+      const scheduleType = typeof args.scheduleType === "string" ? args.scheduleType : "";
+      const time = typeof args.time === "string" ? args.time : "";
+      if (!name || !instruction || !scheduleType) {
+        return { toolCallId: "", toolName, output: "Error: name, instruction, and scheduleType are required", isError: true };
+      }
+      try {
+        const task = await createScheduledTask(storage, {
+          name,
+          instruction,
+          scheduleType: scheduleType as "once" | "interval" | "daily" | "weekly",
+          time,
+          dayOfWeek: typeof args.dayOfWeek === "number" ? args.dayOfWeek : undefined,
+          intervalMinutes: typeof args.intervalMinutes === "number" ? args.intervalMinutes : undefined
+        });
+        // Register the alarm
+        await registerTaskAlarm(task);
+        return { toolCallId: "", toolName, output: `Scheduled task created (id: ${task.id}): "${task.name}" — ${describeTaskSchedule(task)}`, isError: false };
+      } catch (error) {
+        return { toolCallId: "", toolName, output: `Create scheduled task failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+      }
+    }
+
+    if (toolName === "list_scheduled_tasks") {
+      const query = typeof args.query === "string" ? args.query : "";
+      try {
+        const results = await listScheduledTasks(storage, query);
+        if (results.length === 0) {
+          return { toolCallId: "", toolName, output: "No scheduled tasks found.", isError: false };
+        }
+        const formatted = results.map((t) => {
+          const status = t.enabled ? "✅" : "⏸️";
+          const lastRun = t.lastRunAt ? `上次: ${new Date(t.lastRunAt).toLocaleString("zh-CN")}` : "尚未执行";
+          return `- ${status} [${t.id}] ${t.name}: ${describeTaskSchedule(t)} (${lastRun}, 共${t.runCount}次)`;
+        }).join("\n");
+        return { toolCallId: "", toolName, output: `Found ${results.length} tasks:\n${formatted}`, isError: false };
+      } catch (error) {
+        return { toolCallId: "", toolName, output: `List tasks failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+      }
+    }
+
+    if (toolName === "update_scheduled_task") {
+      const taskId = typeof args.taskId === "string" ? args.taskId : "";
+      if (!taskId) {
+        return { toolCallId: "", toolName, output: "Error: taskId is required", isError: true };
+      }
+      const updates: Record<string, unknown> = {};
+      if (typeof args.name === "string") updates.name = args.name;
+      if (typeof args.instruction === "string") updates.instruction = args.instruction;
+      if (typeof args.scheduleType === "string") updates.scheduleType = args.scheduleType;
+      if (typeof args.time === "string") updates.time = args.time;
+      if (typeof args.dayOfWeek === "number") updates.dayOfWeek = args.dayOfWeek;
+      if (typeof args.intervalMinutes === "number") updates.intervalMinutes = args.intervalMinutes;
+      if (typeof args.enabled === "boolean") updates.enabled = args.enabled;
+      try {
+        const task = await updateScheduledTask(storage, taskId, updates);
+        // Re-register alarm with new schedule
+        await unregisterTaskAlarm(taskId);
+        if (task.enabled) {
+          await registerTaskAlarm(task);
+        }
+        return { toolCallId: "", toolName, output: `Task updated (id: ${task.id}): "${task.name}" — ${task.enabled ? "已启用" : "已暂停"}, ${describeTaskSchedule(task)}`, isError: false };
+      } catch (error) {
+        return { toolCallId: "", toolName, output: `Update task failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+      }
+    }
+
+    if (toolName === "delete_scheduled_task") {
+      const taskId = typeof args.taskId === "string" ? args.taskId : "";
+      if (!taskId) {
+        return { toolCallId: "", toolName, output: "Error: taskId is required", isError: true };
+      }
+      try {
+        await unregisterTaskAlarm(taskId);
+        const deleted = await deleteScheduledTask(storage, taskId);
+        return {
+          toolCallId: "", toolName,
+          output: deleted ? `Task ${taskId} deleted.` : `Task ${taskId} not found.`,
+          isError: !deleted
+        };
+      } catch (error) {
+        return { toolCallId: "", toolName, output: `Delete task failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+      }
+    }
+
+    // ── Dynamic Script Skill Tool Execution (via sandbox) ──
+    {
+      const scriptSkill = await findScriptSkillByToolName(storage, toolName);
+      if (scriptSkill) {
+        try {
+          const output = await runInSandbox(scriptSkill.code, toolName, args, scriptSkill.envVars);
+          await recordScriptSkillUsage(storage, scriptSkill.id);
+          return { toolCallId: "", toolName, output, isError: false };
+        } catch (error) {
+          return {
+            toolCallId: "", toolName,
+            output: `Script skill tool "${toolName}" failed: ${error instanceof Error ? error.message : String(error)}`,
+            isError: true
+          };
+        }
+      }
+    }
+
+    return { toolCallId: "", toolName, output: `Unknown background tool: ${toolName}`, isError: true };
+  };
+
+  const startAgentRun = (payload: AgentRunConfig): void => {
+    const controller = new AbortController();
+    activeAgentControllers.set(payload.requestId, controller);
+
+    void (async () => {
+      try {
+        await runAgent(
+          payload,
+          {
+            emit: emitAgentEvent,
+            executePageTool: async (tabId, toolName, args) => executePageTool(tabId, toolName, args),
+            executeBackgroundTool: async (tabId, toolName, args) => executeBackgroundTool(tabId, toolName, args, payload.config),
+            getPageContext: async (tabId) => {
+              try {
+                const resp = await sendTabMessage(tabId, { type: "GET_PAGE_CONTEXT" }) as { ok?: boolean; data?: string } | undefined;
+                if (resp?.ok && typeof resp.data === "string") {
+                  const titleMatch = resp.data.match(/^Title:\s*(.+)/);
+                  return { title: titleMatch?.[1], url: undefined };
+                }
+              } catch {
+                // ignored
+              }
+              return {};
+            },
+            getMemories: async () => {
+              return getAllMemories(storage);
+            },
+            getSkills: async () => {
+              return getAllSkills(storage);
+            },
+            getScheduledTasks: async () => {
+              return getAllScheduledTasks(storage);
+            },
+            getScriptSkills: async () => {
+              return getAllScriptSkills(storage);
+            }
+          },
+          controller.signal
+        );
+      } catch (error) {
+        await emitAgentEvent({
+          type: "AGENT_ERROR",
+          payload: {
+            requestId: payload.requestId,
+            error: error instanceof Error ? error.message : String(error)
+          }
+        });
+      } finally {
+        activeAgentControllers.delete(payload.requestId);
+      }
+    })();
+  };
+
+  const resolveTabId = async (input: unknown): Promise<number | undefined> => {
+    if (typeof input === "number" && Number.isInteger(input) && input > 0) {
+      return input;
+    }
+    if (typeof chrome === "undefined" || !chrome.tabs?.query) {
+      return undefined;
+    }
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    return tab?.id;
+  };
+
+  const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+  const sendLocalCommandResponse = (response: Record<string, unknown>): void => {
+    if (localCommandSocket?.readyState === WebSocket.OPEN) {
+      localCommandSocket.send(JSON.stringify(response));
+    }
+  };
+
+  const waitForExternalRun = async (
+    requestId: string,
+    timeoutMs: number,
+    pollIntervalMs: number
+  ): Promise<ExternalAgentRunState | undefined> => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const run = externalAgentRuns.get(requestId);
+      if (run && run.status !== "running") return run;
+      await sleep(Math.max(100, pollIntervalMs));
+    }
+    return externalAgentRuns.get(requestId);
+  };
+
+  const handleLocalCommandEnvelope = async (
+    envelope: LocalCommandEnvelope,
+    activeConfig: LLMConfig
+  ): Promise<Record<string, unknown>> => {
+    const requestId = typeof envelope.requestId === "string" && envelope.requestId.trim()
+      ? envelope.requestId.trim()
+      : `local-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const type = typeof envelope.type === "string" ? envelope.type : "";
+
+    if (activeConfig.localCommandToken && envelope.token !== activeConfig.localCommandToken) {
+      return { type: "response", requestId, ok: false, errors: ["Invalid local command token"] };
+    }
+
+    if (type === "ping") {
+      return { type: "response", requestId, ok: true, data: { pong: true } };
+    }
+
+    if (type === "get_result") {
+      const rid = typeof envelope.requestId === "string" ? envelope.requestId.trim() : "";
+      const run = rid ? externalAgentRuns.get(rid) : undefined;
+      return run
+        ? { type: "response", requestId: rid, ok: true, data: serializeExternalRun(run) }
+        : { type: "response", requestId: rid || requestId, ok: false, errors: [`Result not found for requestId: ${rid}`] };
+    }
+
+    if (type === "tool_call" || type === "run_skill") {
+      const tabId = await resolveTabId(envelope.tabId);
+      if (!tabId) {
+        return { type: "response", requestId, ok: false, errors: ["tabId is required (or no active tab found)"] };
+      }
+
+      const toolName = type === "run_skill"
+        ? "run_skill"
+        : (typeof envelope.toolName === "string" ? envelope.toolName.trim() : "");
+      if (!toolName) {
+        return { type: "response", requestId, ok: false, errors: ["toolName is required"] };
+      }
+
+      const args = type === "run_skill"
+        ? {
+            skillId: envelope.skillId,
+            stopOnError: envelope.stopOnError
+          }
+        : (isObjectRecord(envelope.arguments) ? envelope.arguments : {});
+
+      const config = envelope.config ?? activeConfig;
+      const isPageTool = PAGE_TOOLS.has(toolName);
+      const isBackgroundTool = BACKGROUND_TOOLS.has(toolName);
+      const scriptSkill = !isPageTool && !isBackgroundTool
+        ? await findScriptSkillByToolName(storage, toolName)
+        : null;
+      if (!isPageTool && !isBackgroundTool && !scriptSkill) {
+        return { type: "response", requestId, ok: false, errors: [`Unknown tool: ${toolName}`] };
+      }
+
+      const result = isPageTool
+        ? await executePageTool(tabId, toolName, args)
+        : await executeBackgroundTool(tabId, toolName, args, config);
+      return {
+        type: "response",
+        requestId,
+        ok: !result.isError,
+        data: {
+          toolName,
+          result: result.output,
+          isError: result.isError
+        }
+      };
+    }
+
+    if (type === "command" || type === "agent" || type === "agent_run" || type === "work") {
+      const userMessage = typeof envelope.userMessage === "string" ? envelope.userMessage.trim() : "";
+      if (!userMessage) {
+        return { type: "response", requestId, ok: false, errors: ["userMessage is required"] };
+      }
+
+      const tabId = await resolveTabId(envelope.tabId);
+      if (!tabId) {
+        return { type: "response", requestId, ok: false, errors: ["tabId is required (or no active tab found)"] };
+      }
+
+      const config = envelope.config ?? activeConfig;
+      const validation = validateConfig(config);
+      if (!validation.valid) {
+        return { type: "response", requestId, ok: false, errors: [`Invalid config: ${validation.errors.join("; ")}`] };
+      }
+
+      const runPayload: AgentRunConfig = {
+        requestId,
+        tabId,
+        config,
+        userMessage,
+        history: envelope.history,
+        maxIterations: typeof envelope.maxIterations === "number" ? envelope.maxIterations : undefined,
+        toolTimeout: typeof envelope.toolTimeout === "number" ? envelope.toolTimeout : undefined
+      };
+
+      pruneExternalAgentRuns();
+      externalAgentRuns.set(requestId, {
+        requestId,
+        senderId: "local-websocket",
+        tabId,
+        userMessage,
+        status: "running",
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        assistantText: "",
+        thinkingText: "",
+        toolCalls: []
+      });
+      emitExternalAgentRunStarted({
+        requestId,
+        senderId: "local-websocket",
+        tabId,
+        userMessage
+      });
+      startAgentRun(runPayload);
+
+      if (!envelope.waitForResult) {
+        return { type: "response", requestId, ok: true, data: { requestId, status: "running" } };
+      }
+
+      const run = await waitForExternalRun(
+        requestId,
+        typeof envelope.waitTimeoutMs === "number" ? envelope.waitTimeoutMs : 120000,
+        typeof envelope.pollIntervalMs === "number" ? envelope.pollIntervalMs : 1000
+      );
+
+      if (!run || run.status === "running") {
+        return {
+          type: "response",
+          requestId,
+          ok: false,
+          errors: ["Timed out waiting for command result"],
+          data: run ? serializeExternalRun(run) : undefined
+        };
+      }
+
+      return { type: "response", requestId, ok: run.status === "completed", data: serializeExternalRun(run) };
+    }
+
+    return { type: "response", requestId, ok: false, errors: [`Unknown local command type: ${type}`] };
+  };
+
+  const scheduleLocalCommandReconnect = (delayMs = LOCAL_COMMAND_RECONNECT_DELAY_MS): void => {
+    clearLocalCommandReconnectTimer();
+    localCommandReconnectTimer = setTimeout(() => {
+      localCommandReconnectTimer = null;
+      void refreshLocalCommandSocket();
+    }, delayMs);
+    (localCommandReconnectTimer as { unref?: () => void }).unref?.();
+
+    if (typeof chrome !== "undefined" && chrome.alarms?.create) {
+      chrome.alarms.create(LOCAL_COMMAND_RECONNECT_ALARM, {
+        when: Date.now() + Math.max(1000, delayMs)
+      }).catch(() => {/* ignored */});
+    }
+  };
+
+  const ensureLocalCommandWatchdog = (): void => {
+    if (localCommandWatchdogTimer) return;
+    localCommandWatchdogTimer = setInterval(() => {
+      void (async () => {
+        const config = await repo.getConfig();
+        if (!config.localCommandEnabled) return;
+
+        const state = localCommandSocket?.readyState;
+        const staleConnecting =
+          state === WebSocket.CONNECTING &&
+          Date.now() - localCommandStatus.updatedAt > LOCAL_COMMAND_CONNECTING_TIMEOUT_MS;
+
+        if (!localCommandSocket || state === WebSocket.CLOSING || state === WebSocket.CLOSED || staleConnecting) {
+          if (localCommandSocket) {
+            try {
+              localCommandSocket.close();
+            } catch {
+              // ignored
+            }
+            localCommandSocket = null;
+          }
+          setLocalCommandStatus({
+            enabled: true,
+            state: "reconnecting",
+            url: config.localCommandWsUrl,
+            lastError: staleConnecting ? "WebSocket connection timed out" : localCommandStatus.lastError
+          });
+          scheduleLocalCommandReconnect(0);
+        }
+      })();
+    }, LOCAL_COMMAND_WATCHDOG_MS);
+    (localCommandWatchdogTimer as { unref?: () => void }).unref?.();
+  };
+
+  const refreshLocalCommandSocket = async (): Promise<void> => {
+    const config = await repo.getConfig();
+    const key = `${config.localCommandEnabled ? "1" : "0"}:${config.localCommandWsUrl}:${config.localCommandToken}`;
+
+    if (!config.localCommandEnabled || typeof WebSocket === "undefined") {
+      setLocalCommandStatus({
+        enabled: false,
+        state: "disabled",
+        url: config.localCommandWsUrl,
+        lastError: typeof WebSocket === "undefined" ? "WebSocket is not available in this runtime" : ""
+      });
+      localCommandConnectionKey = key;
+      clearLocalCommandReconnectTimer();
+      if (typeof chrome !== "undefined" && chrome.alarms?.clear) {
+        chrome.alarms.clear(LOCAL_COMMAND_RECONNECT_ALARM).catch(() => {/* ignored */});
+      }
+      if (localCommandWatchdogTimer) {
+        clearInterval(localCommandWatchdogTimer);
+        localCommandWatchdogTimer = null;
+      }
+      if (localCommandSocket) {
+        localCommandSocket.close();
+        localCommandSocket = null;
+      }
+      return;
+    }
+
+    if (localCommandConnectionKey === key && isLocalCommandSocketActive()) {
+      return;
+    }
+
+    if (localCommandSocket && !isLocalCommandSocketActive()) {
+      try {
+        localCommandSocket.close();
+      } catch {
+        // ignored
+      }
+      localCommandSocket = null;
+    }
+
+    setLocalCommandStatus({
+      enabled: true,
+      state: "connecting",
+      url: config.localCommandWsUrl,
+      lastError: ""
+    });
+    ensureLocalCommandWatchdog();
+    localCommandConnectionKey = key;
+    clearLocalCommandReconnectTimer();
+    if (localCommandSocket) {
+      localCommandSocket.close();
+      localCommandSocket = null;
+    }
+
+    const ws = new WebSocket(config.localCommandWsUrl);
+    localCommandSocket = ws;
+
+    ws.onopen = () => {
+      clearLocalCommandReconnectTimer();
+      if (typeof chrome !== "undefined" && chrome.alarms?.clear) {
+        chrome.alarms.clear(LOCAL_COMMAND_RECONNECT_ALARM).catch(() => {/* ignored */});
+      }
+      setLocalCommandStatus({
+        enabled: true,
+        state: "connected",
+        url: config.localCommandWsUrl,
+        lastConnectedAt: Date.now(),
+        lastError: ""
+      });
+      sendLocalCommandResponse({
+        type: "hello",
+        ok: true,
+        data: {
+          agent: "NeonAgent",
+          commands: ["command", "agent", "agent_run", "work", "tool_call", "run_skill", "get_result", "ping"]
+        }
+      });
+    };
+
+    ws.onmessage = (event) => {
+      void (async () => {
+        let envelope: LocalCommandEnvelope;
+        try {
+          envelope = JSON.parse(String(event.data)) as LocalCommandEnvelope;
+        } catch {
+          sendLocalCommandResponse({ type: "response", ok: false, errors: ["Invalid JSON message"] });
+          return;
+        }
+
+        try {
+          const latestConfig = await repo.getConfig();
+          const response = await handleLocalCommandEnvelope(envelope, latestConfig);
+          sendLocalCommandResponse(response);
+        } catch (error) {
+          sendLocalCommandResponse({
+            type: "response",
+            requestId: envelope.requestId,
+            ok: false,
+            errors: [error instanceof Error ? error.message : String(error)]
+          });
+        }
+      })();
+    };
+
+    ws.onclose = () => {
+      if (localCommandSocket === ws) {
+        localCommandSocket = null;
+      }
+      if (localCommandConnectionKey === key && config.localCommandEnabled) {
+        setLocalCommandStatus({
+          enabled: true,
+          state: "reconnecting",
+          url: config.localCommandWsUrl
+        });
+        scheduleLocalCommandReconnect();
+      }
+    };
+
+    ws.onerror = () => {
+      setLocalCommandStatus({
+        enabled: true,
+        state: "error",
+        url: config.localCommandWsUrl,
+        lastError: "WebSocket connection error"
+      });
+      scheduleLocalCommandReconnect();
+      ws.close();
+    };
+  };
+
+  void refreshLocalCommandSocket();
+  if (typeof chrome !== "undefined" && chrome.alarms?.onAlarm) {
+    chrome.alarms.onAlarm.addListener((alarm) => {
+      if (alarm.name === LOCAL_COMMAND_RECONNECT_ALARM) {
+        void refreshLocalCommandSocket();
+      }
+    });
+  }
+
+  return (message: { type?: string; payload?: unknown }, sender: chrome.runtime.MessageSender, sendResponse: (response: unknown) => void) => {
     void (async () => {
       if (message.type === "PING") {
         sendResponse({ ok: true, data: "PONG" });
@@ -251,6 +1557,76 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
         return;
       }
 
+      if (message.type === "GET_LOCAL_COMMAND_STATUS") {
+        sendResponse({ ok: true, data: getLocalCommandStatus() });
+        return;
+      }
+
+      if (message.type === "GET_PENDING_AUTO_SOLVE_REQUEST") {
+        const payload = (message.payload ?? {}) as { tabId?: number };
+        const tabId = typeof payload.tabId === "number" ? payload.tabId : null;
+        const pending = pendingAutoSolveRequest &&
+          (pendingAutoSolveRequest.payload.tabId === null || tabId === null || pendingAutoSolveRequest.payload.tabId === tabId)
+          ? pendingAutoSolveRequest
+          : null;
+        sendResponse({ ok: true, data: pending });
+        return;
+      }
+
+      if (message.type === "CLEAR_PENDING_AUTO_SOLVE_REQUEST") {
+        const payload = (message.payload ?? {}) as { signature?: string };
+        if (!payload.signature || pendingAutoSolveRequest?.payload.signature === payload.signature) {
+          pendingAutoSolveRequest = null;
+        }
+        sendResponse({ ok: true });
+        return;
+      }
+
+      if (message.type === "CLAIM_AUTO_SOLVE_RUN") {
+        const payload = (message.payload ?? {}) as { tabId?: number; url?: string; signature?: string };
+        const tabId = typeof payload.tabId === "number" ? payload.tabId : null;
+        const url = typeof payload.url === "string" ? payload.url : "";
+        const signature = typeof payload.signature === "string" ? payload.signature : "";
+        const shouldRun = await shouldRunAutoSolve(tabId, url, signature);
+        sendResponse({ ok: true, data: { shouldRun } });
+        return;
+      }
+
+      if (message.type === "AUTO_SOLVE_CURRENT_PAGE_REQUEST") {
+        const config = await repo.getConfig();
+        if (!config.autoSolveCurrentPage) {
+          sendResponse({ ok: true, data: { ignored: true, reason: "disabled" } });
+          return;
+        }
+
+        const payload = (message.payload ?? {}) as Record<string, unknown>;
+        const event = {
+          type: "AUTO_SOLVE_CURRENT_PAGE_REQUESTED",
+          payload: {
+            tabId: sender.tab?.id ?? null,
+            questionCount: typeof payload.questionCount === "number" ? payload.questionCount : 0,
+            signature: typeof payload.signature === "string" ? payload.signature : "",
+            reason: typeof payload.reason === "string" ? payload.reason : "",
+            title: typeof payload.title === "string" ? payload.title : "",
+            url: typeof payload.url === "string" ? payload.url : "",
+            createdAt: Date.now()
+          }
+        } as const;
+
+        if (!await shouldRunAutoSolve(event.payload.tabId, event.payload.url, event.payload.signature)) {
+          sendResponse({ ok: true, data: { notified: false, duplicate: true } });
+          return;
+        }
+
+        pendingAutoSolveRequest = event;
+
+        if (typeof chrome !== "undefined" && chrome.runtime?.sendMessage) {
+          chrome.runtime.sendMessage(event).catch(() => {/* receiver not ready */});
+        }
+        sendResponse({ ok: true, data: { notified: true } });
+        return;
+      }
+
       if (message.type === "SAVE_CONFIG") {
         const config = message.payload as LLMConfig;
         const validation = validateConfig(config);
@@ -260,7 +1636,52 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
         }
 
         await repo.saveConfig(config);
+        void refreshLocalCommandSocket();
         sendResponse({ ok: true });
+        return;
+      }
+
+      if (message.type === "TEST_LLM_CONFIG") {
+        const config = {
+          ...(message.payload as LLMConfig),
+          agentMaxTokens: Math.min(Math.max((message.payload as LLMConfig)?.agentMaxTokens || 16, 16), 64),
+          maxTokens: Math.min(Math.max((message.payload as LLMConfig)?.maxTokens || 16, 16), 64)
+        };
+        const validation = validateConfig(config);
+        if (!validation.valid) {
+          sendResponse({ ok: false, errors: validation.errors });
+          return;
+        }
+
+        const startedAt = Date.now();
+        try {
+          let content = "";
+          for await (const delta of invokeLLMStream({
+            config,
+            messages: [
+              {
+                role: "user",
+                content: "Reply with exactly: ok"
+              }
+            ]
+          })) {
+            if (delta.content) content += delta.content;
+            if (!delta.content && delta.reasoning) content += delta.reasoning;
+          }
+          sendResponse({
+            ok: true,
+            data: {
+              model: config.model,
+              latencyMs: Date.now() - startedAt,
+              content: content.trim().slice(0, 200)
+            }
+          });
+        } catch (error) {
+          sendResponse({
+            ok: false,
+            errors: [error instanceof Error ? error.message : String(error)]
+          });
+        }
         return;
       }
 
@@ -739,6 +2160,163 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
         return;
       }
 
+      if (message.type === "AGENT_EXTERNAL_TOOL_CALL") {
+        const senderId = resolveExternalSenderId(sender);
+        if (!senderId) {
+          sendResponse({ ok: false, errors: ["Only extension senders can call AGENT_EXTERNAL_TOOL_CALL"] });
+          return;
+        }
+
+        const payload = message.payload as AgentExternalToolCallPayload | undefined;
+        const toolName = typeof payload?.toolName === "string" ? payload.toolName.trim() : "";
+        if (!toolName) {
+          sendResponse({ ok: false, errors: ["toolName is required"] });
+          return;
+        }
+
+        const tabId = await resolveTabId(payload?.tabId);
+        if (!tabId) {
+          sendResponse({ ok: false, errors: ["tabId is required (or no active tab found)"] });
+          return;
+        }
+
+        const args = isObjectRecord(payload?.arguments) ? payload.arguments : {};
+        const requestId = typeof payload?.requestId === "string" && payload.requestId.trim()
+          ? payload.requestId.trim()
+          : `ext-tool-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+        const config = payload?.config ?? await repo.getConfig();
+
+        const isPageTool = PAGE_TOOLS.has(toolName);
+        const isBackgroundTool = BACKGROUND_TOOLS.has(toolName);
+        const scriptSkill = !isPageTool && !isBackgroundTool
+          ? await findScriptSkillByToolName(storage, toolName)
+          : null;
+
+        if (!isPageTool && !isBackgroundTool && !scriptSkill) {
+          sendResponse({ ok: false, errors: [`Unknown tool: ${toolName}`] });
+          return;
+        }
+
+        const result = isPageTool
+          ? await executePageTool(tabId, toolName, args)
+          : await executeBackgroundTool(tabId, toolName, args, config);
+
+        sendResponse({
+          ok: !result.isError,
+          data: {
+            requestId,
+            senderId,
+            toolName,
+            result: result.output,
+            isError: result.isError
+          }
+        });
+        return;
+      }
+
+      if (message.type === "AGENT_EXTERNAL_GET_RESULT") {
+        const senderId = resolveExternalSenderId(sender);
+        if (!senderId) {
+          sendResponse({ ok: false, errors: ["Only extension senders can call AGENT_EXTERNAL_GET_RESULT"] });
+          return;
+        }
+
+        const payload = message.payload as AgentExternalGetResultPayload | undefined;
+        const requestId = typeof payload?.requestId === "string" ? payload.requestId.trim() : "";
+        if (!requestId) {
+          sendResponse({ ok: false, errors: ["requestId is required"] });
+          return;
+        }
+
+        const run = externalAgentRuns.get(requestId);
+        if (!run) {
+          sendResponse({ ok: false, errors: [`Result not found for requestId: ${requestId}`] });
+          return;
+        }
+        if (run.senderId !== senderId) {
+          sendResponse({ ok: false, errors: ["Not allowed to read this request result"] });
+          return;
+        }
+
+        sendResponse({ ok: true, data: serializeExternalRun(run) });
+        return;
+      }
+
+      if (message.type === "AGENT_EXTERNAL_COMMAND") {
+        const senderId = resolveExternalSenderId(sender);
+        if (!senderId) {
+          sendResponse({ ok: false, errors: ["Only extension senders can call AGENT_EXTERNAL_COMMAND"] });
+          return;
+        }
+
+        const payload = message.payload as AgentExternalCommandPayload | undefined;
+        const userMessage = typeof payload?.userMessage === "string" ? payload.userMessage.trim() : "";
+        if (!userMessage) {
+          sendResponse({ ok: false, errors: ["userMessage is required"] });
+          return;
+        }
+
+        const tabId = await resolveTabId(payload?.tabId);
+        if (!tabId) {
+          sendResponse({ ok: false, errors: ["tabId is required (or no active tab found)"] });
+          return;
+        }
+
+        const requestId = typeof payload?.requestId === "string" && payload.requestId.trim()
+          ? payload.requestId.trim()
+          : `ext-agent-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+        const config = payload?.config ?? await repo.getConfig();
+        const validation = validateConfig(config);
+        if (!validation.valid) {
+          sendResponse({ ok: false, errors: [`Invalid config: ${validation.errors.join("; ")}`] });
+          return;
+        }
+
+        const runPayload: AgentRunConfig = {
+          requestId,
+          tabId,
+          config,
+          userMessage,
+          history: payload?.history,
+          maxIterations: typeof payload?.maxIterations === "number" ? payload.maxIterations : undefined,
+          toolTimeout: typeof payload?.toolTimeout === "number" ? payload.toolTimeout : undefined
+        };
+
+        pruneExternalAgentRuns();
+        externalAgentRuns.set(requestId, {
+          requestId,
+          senderId,
+          tabId,
+          userMessage,
+          status: "running",
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          assistantText: "",
+          thinkingText: "",
+          toolCalls: []
+        });
+
+        emitExternalAgentRunStarted({
+          requestId,
+          senderId,
+          tabId,
+          userMessage
+        });
+
+        sendResponse({
+          ok: true,
+          data: {
+            requestId,
+            senderId
+          }
+        });
+
+        startAgentRun(runPayload);
+        return;
+      }
+
       if (message.type === "AGENT_RUN") {
         const payload = message.payload as AgentRunConfig | undefined;
         if (!payload?.requestId || !payload?.tabId || !payload?.config || !payload?.userMessage) {
@@ -747,431 +2325,7 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
         }
 
         sendResponse({ ok: true, data: { requestId: payload.requestId } });
-
-        const controller = new AbortController();
-        activeAgentControllers.set(payload.requestId, controller);
-
-        void (async () => {
-          try {
-            await runAgentLoop(
-              payload,
-              {
-                emit: emitAgentEvent,
-                executePageTool: async (tabId, toolName, args) => {
-                  const response = await sendTabMessage(tabId, {
-                    type: "AGENT_TOOL_EXECUTE",
-                    payload: { toolName, arguments: args }
-                  }) as { ok?: boolean; data?: string } | undefined;
-
-                  return {
-                    toolCallId: "",
-                    toolName,
-                    output: response?.ok
-                      ? (typeof response.data === "string" ? response.data : JSON.stringify(response.data))
-                      : `Tool execution failed: ${JSON.stringify(response)}`,
-                    isError: !response?.ok
-                  };
-                },
-                executeBackgroundTool: async (tabId, toolName, args) => {
-                  if (toolName === "save_memory") {
-                    const content = typeof args.content === "string" ? args.content : "";
-                    if (!content) {
-                      return { toolCallId: "", toolName, output: "Error: content is required", isError: true };
-                    }
-                    const tags = Array.isArray(args.tags) ? args.tags.map(String) : [];
-                    try {
-                      const entry = await addMemory(storage, content, tags);
-                      // Auto-compress if threshold exceeded
-                      const allMem = await getAllMemories(storage);
-                      if (needsCompression(allMem) && payload.config.baseUrl && payload.config.apiKey) {
-                        const callLLM = async (prompt: string): Promise<string> => {
-                          return invokeLLM({ config: payload.config, messages: [{ role: "user", content: prompt }] });
-                        };
-                        try {
-                          const cr = await compressMemories(storage, callLLM);
-                          return { toolCallId: "", toolName, output: `Memory saved (id: ${entry.id}): ${entry.content}\n[自动压缩] ${cr.originalCount} → ${cr.compressedCount} 条`, isError: false };
-                        } catch {
-                          // Compression failed, still return success for save
-                        }
-                      }
-                      return { toolCallId: "", toolName, output: `Memory saved (id: ${entry.id}): ${entry.content}`, isError: false };
-                    } catch (error) {
-                      return { toolCallId: "", toolName, output: `Save memory failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
-                    }
-                  }
-
-                  if (toolName === "search_memories") {
-                    const query = typeof args.query === "string" ? args.query : "";
-                    try {
-                      const results = await searchMemories(storage, query);
-                      if (results.length === 0) {
-                        return { toolCallId: "", toolName, output: "No memories found.", isError: false };
-                      }
-                      const formatted = results.map((e) => {
-                        const tagStr = e.tags.length > 0 ? ` [${e.tags.join(", ")}]` : "";
-                        return `- [${e.id}] ${e.content}${tagStr}`;
-                      }).join("\n");
-                      return { toolCallId: "", toolName, output: `Found ${results.length} memories:\n${formatted}`, isError: false };
-                    } catch (error) {
-                      return { toolCallId: "", toolName, output: `Search memories failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
-                    }
-                  }
-
-                  if (toolName === "delete_memory") {
-                    const memoryId = typeof args.memoryId === "string" ? args.memoryId : "";
-                    if (!memoryId) {
-                      return { toolCallId: "", toolName, output: "Error: memoryId is required", isError: true };
-                    }
-                    try {
-                      const deleted = await deleteMemory(storage, memoryId);
-                      return {
-                        toolCallId: "", toolName,
-                        output: deleted ? `Memory ${memoryId} deleted.` : `Memory ${memoryId} not found.`,
-                        isError: !deleted
-                      };
-                    } catch (error) {
-                      return { toolCallId: "", toolName, output: `Delete memory failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
-                    }
-                  }
-
-                  if (toolName === "navigate") {
-                    const url = typeof args.url === "string" ? args.url : "";
-                    if (!url) {
-                      return { toolCallId: "", toolName, output: "Error: url is required", isError: true };
-                    }
-                    try {
-                      await chrome.tabs.update(tabId, { url });
-                      return { toolCallId: "", toolName, output: `Navigating to ${url}`, isError: false };
-                    } catch (error) {
-                      return {
-                        toolCallId: "",
-                        toolName,
-                        output: `Navigate failed: ${error instanceof Error ? error.message : String(error)}`,
-                        isError: true
-                      };
-                    }
-                  }
-
-                  if (toolName === "get_current_time") {
-                    const now = new Date();
-                    const days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-                    const info = {
-                      datetime: now.toLocaleString("zh-CN", { hour12: false }),
-                      iso: now.toISOString(),
-                      timestamp: now.getTime(),
-                      dayOfWeek: days[now.getDay()],
-                      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
-                    };
-                    return { toolCallId: "", toolName, output: JSON.stringify(info), isError: false };
-                  }
-
-                  // ── Skill Tools ──
-
-                  if (toolName === "create_skill") {
-                    const name = typeof args.name === "string" ? args.name : "";
-                    const description = typeof args.description === "string" ? args.description : "";
-                    const steps = Array.isArray(args.steps) ? args.steps.map(String) : [];
-                    if (!name || !description || steps.length === 0) {
-                      return { toolCallId: "", toolName, output: "Error: name, description, and steps are required", isError: true };
-                    }
-                    const tags = Array.isArray(args.tags) ? args.tags.map(String) : [];
-                    try {
-                      const skill = await createSkill(storage, name, description, steps, tags);
-                      return { toolCallId: "", toolName, output: `Skill created (id: ${skill.id}, v${skill.version}): ${skill.name} — ${skill.steps.length} steps`, isError: false };
-                    } catch (error) {
-                      return { toolCallId: "", toolName, output: `Create skill failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
-                    }
-                  }
-
-                  if (toolName === "list_skills") {
-                    const query = typeof args.query === "string" ? args.query : "";
-                    try {
-                      const results = await listSkills(storage, query);
-                      if (results.length === 0) {
-                        return { toolCallId: "", toolName, output: "No skills found.", isError: false };
-                      }
-                      const formatted = results.map((s) => {
-                        const tagStr = s.tags.length > 0 ? ` [${s.tags.join(", ")}]` : "";
-                        const usage = s.usageCount > 0 ? ` (used ${s.usageCount}x)` : "";
-                        return `- [${s.id}] ${s.name} (v${s.version}): ${s.description}${tagStr}${usage}`;
-                      }).join("\n");
-                      return { toolCallId: "", toolName, output: `Found ${results.length} skills:\n${formatted}`, isError: false };
-                    } catch (error) {
-                      return { toolCallId: "", toolName, output: `List skills failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
-                    }
-                  }
-
-                  if (toolName === "execute_skill") {
-                    const skillId = typeof args.skillId === "string" ? args.skillId : "";
-                    if (!skillId) {
-                      return { toolCallId: "", toolName, output: "Error: skillId is required", isError: true };
-                    }
-                    try {
-                      const skill = await executeSkill(storage, skillId);
-                      const playbook = formatSkillForExecution(skill);
-                      return { toolCallId: "", toolName, output: playbook, isError: false };
-                    } catch (error) {
-                      return { toolCallId: "", toolName, output: `Execute skill failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
-                    }
-                  }
-
-                  if (toolName === "update_skill") {
-                    const skillId = typeof args.skillId === "string" ? args.skillId : "";
-                    if (!skillId) {
-                      return { toolCallId: "", toolName, output: "Error: skillId is required", isError: true };
-                    }
-                    const updates: { name?: string; description?: string; steps?: string[]; tags?: string[] } = {};
-                    if (typeof args.name === "string") updates.name = args.name;
-                    if (typeof args.description === "string") updates.description = args.description;
-                    if (Array.isArray(args.steps)) updates.steps = args.steps.map(String);
-                    if (Array.isArray(args.tags)) updates.tags = args.tags.map(String);
-                    try {
-                      const skill = await updateSkill(storage, skillId, updates);
-                      return { toolCallId: "", toolName, output: `Skill updated (id: ${skill.id}, v${skill.version}): ${skill.name} — ${skill.steps.length} steps`, isError: false };
-                    } catch (error) {
-                      return { toolCallId: "", toolName, output: `Update skill failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
-                    }
-                  }
-
-                  if (toolName === "delete_skill") {
-                    const skillId = typeof args.skillId === "string" ? args.skillId : "";
-                    if (!skillId) {
-                      return { toolCallId: "", toolName, output: "Error: skillId is required", isError: true };
-                    }
-                    try {
-                      const deleted = await deleteSkill(storage, skillId);
-                      return {
-                        toolCallId: "", toolName,
-                        output: deleted ? `Skill ${skillId} deleted.` : `Skill ${skillId} not found.`,
-                        isError: !deleted
-                      };
-                    } catch (error) {
-                      return { toolCallId: "", toolName, output: `Delete skill failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
-                    }
-                  }
-
-                  // ── Script Skill Management Tools ──
-
-                  if (toolName === "install_script_skill") {
-                    const name = typeof args.name === "string" ? args.name : "";
-                    const description = typeof args.description === "string" ? args.description : "";
-                    const code = typeof args.code === "string" ? args.code : "";
-                    const tools = Array.isArray(args.tools) ? args.tools as ScriptSkillToolDef[] : [];
-                    if (!name || !code || tools.length === 0) {
-                      return { toolCallId: "", toolName, output: "Error: name, code, and tools are required", isError: true };
-                    }
-                    const envVars = (typeof args.envVars === "object" && args.envVars !== null)
-                      ? args.envVars as Record<string, string> : {};
-                    const sourceUrl = typeof args.sourceUrl === "string" ? args.sourceUrl : undefined;
-                    const tags = Array.isArray(args.tags) ? args.tags.map(String) : [];
-                    try {
-                      const skill = await createScriptSkill(storage, {
-                        name, description, code, tools, envVars, sourceUrl, tags
-                      });
-                      const toolNames = skill.tools.map((t) => t.name).join(", ");
-                      return { toolCallId: "", toolName, output: `Script skill installed (id: ${skill.id}): "${skill.name}" — tools: ${toolNames}\n注意：新安装的工具将在下一轮对话中可用。`, isError: false };
-                    } catch (error) {
-                      return { toolCallId: "", toolName, output: `Install script skill failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
-                    }
-                  }
-
-                  if (toolName === "list_script_skills") {
-                    const query = typeof args.query === "string" ? args.query : "";
-                    try {
-                      const results = await listScriptSkills(storage, query);
-                      if (results.length === 0) {
-                        return { toolCallId: "", toolName, output: "No script skills installed.", isError: false };
-                      }
-                      const formatted = results.map((s) => {
-                        const toolNames = s.tools.map((t) => t.name).join(", ");
-                        const tagStr = s.tags.length > 0 ? ` [${s.tags.join(", ")}]` : "";
-                        const usage = s.usageCount > 0 ? ` (used ${s.usageCount}x)` : "";
-                        const source = s.sourceUrl ? ` (from: ${s.sourceUrl})` : "";
-                        return `- [${s.id}] ${s.name} (v${s.version}): ${s.description}${tagStr}${usage}${source}\n  Tools: ${toolNames}`;
-                      }).join("\n");
-                      return { toolCallId: "", toolName, output: `Found ${results.length} script skills:\n${formatted}`, isError: false };
-                    } catch (error) {
-                      return { toolCallId: "", toolName, output: `List script skills failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
-                    }
-                  }
-
-                  if (toolName === "update_script_skill") {
-                    const skillId = typeof args.skillId === "string" ? args.skillId : "";
-                    if (!skillId) {
-                      return { toolCallId: "", toolName, output: "Error: skillId is required", isError: true };
-                    }
-                    const updates: Record<string, unknown> = {};
-                    if (typeof args.name === "string") updates.name = args.name;
-                    if (typeof args.description === "string") updates.description = args.description;
-                    if (typeof args.code === "string") updates.code = args.code;
-                    if (Array.isArray(args.tools)) updates.tools = args.tools;
-                    if (typeof args.envVars === "object" && args.envVars !== null) updates.envVars = args.envVars;
-                    if (Array.isArray(args.tags)) updates.tags = args.tags.map(String);
-                    try {
-                      const skill = await updateScriptSkill(storage, skillId, updates as Parameters<typeof updateScriptSkill>[2]);
-                      return { toolCallId: "", toolName, output: `Script skill updated (id: ${skill.id}, v${skill.version}): "${skill.name}"`, isError: false };
-                    } catch (error) {
-                      return { toolCallId: "", toolName, output: `Update script skill failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
-                    }
-                  }
-
-                  if (toolName === "uninstall_script_skill") {
-                    const skillId = typeof args.skillId === "string" ? args.skillId : "";
-                    if (!skillId) {
-                      return { toolCallId: "", toolName, output: "Error: skillId is required", isError: true };
-                    }
-                    try {
-                      const deleted = await deleteScriptSkill(storage, skillId);
-                      return {
-                        toolCallId: "", toolName,
-                        output: deleted ? `Script skill ${skillId} uninstalled.` : `Script skill ${skillId} not found.`,
-                        isError: !deleted
-                      };
-                    } catch (error) {
-                      return { toolCallId: "", toolName, output: `Uninstall script skill failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
-                    }
-                  }
-
-                  // ── Scheduled Task Tools ──
-
-                  if (toolName === "create_scheduled_task") {
-                    const name = typeof args.name === "string" ? args.name : "";
-                    const instruction = typeof args.instruction === "string" ? args.instruction : "";
-                    const scheduleType = typeof args.scheduleType === "string" ? args.scheduleType : "";
-                    const time = typeof args.time === "string" ? args.time : "";
-                    if (!name || !instruction || !scheduleType) {
-                      return { toolCallId: "", toolName, output: "Error: name, instruction, and scheduleType are required", isError: true };
-                    }
-                    try {
-                      const task = await createScheduledTask(storage, {
-                        name,
-                        instruction,
-                        scheduleType: scheduleType as "once" | "interval" | "daily" | "weekly",
-                        time,
-                        dayOfWeek: typeof args.dayOfWeek === "number" ? args.dayOfWeek : undefined,
-                        intervalMinutes: typeof args.intervalMinutes === "number" ? args.intervalMinutes : undefined
-                      });
-                      // Register the alarm
-                      await registerTaskAlarm(task);
-                      return { toolCallId: "", toolName, output: `Scheduled task created (id: ${task.id}): "${task.name}" — ${describeTaskSchedule(task)}`, isError: false };
-                    } catch (error) {
-                      return { toolCallId: "", toolName, output: `Create scheduled task failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
-                    }
-                  }
-
-                  if (toolName === "list_scheduled_tasks") {
-                    const query = typeof args.query === "string" ? args.query : "";
-                    try {
-                      const results = await listScheduledTasks(storage, query);
-                      if (results.length === 0) {
-                        return { toolCallId: "", toolName, output: "No scheduled tasks found.", isError: false };
-                      }
-                      const formatted = results.map((t) => {
-                        const status = t.enabled ? "✅" : "⏸️";
-                        const lastRun = t.lastRunAt ? `上次: ${new Date(t.lastRunAt).toLocaleString("zh-CN")}` : "尚未执行";
-                        return `- ${status} [${t.id}] ${t.name}: ${describeTaskSchedule(t)} (${lastRun}, 共${t.runCount}次)`;
-                      }).join("\n");
-                      return { toolCallId: "", toolName, output: `Found ${results.length} tasks:\n${formatted}`, isError: false };
-                    } catch (error) {
-                      return { toolCallId: "", toolName, output: `List tasks failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
-                    }
-                  }
-
-                  if (toolName === "update_scheduled_task") {
-                    const taskId = typeof args.taskId === "string" ? args.taskId : "";
-                    if (!taskId) {
-                      return { toolCallId: "", toolName, output: "Error: taskId is required", isError: true };
-                    }
-                    const updates: Record<string, unknown> = {};
-                    if (typeof args.name === "string") updates.name = args.name;
-                    if (typeof args.instruction === "string") updates.instruction = args.instruction;
-                    if (typeof args.scheduleType === "string") updates.scheduleType = args.scheduleType;
-                    if (typeof args.time === "string") updates.time = args.time;
-                    if (typeof args.dayOfWeek === "number") updates.dayOfWeek = args.dayOfWeek;
-                    if (typeof args.intervalMinutes === "number") updates.intervalMinutes = args.intervalMinutes;
-                    if (typeof args.enabled === "boolean") updates.enabled = args.enabled;
-                    try {
-                      const task = await updateScheduledTask(storage, taskId, updates);
-                      // Re-register alarm with new schedule
-                      await unregisterTaskAlarm(taskId);
-                      if (task.enabled) {
-                        await registerTaskAlarm(task);
-                      }
-                      return { toolCallId: "", toolName, output: `Task updated (id: ${task.id}): "${task.name}" — ${task.enabled ? "已启用" : "已暂停"}, ${describeTaskSchedule(task)}`, isError: false };
-                    } catch (error) {
-                      return { toolCallId: "", toolName, output: `Update task failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
-                    }
-                  }
-
-                  if (toolName === "delete_scheduled_task") {
-                    const taskId = typeof args.taskId === "string" ? args.taskId : "";
-                    if (!taskId) {
-                      return { toolCallId: "", toolName, output: "Error: taskId is required", isError: true };
-                    }
-                    try {
-                      await unregisterTaskAlarm(taskId);
-                      const deleted = await deleteScheduledTask(storage, taskId);
-                      return {
-                        toolCallId: "", toolName,
-                        output: deleted ? `Task ${taskId} deleted.` : `Task ${taskId} not found.`,
-                        isError: !deleted
-                      };
-                    } catch (error) {
-                      return { toolCallId: "", toolName, output: `Delete task failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
-                    }
-                  }
-
-                  // ── Dynamic Script Skill Tool Execution (via sandbox) ──
-                  {
-                    const scriptSkill = await findScriptSkillByToolName(storage, toolName);
-                    if (scriptSkill) {
-                      try {
-                        const output = await runInSandbox(scriptSkill.code, toolName, args, scriptSkill.envVars);
-                        await recordScriptSkillUsage(storage, scriptSkill.id);
-                        return { toolCallId: "", toolName, output, isError: false };
-                      } catch (error) {
-                        return {
-                          toolCallId: "", toolName,
-                          output: `Script skill tool "${toolName}" failed: ${error instanceof Error ? error.message : String(error)}`,
-                          isError: true
-                        };
-                      }
-                    }
-                  }
-
-                  return { toolCallId: "", toolName, output: `Unknown background tool: ${toolName}`, isError: true };
-                },
-                getPageContext: async (tabId) => {
-                  try {
-                    const resp = await sendTabMessage(tabId, { type: "GET_PAGE_CONTEXT" }) as { ok?: boolean; data?: string } | undefined;
-                    if (resp?.ok && typeof resp.data === "string") {
-                      const titleMatch = resp.data.match(/^Title:\s*(.+)/);
-                      return { title: titleMatch?.[1], url: undefined };
-                    }
-                  } catch {
-                    // ignored
-                  }
-                  return {};
-                },
-                getMemories: async () => {
-                  return getAllMemories(storage);
-                },
-                getSkills: async () => {
-                  return getAllSkills(storage);
-                },
-                getScheduledTasks: async () => {
-                  return getAllScheduledTasks(storage);
-                },
-                getScriptSkills: async () => {
-                  return getAllScriptSkills(storage);
-                }
-              },
-              controller.signal
-            );
-          } finally {
-            activeAgentControllers.delete(payload.requestId);
-          }
-        })();
+        startAgentRun(payload);
         return;
       }
 
@@ -1182,6 +2336,13 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
           const controller = activeAgentControllers.get(rid);
           if (controller) {
             controller.abort();
+            const run = externalAgentRuns.get(rid);
+            if (run) {
+              run.status = "error";
+              run.error = "Agent cancelled";
+              run.updatedAt = Date.now();
+              run.finishedAt = Date.now();
+            }
             sendResponse({ ok: true, data: { requestId: rid, canceled: true } });
           } else {
             sendResponse({ ok: true, data: { requestId: rid, canceled: false } });
@@ -1199,8 +2360,18 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
   };
 }
 
-if (typeof chrome !== "undefined" && chrome.runtime?.onMessage) {
-  chrome.runtime.onMessage.addListener(createBackgroundMessageHandler(chromeStorageAdapter));
+if (typeof chrome !== "undefined" && chrome.runtime) {
+  const messageHandler = createBackgroundMessageHandler(chromeStorageAdapter);
+  const connectHandler = createBackgroundConnectHandler(chromeStorageAdapter);
+  if (chrome.runtime.onMessage) {
+    chrome.runtime.onMessage.addListener(messageHandler);
+  }
+  if (chrome.runtime.onMessageExternal) {
+    chrome.runtime.onMessageExternal.addListener(messageHandler);
+  }
+  if (chrome.runtime.onConnect) {
+    chrome.runtime.onConnect.addListener(connectHandler);
+  }
 }
 
 // ── Scheduled Task Alarm Helpers ──

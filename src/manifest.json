@@ -1,10 +1,13 @@
 {
   "manifest_version": 3,
   "name": "NeonAgent",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "AI assistant side panel for lawful and authorized learning scenarios.",
   "permissions": ["storage", "sidePanel", "activeTab", "scripting", "alarms", "offscreen"],
   "host_permissions": ["<all_urls>"],
+  "externally_connectable": {
+    "ids": ["*"]
+  },
   "background": {
     "service_worker": "background.js",
     "type": "module"
@@ -13,6 +16,12 @@
     "default_path": "sidepanel/index.html"
   },
   "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["pageFullscreenBlock.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
     {
       "matches": ["<all_urls>"],
       "js": ["content.js"],
@@ -26,7 +35,7 @@
     "pages": ["sandbox.html"]
   },
   "content_security_policy": {
-    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'",
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self' http://*:* https://*:* ws://*:* wss://*:* http://localhost:* ws://localhost:* http://127.0.0.1:* ws://127.0.0.1:*",
     "sandbox": "sandbox allow-scripts allow-forms allow-popups allow-modals; script-src 'self' 'unsafe-inline' 'unsafe-eval'; child-src 'self'"
   }
 }

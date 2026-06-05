@@ -22,6 +22,7 @@ NeonAgent 是一款参考Claude code 和Hermes架构设计的Chrome浏览器智�
     * 劫持 `window.blur` 和 `window.focus` 事件，防止页面感知窗口失焦。
 * **插件检测对抗：** * 隐藏 `navigator.plugins` 和 `navigator.mimeTypes` 特征。
     * 处理 `Runtime` 相关特征，防止网站检测到特定扩展程序的注入。
+* **页面自动全屏限制：** 可拦截网页脚本调用 `requestFullscreen` 及常见浏览器前缀全屏 API，并在页面进入全屏时自动退出，避免站点未经用户期望强制全屏。
 
 ### 2.2 大模型 (LLM) 接入配置
 * **多模型支持：** 允许用户配置不同的 API 端点（如 OpenAI, Anthropic, Gemini, 或本地 Ollama）。
@@ -44,6 +45,7 @@ NeonAgent 是一款参考Claude code 和Hermes架构设计的Chrome浏览器智�
 * **答题策略：**
     * **手动/半自动模式：** 用户点击按钮，AI 将答案显示在题目旁或侧边栏。
     * **自动填充：** AI 识别选项后，模拟点击对应选项。
+    * **当前页面自动解题：** 设置页可勾选“当前页面自动解题”。开启后 Content Script 会自动判断当前页面是否包含题目；检测到题目时触发侧边栏“一键解题”流程，并在对话框中显示解题请求、模型答案和填充状态。
 * **上下文感知：** 能够提取当前页面内容作为背景知识，提高答题准确率。
 
 ### 2.5 浏览器智能体 (Browser Agent)
@@ -52,7 +54,7 @@ NeonAgent 是一款参考Claude code 和Hermes架构设计的Chrome浏览器智�
 
 * **核心循环：** 采用 Agent Loop 模式——用户消息 → LLM 调用（带工具定义）→ 解析 tool_calls → 执行工具 → 结果反馈给 LLM → 循环，直到 LLM 仅输出文本回复或达到最大迭代次数。
 * **OpenAI Function Calling：** 使用 OpenAI 兼容的 function calling 格式定义工具，LLM 在流式响应中返回 `tool_calls`，由智能体框架自动解析并执行。
-* **工具集（28 个工具）：**
+* **工具集（45 个工具，按需加载部分领域工具）：**
     | 工具名称 | 能力描述 |
     | :--- | :--- |
     | `get_page_info` | 获取当前页面 URL、标题、meta description |
@@ -67,12 +69,20 @@ NeonAgent 是一款参考Claude code 和Hermes架构设计的Chrome浏览器智�
     | `wait_for_element` | 等待指定元素出现（MutationObserver） |
     | `get_form_data` | 获取表单中所有字段的当前值 |
     | `press_key` | 模拟键盘按键（Enter、Escape、Tab 等） |
+    | `translate_current_page` | 一次性翻译当前页面，等同翻译标签页的“翻译当前页面”按钮 |
+    | `write_bilingual_translation_to_page` | 将中英文/双语对照翻译写回页面，支持上下或左右布局 |
+    | `update_bilingual_translation_on_page` | 原地更新已有中英文/双语对照翻译块，不存在时自动创建 |
+    | `list_api_traffic` | 列出当前站点已产生的 API/接口请求流量，支持 URL 过滤、时间窗口和返回数量限制 |
+    | `analyze_api_traffic` | 汇总分析 API/接口流量，按域名、接口路径、状态码、请求类型聚合，并返回慢接口和大流量接口 |
+    | `wait_for_api_traffic` | 等待当前页面出现匹配条件的 API/接口请求，适合点击或输入后观察接口触发 |
+    | `load_tool_category` | 按需加载 `canvas`、`translation`、`traffic`、`memory`、`skill`、`script_skill`、`task` 等领域工具 |
     | `save_memory` | 将重要信息保存到持久记忆（跨会话可用） |
     | `search_memories` | 搜索已保存的记忆条目 |
     | `delete_memory` | 删除指定的记忆条目 |
     | `create_skill` | 将多步骤操作流程保存为可复用技能 |
     | `list_skills` | 列出/搜索已保存的技能 |
     | `execute_skill` | 执行已保存的技能（加载步骤逐一执行） |
+    | `run_skill` | 直接运行技能中的结构化工具步骤，让 Skill 控制页面工具、后台工具或脚本技能工具 |
     | `update_skill` | 升级/优化技能的步骤和描述（版本自动递增） |
     | `delete_skill` | 删除不再需要的技能 |
     | `install_script_skill` | 安装脚本技能（提供名称、JS 代码和工具定义，注册为智能体可调用的新工具） |
@@ -95,9 +105,23 @@ NeonAgent 是一款参考Claude code 和Hermes架构设计的Chrome浏览器智�
         > Tags: 标签1, 标签2
       ```
     * UI 侧边栏智能体标签页新增"🧠 记忆"面板，展示所有记忆条目和标签，支持刷新、删除、Markdown 导入/导出和 LLM 智能压缩。
+* **站点 API 接口流量分析：**
+    * 新增 `traffic` 工具分类。需要分析当前页面接口请求时，智能体可先调用 `load_tool_category` 加载该分类，再使用 `list_api_traffic`、`analyze_api_traffic`、`wait_for_api_traffic`。
+    * `list_api_traffic` 基于浏览器 `Performance Resource Timing` 数据列出当前页面生命周期内的 `fetch`、XHR、beacon 及疑似 API URL 请求，返回 URL、域名、路径、请求类型、耗时、传输大小、响应状态码和协议等信息。
+    * `analyze_api_traffic` 对接口请求进行聚合统计，输出总请求数、总传输大小、平均耗时、按域名/接口路径/状态码/请求类型分组的数据，以及最慢接口和流量最大的接口。
+    * `wait_for_api_traffic` 可在用户操作后等待目标接口出现，支持普通 URL 子串或 `/pattern/flags` 正则匹配，适用于排查按钮、搜索、登录、提交等交互是否触发了预期 API。
+    * 该能力不会读取请求或响应正文；状态码与大小来自浏览器暴露的性能数据，可能受缓存、跨域 `Timing-Allow-Origin` 和浏览器限制影响。
+* **中英文对照翻译展示：**
+    * 新增 `write_bilingual_translation_to_page` 和 `update_bilingual_translation_on_page` 两个页面工具，用于把原文与译文以双语对照块写回当前网页。
+    * 翻译标签页的网页自动翻译按段落逐条处理，使用流式输出实时展示译文，显示模式支持“直接替换为目标语言”和“原文下方显示译文”两种；下方译文只显示翻译结果，不重复原文，并继承页面背景。
+    * 支持双击页面单词或划选一段文本后即时翻译，译文以页面小卡片流式显示，可独立于整页翻译开关启用。
+    * 默认读取目标元素文本作为原文，也可通过 `sourceText` 显式传入原文；译文通过 `translatedText` 传入，支持自定义 `sourceLabel` 和 `targetLabel`。
+    * 支持 `stacked`（上下对照）和 `side-by-side`（左右对照）两种布局，并复用页面翻译工具的 `below` / `hover` 显示模式与样式配置。
+    * 清理对照翻译块继续使用 `remove_translation_from_page`，与普通译文块保持同一套删除逻辑。
 * **技能系统：**
     * 智能体可通过 `create_skill` 将成功完成的多步骤操作保存为可复用的「技能」（Skill），包含名称、描述、步骤列表和标签。
     * 调用 `execute_skill` 时，系统加载技能的步骤列表，智能体按步骤使用已有工具逐一执行，自动记录使用次数。
+    * **结构化可执行步骤：** 技能步骤除自然语言字符串外，也可保存 `{ "type": "tool", "toolName": "read_page_content", "arguments": { ... }, "instruction": "..." }`。调用 `run_skill` 时，插件会按顺序直接执行这些页面工具、后台工具或脚本技能工具；普通文字步骤会作为待执行说明返回。
     * 支持 `update_skill` 自动升级：当智能体发现更优操作方式时，可更新技能的步骤/描述，版本号自动递增。
     * 技能列表在每次对话开始时自动注入系统提示词，智能体收到任务时会自动检查是否有可复用的技能。
     * **手动编辑：** UI 侧边栏技能库面板中每个技能提供「编辑」按钮，点击弹出模态框，以通用 Markdown 格式编辑技能全部内容（名称、描述、步骤、标签），保存后版本号自动递增。同时提供「删除」按钮，确认后直接删除技能。
@@ -148,6 +172,60 @@ NeonAgent 是一款参考Claude code 和Hermes架构设计的Chrome浏览器智�
     * 自动记录每次执行时间、执行结果和累计次数，任务列表在每次对话时注入系统提示词供智能体参考。
     * UI 侧边栏智能体标签页提供"⏰ 定时任务"面板，展示任务状态（启用/暂停）、调度计划、执行次数，支持刷新和一键暂停/恢复。
     * 适用场景：每日签到、定期检查、周期性数据采集、定时提醒等。
+* **跨智能体指令桥接（OpenClaw / Codex 等）：**
+    * 扩展支持 `chrome.runtime.onMessageExternal`，可接收其他扩展智能体的消息并执行。
+    * 新增 `AGENT_EXTERNAL_COMMAND`：接收外部自然语言指令后启动 Agent Loop 执行。
+    * 新增 `AGENT_EXTERNAL_TOOL_CALL`：外部智能体可直接调用 NeonAgent 工具（页面工具/后台工具/脚本技能工具）。
+    * 外部智能体可通过 `AGENT_EXTERNAL_TOOL_CALL` 调用 `run_skill`，把已保存 Skill 当作插件控制入口，批量执行结构化工具步骤。
+    * 新增 `AGENT_EXTERNAL_GET_RESULT`：按 `requestId` 查询外部命令执行状态与最终输出。
+    * 出于安全考虑，仅接受具备 `sender.id` 的扩展来源消息（拒绝网页来源）。
+    * **内置本地 WebSocket 命令通道：** 不想额外加载 bridge 扩展时，可在设置页启用“本地命令 WebSocket”。NeonAgent 会主动连接 `ws://127.0.0.1:8787/neonagent`（可配置），Codex/OpenClaw 侧只需提供本地 WebSocket 服务并发送 JSON 命令。
+    * 仓库内置最小桥接扩展：`bridge/codex-bridge`（可直接作为 Codex/OpenClaw 转发层使用）。
+    * 示例：
+      ```json
+      {
+        "type": "AGENT_EXTERNAL_COMMAND",
+        "payload": {
+          "requestId": "ext-123",
+          "tabId": 123,
+          "userMessage": "读取当前页面正文并总结",
+          "config": { "...": "LLMConfig" }
+        }
+      }
+      ```
+    * 本地 WebSocket 命令示例。`command`、`agent`、`agent_run`、`work` 都会直接启动 NeonAgent 智能体工作：
+      ```json
+      {
+        "type": "agent_run",
+        "requestId": "codex-001",
+        "token": "optional-token",
+        "tabId": 123,
+        "userMessage": "读取当前页面正文并总结",
+        "waitForResult": true
+      }
+      ```
+      也支持直接工具调用：
+      ```json
+      {
+        "type": "tool_call",
+        "requestId": "codex-tool-001",
+        "token": "optional-token",
+        "tabId": 123,
+        "toolName": "read_page_content",
+        "arguments": { "selector": "main", "maxLength": 3000 }
+      }
+      ```
+      以及运行 NeonAgent 内部 Skill：
+      ```json
+      {
+        "type": "run_skill",
+        "requestId": "codex-skill-001",
+        "token": "optional-token",
+        "tabId": 123,
+        "skillId": "skill-...",
+        "stopOnError": true
+      }
+      ```
 * **安全守则：**
     * 不自动提交包含敏感信息的表单，除非用户明确授权。
     * 不自动导航到用户未提及的外部网站。
@@ -189,15 +267,17 @@ window.addEventListener('visibilitychange', (e) => {
 ## 4. 界面原型规划 (UI/UX)
 
 ### 4.1 侧边栏布局
-* **顶部：** 切换“对话”、“智能体”与“设置”选项卡。
+* **顶部：** 切换“对话”、“智能体”、“翻译”、“设置”与“关于”选项卡。
 * **对话标签页：** 消息流区域 + 底部输入框（含“发送”按钮和“一键解析题目”快捷入口）。
 * **智能体标签页：** 顶部会话栏（支持新建/切换/删除/清空会话，历史记录持久化）+ 展示智能体交互记录（用户消息、思考过程、工具调用卡片、助手回复）+ 底部输入框（含"发送"、"停止"、"清空记录"、"🧠 记忆"、"📦 技能库"和"⏰ 定时任务"按钮）。记忆面板可展开查看所有记忆条目和标签，支持刷新、删除、Markdown 导入/导出和 LLM 智能压缩。技能库面板可展开查看已保存技能列表（名称、版本、使用次数），支持刷新、一键执行、编辑（弹出 Markdown 编辑器修改技能）、删除、导入 Markdown/JSON 文件和导出全部技能为 Markdown。定时任务面板可展开查看已创建任务列表（状态、调度计划、执行次数），支持刷新和一键暂停/恢复。
+* **翻译标签页：** 独立管理当前网页翻译开关、双击/划词翻译、目标语言、显示模式、批量翻译参数和译文样式；提供“翻译当前页面”按钮一次性翻译当前页，不改变网页翻译开关状态；自动翻译按段落流式输出，支持直接替换原文或在原文下方显示译文。
 
 ### 4.2 设置页面
 * **API 配置区：** Base URL, API Key, Model Select, Agent Max Tokens（智能体单次回复最大 Token 数，默认 102400）。
 * **开关区：** * [Switch] 解除右键限制
     * [Behavior] 同步注入“页面文字可选择”CSS
     * [Switch] 屏蔽切屏检测
+    * [Switch] 限制页面自动全屏
     * [Switch] 开启自动答题悬浮球
 
 ---
@@ -295,7 +375,7 @@ npm run build
 2. 页面上下文读取与注入诊断提示。
 3. 聊天记录管理：支持新建会话、历史会话列表、删除单条与清空全部，并持久化到 `chrome.storage.local`。
 4. 题目辅助流程：支持页面题目解析（Parse Questions）与答案自动填充（Auto Fill，基于助手输出的选项映射）。
-5. 浏览器智能体：支持 Agent Loop 自主工具调用循环，28 个工具（页面读取、元素查找/点击/输入、JS 执行、导航、记忆存取、技能管理、脚本技能、定时任务等），侧边栏"智能体"标签页展示思考过程和工具调用卡片，实时显示迭代轮次进度，支持会话历史持久化（新建/切换/删除/清空会话），支持跨会话持久记忆。
+5. 浏览器智能体：支持 Agent Loop 自主工具调用循环，45 个工具（页面读取、元素查找/点击/输入、JS 执行、导航、Canvas 操作、页面翻译、中英文对照翻译、站点 API 接口流量分析、记忆存取、技能管理、脚本技能、定时任务等），侧边栏"智能体"标签页展示思考过程和工具调用卡片，实时显示迭代轮次进度，支持会话历史持久化（新建/切换/删除/清空会话），支持跨会话持久记忆。
 6. 技能系统：智能体可将成功的多步骤操作保存为可复用技能（`create_skill`），下次遇到相似任务自动调用（`execute_skill`），并在发现更优方式时自动升级（`update_skill`，版本递增）。技能列表每次对话自动注入系统提示词，侧边栏提供"技能库"面板可视化管理。
 7. 脚本技能系统：支持通过 JavaScript 代码扩展智能体工具能力（`install_script_skill`），脚本在沙盒中执行，可调用外部 API。兼容 ClawHub SKILL.md 格式，方便从技能市场导入第三方技能。安装后的脚本工具自动注册到 LLM 工具列表，每次对话动态加载。支持环境变量配置、代码更新和卸载。
 8. 定时任务系统：智能体可创建定时任务（`create_scheduled_task`），支持单次/间隔/每日/每周四种调度类型，基于 `chrome.alarms` 持久化调度，Service Worker 唤醒后自动恢复定时器。任务触发时在活动标签页自动执行智能体指令，自动记录执行历史。侧边栏提供"⏰ 定时任务"面板可视化管理。

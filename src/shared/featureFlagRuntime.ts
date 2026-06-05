@@ -28,6 +28,17 @@ type StyleHostLike = {
   body?: StyleContainerLike;
 };
 
+type FullscreenDocumentLike = EventTargetLike & {
+  fullscreenElement?: unknown;
+  webkitFullscreenElement?: unknown;
+  mozFullScreenElement?: unknown;
+  msFullscreenElement?: unknown;
+  exitFullscreen?: () => Promise<void> | void;
+  webkitExitFullscreen?: () => Promise<void> | void;
+  mozCancelFullScreen?: () => Promise<void> | void;
+  msExitFullscreen?: () => Promise<void> | void;
+};
+
 const SELECTION_UNLOCK_STYLE_ID = "neonagent-selection-unlock-style";
 const SELECTION_UNLOCK_CSS =
   "html, body, * { user-select: text !important; -webkit-user-select: text !important; }";
@@ -248,6 +259,68 @@ export function createVisibilityBypassRuntime(input: {
       )
     );
   }
+
+  return () => {
+    cleaners.forEach((fn) => fn());
+  };
+}
+
+export function createFullscreenBlockRuntime(input: {
+  elementPrototype: object;
+  documentTarget: FullscreenDocumentLike;
+}): () => void {
+  const cleaners: Array<() => void> = [];
+  const blockedRequest = (() => Promise.reject(new DOMException("Fullscreen requests are blocked by NeonAgent", "NotAllowedError"))) as () => Promise<void>;
+
+  const requestMethods = [
+    "requestFullscreen",
+    "webkitRequestFullscreen",
+    "webkitRequestFullScreen",
+    "mozRequestFullScreen",
+    "msRequestFullscreen"
+  ] as const;
+
+  for (const method of requestMethods) {
+    if (method in input.elementPrototype) {
+      cleaners.push(overrideFunction(input.elementPrototype as Record<string, unknown>, method, blockedRequest));
+    }
+  }
+
+  const exitFullscreen = (): void => {
+    const doc = input.documentTarget;
+    const isFullscreen = Boolean(
+      doc.fullscreenElement ||
+      doc.webkitFullscreenElement ||
+      doc.mozFullScreenElement ||
+      doc.msFullscreenElement
+    );
+    if (!isFullscreen) return;
+
+    try {
+      const exit =
+        doc.exitFullscreen ??
+        doc.webkitExitFullscreen ??
+        doc.mozCancelFullScreen ??
+        doc.msExitFullscreen;
+      void exit?.call(doc);
+    } catch {
+      // ignored
+    }
+  };
+
+  const fullscreenEvents = [
+    "fullscreenchange",
+    "webkitfullscreenchange",
+    "mozfullscreenchange",
+    "MSFullscreenChange"
+  ];
+
+  for (const event of fullscreenEvents) {
+    input.documentTarget.addEventListener(event, exitFullscreen, true);
+    cleaners.push(() => input.documentTarget.removeEventListener(event, exitFullscreen, true));
+  }
+
+  exitFullscreen();
 
   return () => {
     cleaners.forEach((fn) => fn());

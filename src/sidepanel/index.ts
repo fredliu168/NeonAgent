@@ -1,5 +1,4 @@
 import { DEFAULT_CONFIG, migrateConfig, normalizeBaseUrl, validateConfig } from "../shared/config.js";
-import { matchAnswersFromText } from "../shared/examAssistant.js";
 import {
   createLLMStreamCancelMessage,
   createLLMStreamRequestMessage
@@ -7,8 +6,7 @@ import {
 import { skillToMarkdown, parseSkillMarkdown, skillsToMarkdown, parseSkillsMarkdown } from "../shared/agentSkills.js";
 import { memoriesToMarkdown, parseMemoriesMarkdown } from "../shared/agentMemory.js";
 import type { ChatSession, ExamQuestion, LLMConfig, RuntimeStreamEvent } from "../shared/types.js";
-import type { AgentProgressEvent } from "../shared/agentTypes.js";
-import type { AgentSession } from "../shared/agentTypes.js";
+import type { AgentMessage, AgentProgressEvent, AgentSession } from "../shared/agentTypes.js";
 import {
   createInitialChatState,
   reduceChatState,
@@ -30,6 +28,7 @@ function byId<T extends HTMLElement>(id: string): T {
 }
 
 const baseUrlInput = byId<HTMLInputElement>("baseUrl");
+const thinkingFormatInput = byId<HTMLSelectElement>("thinkingFormat");
 const apiKeyInput = byId<HTMLInputElement>("apiKey");
 const modelInput = byId<HTMLSelectElement>("model");
 const newModelInput = byId<HTMLInputElement>("newModel");
@@ -37,6 +36,7 @@ const addModelBtn = byId<HTMLButtonElement>("addModel");
 const removeModelBtn = byId<HTMLButtonElement>("removeModel");
 const agentMaxTokensInput = byId<HTMLInputElement>("agentMaxTokens");
 const translationEnabledInput = byId<HTMLInputElement>("translationEnabled");
+const selectionTranslationEnabledInput = byId<HTMLInputElement>("selectionTranslationEnabled");
 const translationTargetLanguageInput = byId<HTMLInputElement>("translationTargetLanguage");
 const translationDisplayModeInput = byId<HTMLSelectElement>("translationDisplayMode");
 const translationDebounceMsInput = byId<HTMLInputElement>("translationDebounceMs");
@@ -49,7 +49,15 @@ const translationStyleItalicInput = byId<HTMLInputElement>("translationStyleItal
 const unlockContextMenuInput = byId<HTMLInputElement>("unlockContextMenu");
 const blockVisibilityDetectionInput = byId<HTMLInputElement>("blockVisibilityDetection");
 const aggressiveVisibilityBypassInput = byId<HTMLInputElement>("aggressiveVisibilityBypass");
+const blockFullscreenRequestsInput = byId<HTMLInputElement>("blockFullscreenRequests");
+const autoSolveCurrentPageInput = byId<HTMLInputElement>("autoSolveCurrentPage");
+const localCommandEnabledInput = byId<HTMLInputElement>("localCommandEnabled");
+const localCommandWsUrlInput = byId<HTMLInputElement>("localCommandWsUrl");
+const localCommandTokenInput = byId<HTMLInputElement>("localCommandToken");
+const localCommandStatusEl = byId<HTMLSpanElement>("localCommandStatus");
+const refreshLocalCommandStatusBtn = byId<HTMLButtonElement>("refreshLocalCommandStatus");
 const statusEl = byId<HTMLDivElement>("status");
+const translationStatusEl = byId<HTMLDivElement>("translationStatus");
 const injectionNoticeEl = byId<HTMLDivElement>("injectionNotice");
 const contextEl = byId<HTMLPreElement>("context");
 const chatInput = byId<HTMLInputElement>("chatInput");
@@ -103,6 +111,8 @@ let activeAgentRequestId: string | null = null;
 let agentPending = false;
 let agentSessions: AgentSession[] = [];
 let activeAgentSessionId: string | null = null;
+const inFlightAutoSolveSignatures = new Set<string>();
+const completedAutoSolveSignatures = new Set<string>();
 
 async function getCurrentTabId(): Promise<number | undefined> {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -113,6 +123,17 @@ async function injectContentScript(tabId: number): Promise<void> {
   if (!chrome.scripting?.executeScript) {
     return;
   }
+
+  const existing = await chrome.tabs.sendMessage(tabId, { type: "PING" }).catch(() => null);
+  if (existing) {
+    return;
+  }
+
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ["pageFullscreenBlock.js"],
+    world: "MAIN"
+  });
 
   await chrome.scripting.executeScript({
     target: { tabId },
@@ -140,6 +161,88 @@ async function sendTabMessageWithAutoInject(
 function setStatus(text: string, error = false): void {
   statusEl.textContent = text;
   statusEl.style.color = error ? "#b91c1c" : "#047857";
+}
+
+function setTranslationStatus(text: string, error = false): void {
+  translationStatusEl.textContent = text;
+  translationStatusEl.style.color = error ? "#b91c1c" : "#047857";
+}
+
+interface LocalCommandStatus {
+  enabled: boolean;
+  state: "disabled" | "connecting" | "connected" | "reconnecting" | "error";
+  url: string;
+  updatedAt: number;
+  lastConnectedAt: number | null;
+  lastError: string;
+  readyState: number | null;
+}
+
+interface ExternalAgentRunStartedEvent {
+  type: "AGENT_EXTERNAL_RUN_STARTED";
+  payload: {
+    requestId: string;
+    senderId: string;
+    tabId: number;
+    userMessage: string;
+    createdAt: number;
+  };
+}
+
+interface AutoSolveCurrentPageRequestedEvent {
+  type: "AUTO_SOLVE_CURRENT_PAGE_REQUESTED";
+  payload: {
+    tabId: number | null;
+    questionCount: number;
+    signature: string;
+    reason: string;
+    title: string;
+    url: string;
+    createdAt: number;
+  };
+}
+
+function renderLocalCommandStatus(status: LocalCommandStatus | null): void {
+  if (!status || !status.enabled || status.state === "disabled") {
+    localCommandStatusEl.textContent = "WebSocket 未启用";
+    localCommandStatusEl.style.color = "#6b7280";
+    return;
+  }
+
+  if (status.state === "connected") {
+    const time = status.lastConnectedAt
+      ? new Date(status.lastConnectedAt).toLocaleTimeString("zh-CN", { hour12: false })
+      : "";
+    localCommandStatusEl.textContent = `WebSocket 已连接${time ? ` (${time})` : ""}`;
+    localCommandStatusEl.style.color = "#047857";
+    return;
+  }
+
+  if (status.state === "connecting") {
+    localCommandStatusEl.textContent = `WebSocket 连接中: ${status.url}`;
+    localCommandStatusEl.style.color = "#d97706";
+    return;
+  }
+
+  if (status.state === "reconnecting") {
+    localCommandStatusEl.textContent = `WebSocket 已断开，正在重连: ${status.url}`;
+    localCommandStatusEl.style.color = "#d97706";
+    return;
+  }
+
+  localCommandStatusEl.textContent = status.lastError
+    ? `WebSocket 连接失败: ${status.lastError}`
+    : "WebSocket 连接失败";
+  localCommandStatusEl.style.color = "#b91c1c";
+}
+
+async function refreshLocalCommandStatus(): Promise<void> {
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "GET_LOCAL_COMMAND_STATUS" });
+    renderLocalCommandStatus(response?.ok ? response.data as LocalCommandStatus : null);
+  } catch {
+    renderLocalCommandStatus(null);
+  }
 }
 
 function setInjectionNotice(text: string | null): void {
@@ -417,8 +520,9 @@ function toConfig(): LLMConfig {
     agentMaxTokens: parseInt(agentMaxTokensInput.value, 10) || DEFAULT_CONFIG.agentMaxTokens,
     systemPrompt: DEFAULT_CONFIG.systemPrompt,
     translationEnabled: translationEnabledInput.checked,
+    selectionTranslationEnabled: selectionTranslationEnabledInput.checked,
     translationTargetLanguage: translationTargetLanguageInput.value.trim() || DEFAULT_CONFIG.translationTargetLanguage,
-    translationDisplayMode: translationDisplayModeInput.value === "hover" ? "hover" : "below",
+    translationDisplayMode: translationDisplayModeInput.value === "bilingual" ? "bilingual" : "replace",
     translationStyleColor: translationStyleColorInput.value || DEFAULT_CONFIG.translationStyleColor,
     translationStyleBackground: translationStyleBackgroundInput.value || DEFAULT_CONFIG.translationStyleBackground,
     translationStyleFontSize: parseInt(translationStyleFontSizeInput.value, 10) || DEFAULT_CONFIG.translationStyleFontSize,
@@ -429,7 +533,13 @@ function toConfig(): LLMConfig {
     unlockContextMenu: unlockContextMenuInput.checked,
     blockVisibilityDetection: blockVisibilityDetectionInput.checked,
     aggressiveVisibilityBypass: aggressiveVisibilityBypassInput.checked,
-    enableFloatingBall: DEFAULT_CONFIG.enableFloatingBall
+    blockFullscreenRequests: blockFullscreenRequestsInput.checked,
+    autoSolveCurrentPage: autoSolveCurrentPageInput.checked,
+    enableFloatingBall: DEFAULT_CONFIG.enableFloatingBall,
+    localCommandEnabled: localCommandEnabledInput.checked,
+    localCommandWsUrl: localCommandWsUrlInput.value.trim() || DEFAULT_CONFIG.localCommandWsUrl,
+    localCommandToken: localCommandTokenInput.value,
+    thinkingFormat: (thinkingFormatInput.value as "none" | "field" | "blocks") ?? DEFAULT_CONFIG.thinkingFormat
   };
 }
 
@@ -453,6 +563,7 @@ function toFeatureFlags(config: LLMConfig) {
     unlockContextMenu: config.unlockContextMenu,
     blockVisibilityDetection: config.blockVisibilityDetection,
     aggressiveVisibilityBypass: config.aggressiveVisibilityBypass,
+    blockFullscreenRequests: config.blockFullscreenRequests,
     enableFloatingBall: config.enableFloatingBall
   };
 }
@@ -473,6 +584,7 @@ async function loadConfig(): Promise<void> {
   renderModelSelect(config.model);
   agentMaxTokensInput.value = String(config.agentMaxTokens ?? DEFAULT_CONFIG.agentMaxTokens);
   translationEnabledInput.checked = !!config.translationEnabled;
+  selectionTranslationEnabledInput.checked = !!config.selectionTranslationEnabled;
   translationTargetLanguageInput.value = config.translationTargetLanguage ?? DEFAULT_CONFIG.translationTargetLanguage;
   translationDisplayModeInput.value = config.translationDisplayMode ?? DEFAULT_CONFIG.translationDisplayMode;
   translationDebounceMsInput.value = String(config.translationDebounceMs ?? DEFAULT_CONFIG.translationDebounceMs);
@@ -485,11 +597,24 @@ async function loadConfig(): Promise<void> {
   unlockContextMenuInput.checked = config.unlockContextMenu;
   blockVisibilityDetectionInput.checked = config.blockVisibilityDetection;
   aggressiveVisibilityBypassInput.checked = config.aggressiveVisibilityBypass;
+  blockFullscreenRequestsInput.checked = !!config.blockFullscreenRequests;
+  autoSolveCurrentPageInput.checked = !!config.autoSolveCurrentPage;
+  localCommandEnabledInput.checked = !!config.localCommandEnabled;
+  localCommandWsUrlInput.value = config.localCommandWsUrl ?? DEFAULT_CONFIG.localCommandWsUrl;
+  localCommandTokenInput.value = config.localCommandToken ?? DEFAULT_CONFIG.localCommandToken;
+  thinkingFormatInput.value = config.thinkingFormat ?? DEFAULT_CONFIG.thinkingFormat;
+  await refreshLocalCommandStatus();
+  if (config.autoSolveCurrentPage) {
+    setTimeout(() => {
+      void refreshAutoSolveDetectionStatus({ solveWhenDetected: true });
+    }, 500);
+  }
 }
 
 function toTranslationPayload(config: LLMConfig) {
   return {
     translationEnabled: config.translationEnabled,
+    selectionTranslationEnabled: config.selectionTranslationEnabled,
     translationTargetLanguage: config.translationTargetLanguage,
     translationDisplayMode: config.translationDisplayMode,
     translationStyleColor: config.translationStyleColor,
@@ -540,6 +665,22 @@ async function applyConfigToActiveTab(config: LLMConfig): Promise<void> {
   }
 
   setInjectionNotice(null);
+
+  const autoSolveResponse = await sendTabMessageWithAutoInject(tabId, {
+    type: "APPLY_AUTO_SOLVE_SETTINGS",
+    payload: { autoSolveCurrentPage: config.autoSolveCurrentPage }
+  });
+
+  if (!autoSolveResponse.response) {
+    setInjectionNotice(
+      autoSolveResponse.diagnosis
+        ? formatInjectionDiagnosisNotice(autoSolveResponse.diagnosis)
+        : "当前页面不支持应用自动解题设置。"
+    );
+    return;
+  }
+
+  setInjectionNotice(null);
 }
 
 async function applyTranslationToActiveTab(): Promise<void> {
@@ -559,7 +700,7 @@ async function applyTranslationToActiveTab(): Promise<void> {
     const message = Array.isArray(saveResponse?.errors)
       ? saveResponse.errors.join(", ")
       : "Save config failed";
-    setStatus(message, true);
+    setTranslationStatus(message, true);
     return;
   }
 
@@ -578,7 +719,45 @@ async function applyTranslationToActiveTab(): Promise<void> {
   }
 
   setInjectionNotice(null);
-  setStatus("翻译设置已保存并应用到当前页");
+  setTranslationStatus("翻译设置已保存并应用到当前页");
+}
+
+async function translateCurrentPage(): Promise<void> {
+  const tabId = await getCurrentTabId();
+  if (!tabId) {
+    setInjectionNotice("当前没有可用标签页，无法翻译。");
+    return;
+  }
+
+  setTranslationStatus("正在翻译当前页面...");
+  const config = {
+    ...toConfig(),
+    translationEnabled: true
+  };
+
+  const response = await sendTabMessageWithAutoInject(tabId, {
+    type: "TRANSLATE_CURRENT_PAGE_ONCE",
+    payload: toTranslationPayload(config)
+  });
+
+  if (!response.response) {
+    setInjectionNotice(
+      response.diagnosis
+        ? formatInjectionDiagnosisNotice(response.diagnosis)
+        : "当前页面不支持应用翻译设置。"
+    );
+    setTranslationStatus("当前页面不支持翻译", true);
+    return;
+  }
+
+  setInjectionNotice(null);
+  const data = response.response.data as { skipped?: boolean; count?: number } | undefined;
+  if (data?.skipped) {
+    setTranslationStatus(`当前页面已翻译，不重复请求${typeof data.count === "number" ? `（${data.count} 段）` : ""}`);
+    return;
+  }
+
+  setTranslationStatus("已开始翻译当前页面");
 }
 
 async function clearTranslationsFromActiveTab(): Promise<void> {
@@ -602,7 +781,7 @@ async function clearTranslationsFromActiveTab(): Promise<void> {
   }
 
   setInjectionNotice(null);
-  setStatus("当前页译文已清除");
+  setTranslationStatus("当前页译文已清除");
 }
 
 async function saveConfig(): Promise<void> {
@@ -627,6 +806,31 @@ async function saveConfig(): Promise<void> {
   }
 
   setStatus("Config saved");
+  setTimeout(() => {
+    void refreshLocalCommandStatus();
+  }, 300);
+}
+
+async function testLlmConfig(): Promise<void> {
+  const config = toConfig();
+  setStatus("正在测试大模型配置...");
+
+  const response = await chrome.runtime.sendMessage({
+    type: "TEST_LLM_CONFIG",
+    payload: config
+  });
+
+  if (!response?.ok) {
+    const message = Array.isArray(response?.errors)
+      ? response.errors.join(", ")
+      : "大模型配置测试失败";
+    setStatus(message, true);
+    return;
+  }
+
+  const data = response.data as { model?: string; latencyMs?: number; content?: string };
+  const latency = typeof data.latencyMs === "number" ? `，耗时 ${data.latencyMs}ms` : "";
+  setStatus(`大模型可用：${data.model ?? config.model}${latency}`);
 }
 
 async function exportConfig(): Promise<void> {
@@ -698,6 +902,7 @@ configImportFileEl.addEventListener("change", () => {
       renderModelSelect(config.model);
       agentMaxTokensInput.value = String(config.agentMaxTokens ?? DEFAULT_CONFIG.agentMaxTokens);
       translationEnabledInput.checked = !!config.translationEnabled;
+      selectionTranslationEnabledInput.checked = !!config.selectionTranslationEnabled;
       translationTargetLanguageInput.value = config.translationTargetLanguage ?? DEFAULT_CONFIG.translationTargetLanguage;
       translationDisplayModeInput.value = config.translationDisplayMode ?? DEFAULT_CONFIG.translationDisplayMode;
       translationDebounceMsInput.value = String(config.translationDebounceMs ?? DEFAULT_CONFIG.translationDebounceMs);
@@ -710,6 +915,11 @@ configImportFileEl.addEventListener("change", () => {
       unlockContextMenuInput.checked = config.unlockContextMenu;
       blockVisibilityDetectionInput.checked = config.blockVisibilityDetection;
       aggressiveVisibilityBypassInput.checked = config.aggressiveVisibilityBypass;
+      blockFullscreenRequestsInput.checked = !!config.blockFullscreenRequests;
+      autoSolveCurrentPageInput.checked = !!config.autoSolveCurrentPage;
+      localCommandEnabledInput.checked = !!config.localCommandEnabled;
+      localCommandWsUrlInput.value = config.localCommandWsUrl ?? DEFAULT_CONFIG.localCommandWsUrl;
+      localCommandTokenInput.value = config.localCommandToken ?? DEFAULT_CONFIG.localCommandToken;
 
       try {
         await applyConfigToActiveTab(config);
@@ -717,6 +927,9 @@ configImportFileEl.addEventListener("change", () => {
         // ignored
       }
 
+      setTimeout(() => {
+        void refreshLocalCommandStatus();
+      }, 300);
       setStatus("配置已导入");
     } catch {
       setStatus("文件解析失败", true);
@@ -854,6 +1067,22 @@ function formatQuestionsForPrompt(questions: ExamQuestion[]): string {
     .join("\n\n");
 }
 
+function buildExamQuestionsSignature(questions: ExamQuestion[]): string {
+  return questions
+    .map((question) => {
+      const type = question.questionType ?? "single";
+      const stem = question.stem
+        .replace(/已完成\s*\d+\s*\/\s*\d+\s*题/gi, "")
+        .replace(/剩余[:：]?\s*\d{1,2}:\d{2}:\d{2}/gi, "")
+        .replace(/座位号[:：]?\s*\S+/gi, "")
+        .replace(/\s+/g, " ")
+        .trim();
+      return `${stem}::${type}::${question.options.length}`;
+    })
+    .join("\n")
+    .slice(0, 12000);
+}
+
 async function detectExamQuestions(): Promise<void> {
   await detectExamQuestionsInternal();
 }
@@ -861,13 +1090,13 @@ async function detectExamQuestions(): Promise<void> {
 async function detectExamQuestionsInternal(): Promise<ExamQuestion[]> {
   const tabId = await getCurrentTabId();
   if (!tabId) {
-    setExamStatus("No active tab for question parsing.");
+    setExamStatus("当前没有可检测的活动标签页。");
     return [];
   }
 
   const response = await sendTabMessageWithAutoInject(tabId, { type: "GET_EXAM_QUESTIONS" });
   if (!response.response?.ok) {
-    setExamStatus("Question parsing failed on current page.");
+    setExamStatus("当前页面题目检测失败。");
     return [];
   }
 
@@ -877,61 +1106,71 @@ async function detectExamQuestionsInternal(): Promise<ExamQuestion[]> {
   latestExamQuestions = questions;
 
   if (questions.length === 0) {
-    setExamStatus("No questions detected.");
+    setExamStatus("当前页面未检测到需要答题的题目。");
     return [];
   }
 
-  setExamStatus(`Detected ${questions.length} question(s).`);
+  setExamStatus(`当前页面检测到 ${questions.length} 道题。`);
   contextEl.textContent = formatQuestionsForPrompt(questions);
   return questions;
 }
 
-async function autoFillExamAnswers(): Promise<void> {
-  if (latestExamQuestions.length === 0) {
-    setExamStatus("Parse questions first.");
+async function claimAutoSolveRun(signature: string, tabId?: number): Promise<boolean> {
+  if (!signature) {
+    return false;
+  }
+
+  const currentTabId = tabId ?? await getCurrentTabId();
+  if (!currentTabId) {
+    return false;
+  }
+
+  const tab = await chrome.tabs.get(currentTabId).catch(() => null);
+  const response = await chrome.runtime.sendMessage({
+    type: "CLAIM_AUTO_SOLVE_RUN",
+    payload: {
+      tabId: currentTabId,
+      url: tab?.url ?? "",
+      signature
+    }
+  }).catch(() => null);
+
+  return !!response?.ok && !!response.data?.shouldRun;
+}
+
+async function refreshAutoSolveDetectionStatus(options?: { solveWhenDetected?: boolean }): Promise<void> {
+  if (!autoSolveCurrentPageInput.checked) {
+    setExamStatus("当前页面自动解题未启用。");
     return;
   }
 
-  const tabId = await getCurrentTabId();
-  if (!tabId) {
-    setExamStatus("No active tab for auto fill.");
+  if (chatState.pending || activeStreamRequestId) {
+    setExamStatus("正在检测当前页面是否需要答题，等待当前回答结束。");
+    setTimeout(() => {
+      void refreshAutoSolveDetectionStatus(options);
+    }, 1500);
     return;
   }
 
-  const lastAssistantMsg = [...chatState.messages].reverse().find((message) => message.role === "assistant");
-  const content = lastAssistantMsg?.content ?? "";
-  const thinking = (lastAssistantMsg as { thinking?: string } | undefined)?.thinking ?? "";
-  const assistantAnswer = content.trim() ? content : thinking;
-  if (!assistantAnswer.trim()) {
-    setExamStatus("No assistant answer to map.");
+  setExamStatus("正在检测当前页面是否需要答题...");
+  const questions = await detectExamQuestionsInternal();
+  if (questions.length === 0) {
     return;
   }
 
-  // Try matching from content first, then thinking, then combined
-  let matches = matchAnswersFromText(latestExamQuestions, assistantAnswer);
-  if (matches.length === 0 && content.trim() && thinking.trim()) {
-    matches = matchAnswersFromText(latestExamQuestions, thinking);
-  }
-  if (matches.length === 0 && thinking.trim() && assistantAnswer !== thinking) {
-    matches = matchAnswersFromText(latestExamQuestions, thinking);
-  }
-  if (matches.length === 0) {
-    setExamStatus("No valid answer labels matched.");
+  setExamStatus(`检测到 ${questions.length} 道题，准备自动解题...`);
+  if (!options?.solveWhenDetected) {
     return;
   }
 
-  const response = await sendTabMessageWithAutoInject(tabId, {
-    type: "APPLY_EXAM_ANSWERS",
-    payload: { matches }
-  });
-
-  if (!response.response?.ok) {
-    setExamStatus("Auto fill failed on current page.");
+  const signature = buildExamQuestionsSignature(questions);
+  const shouldRun = await claimAutoSolveRun(signature);
+  if (!shouldRun) {
+    setExamStatus(`检测到 ${questions.length} 道题，页面和题目未变化，不重复答题。`);
     return;
   }
 
-  const applied = (response.response.data as { applied?: number } | undefined)?.applied ?? 0;
-  setExamStatus(`Auto filled ${applied} question(s).`);
+  await askAndAutoFill({ source: "auto" });
 }
 
 function buildExamPrompt(questions: ExamQuestion[]): string {
@@ -951,27 +1190,99 @@ function buildExamPrompt(questions: ExamQuestion[]): string {
   ].join("\n");
 }
 
-async function askAndAutoFill(): Promise<void> {
+async function askAndAutoFill(options?: { source?: "manual" | "auto" }): Promise<void> {
+  if (chatState.pending || activeStreamRequestId) {
+    setExamStatus(options?.source === "auto" ? "自动解题等待当前回答结束。" : "AI 正在回答中。");
+    return;
+  }
+
   askAndAutoFillBtn.disabled = true;
+  let activeSignature = "";
   try {
+    if (options?.source === "auto") {
+      setExamStatus("检测到题目，正在自动解题...");
+    }
+
     const questions = await detectExamQuestionsInternal();
     if (questions.length === 0) {
       return;
     }
 
-    setExamStatus("Asking assistant for answers...");
+    activeSignature = buildExamQuestionsSignature(questions);
+    if (options?.source === "auto" && activeSignature) {
+      if (inFlightAutoSolveSignatures.has(activeSignature) || completedAutoSolveSignatures.has(activeSignature)) {
+        setExamStatus("当前题目已请求过答案，不重复答题。");
+        return;
+      }
+      inFlightAutoSolveSignatures.add(activeSignature);
+    }
+
+    setExamStatus("正在请求模型解题...");
     const success = await sendChatMessageWithContent(buildExamPrompt(questions), {
       includePageContext: false
     });
     if (!success) {
-      setExamStatus("Ask step failed.");
+      setExamStatus("模型解题请求失败。");
       return;
     }
 
-    await autoFillExamAnswers();
+    if (options?.source === "auto" && activeSignature) {
+      completedAutoSolveSignatures.add(activeSignature);
+      if (completedAutoSolveSignatures.size > 50) {
+        const oldest = completedAutoSolveSignatures.values().next().value;
+        if (oldest) completedAutoSolveSignatures.delete(oldest);
+      }
+    }
+    setExamStatus("模型已给出答案，不自动填充页面。");
   } finally {
+    if (activeSignature) {
+      inFlightAutoSolveSignatures.delete(activeSignature);
+    }
     askAndAutoFillBtn.disabled = false;
   }
+}
+
+async function handleAutoSolveCurrentPageRequest(event: AutoSolveCurrentPageRequestedEvent): Promise<void> {
+  if (!event.payload.signature) {
+    return;
+  }
+
+  const activeTabId = await getCurrentTabId();
+  if (event.payload.tabId !== null && activeTabId !== event.payload.tabId) {
+    return;
+  }
+
+  if (chatState.pending || activeStreamRequestId) {
+    setExamStatus("自动解题等待当前回答结束。");
+    setTimeout(() => {
+      void handleAutoSolveCurrentPageRequest(event);
+    }, 1500);
+    return;
+  }
+
+  await chrome.runtime.sendMessage({
+    type: "CLEAR_PENDING_AUTO_SOLVE_REQUEST",
+    payload: { signature: event.payload.signature }
+  }).catch(() => {
+    // ignored
+  });
+  activateTab("tabChat");
+  await askAndAutoFill({ source: "auto" });
+}
+
+async function loadPendingAutoSolveRequest(): Promise<boolean> {
+  const tabId = await getCurrentTabId();
+  const response = await chrome.runtime.sendMessage({
+    type: "GET_PENDING_AUTO_SOLVE_REQUEST",
+    payload: { tabId }
+  }).catch(() => null);
+
+  if (!response?.ok || !response.data) {
+    return false;
+  }
+
+  await handleAutoSolveCurrentPageRequest(response.data as AutoSolveCurrentPageRequestedEvent);
+  return true;
 }
 
 async function createNewChat(): Promise<void> {
@@ -1252,6 +1563,63 @@ function handleAgentEvent(event: AgentProgressEvent): void {
   }
 }
 
+function handleExternalAgentRunStarted(event: ExternalAgentRunStartedEvent): void {
+  const existing = agentSessions.find((session) => session.id === event.payload.requestId);
+  const now = Date.now();
+
+  if (existing) {
+    activeAgentSessionId = existing.id;
+    agentEntries = (existing.entries ?? []).map((entry) => ({ ...entry }));
+  } else {
+    const session: AgentSession = {
+      id: event.payload.requestId,
+      title: event.payload.userMessage.slice(0, 30) || "外部命令",
+      createdAt: event.payload.createdAt || now,
+      updatedAt: now,
+      messages: [],
+      entries: [
+        {
+          type: "user",
+          content: event.payload.userMessage
+        }
+      ]
+    };
+    agentSessions = [session, ...agentSessions.filter((s) => s.id !== session.id)];
+    activeAgentSessionId = session.id;
+    agentEntries = session.entries.map((entry) => ({ ...entry }));
+  }
+
+  activeAgentRequestId = event.payload.requestId;
+  agentPending = true;
+  agentIterInfoEl.textContent = "";
+  activateTab("tabAgent");
+  renderAgentSessions();
+  renderAgent();
+  scheduleAgentPersist();
+}
+
+function buildAgentHistoryMessages(entries: AgentEntry[]): AgentMessage[] {
+  const history: AgentMessage[] = [];
+
+  for (const entry of entries) {
+    if (entry.type !== "user" && entry.type !== "assistant") {
+      continue;
+    }
+
+    const content = entry.content.trim();
+    if (!content) {
+      continue;
+    }
+
+    history.push({
+      role: entry.type,
+      content
+    });
+  }
+
+  return history;
+}
+
 async function sendAgentMessage(): Promise<void> {
   const input = agentInput.value.trim();
   agentInput.value = "";
@@ -1263,6 +1631,7 @@ async function sendAgentMessage(): Promise<void> {
     return;
   }
 
+  const history = buildAgentHistoryMessages(agentEntries);
   agentEntries.push({ type: "user", content: input });
   agentPending = true;
   renderAgent();
@@ -1280,6 +1649,7 @@ async function sendAgentMessage(): Promise<void> {
         tabId,
         config: toConfig(),
         userMessage: input,
+        history,
         maxIterations: 100
       }
     });
@@ -1381,6 +1751,15 @@ function renderAgentSessions(): void {
   }
 }
 
+function activateTab(targetId: string): void {
+  document.querySelectorAll(".tab-btn").forEach((btn) => {
+    btn.classList.toggle("active", (btn as HTMLButtonElement).dataset.tab === targetId);
+  });
+  document.querySelectorAll(".tab-content").forEach((panel) => {
+    panel.classList.toggle("active", panel.id === targetId);
+  });
+}
+
 let agentPersistTimer: ReturnType<typeof setTimeout> | null = null;
 
 function scheduleAgentPersist(): void {
@@ -1398,7 +1777,7 @@ async function persistActiveAgentSession(): Promise<void> {
     ...session,
     title: createAgentSessionTitle(),
     updatedAt: now,
-    messages: [],
+    messages: buildAgentHistoryMessages(agentEntries),
     entries: agentEntries.map((e) => ({
       type: e.type,
       content: e.content,
@@ -2043,6 +2422,16 @@ function maybeHandleRuntimeMessage(message: unknown): void {
     return;
   }
 
+  if (type === "AGENT_EXTERNAL_RUN_STARTED") {
+    handleExternalAgentRunStarted(message as ExternalAgentRunStartedEvent);
+    return;
+  }
+
+  if (type === "AUTO_SOLVE_CURRENT_PAGE_REQUESTED") {
+    void handleAutoSolveCurrentPageRequest(message as AutoSolveCurrentPageRequestedEvent);
+    return;
+  }
+
   if (isAgentEvent(type)) {
     handleAgentEvent(message as AgentProgressEvent);
     return;
@@ -2051,6 +2440,19 @@ function maybeHandleRuntimeMessage(message: unknown): void {
 
 byId<HTMLButtonElement>("saveConfig").addEventListener("click", () => {
   void saveConfig();
+});
+
+byId<HTMLButtonElement>("testLlmConfig").addEventListener("click", () => {
+  void testLlmConfig();
+});
+
+refreshLocalCommandStatusBtn.addEventListener("click", () => {
+  void refreshLocalCommandStatus();
+});
+
+autoSolveCurrentPageInput.addEventListener("change", () => {
+  void saveConfig();
+  void refreshAutoSolveDetectionStatus({ solveWhenDetected: true });
 });
 
 addModelBtn.addEventListener("click", () => {
@@ -2086,6 +2488,10 @@ byId<HTMLButtonElement>("importConfigBtn").addEventListener("click", () => {
 
 byId<HTMLButtonElement>("applyTranslation").addEventListener("click", () => {
   void applyTranslationToActiveTab();
+});
+
+byId<HTMLButtonElement>("translateCurrentPage").addEventListener("click", () => {
+  void translateCurrentPage();
 });
 
 byId<HTMLButtonElement>("clearTranslation").addEventListener("click", () => {
@@ -2218,10 +2624,10 @@ document.querySelectorAll<HTMLButtonElement>(".tab-btn").forEach((btn) => {
       return;
     }
 
-    document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
-    document.querySelectorAll(".tab-content").forEach((p) => p.classList.remove("active"));
-    btn.classList.add("active");
-    document.getElementById(targetId)?.classList.add("active");
+    activateTab(targetId);
+    if (targetId === "tabChat") {
+      void refreshAutoSolveDetectionStatus({ solveWhenDetected: true });
+    }
   });
 });
 
@@ -2232,3 +2638,11 @@ chrome.runtime.onMessage.addListener((message) => {
 void loadConfig();
 void loadChatSessions();
 void loadAgentSessions();
+setTimeout(() => {
+  void (async () => {
+    const handledPending = await loadPendingAutoSolveRequest();
+    if (!handledPending) {
+      await refreshAutoSolveDetectionStatus({ solveWhenDetected: true });
+    }
+  })();
+}, 300);

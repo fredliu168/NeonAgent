@@ -5,6 +5,7 @@ const defaultFeatureFlags: FeatureFlags = {
   unlockContextMenu: false,
   blockVisibilityDetection: false,
   aggressiveVisibilityBypass: false,
+  blockFullscreenRequests: false,
   enableFloatingBall: false
 };
 

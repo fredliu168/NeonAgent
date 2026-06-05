@@ -1,12 +1,13 @@
 {
   "name": "neonagent",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "scripts": {
     "clean": "rm -rf dist",
     "build": "npm run clean && tsc -p tsconfig.build.json && npm run copy:static",
     "copy:static": "mkdir -p dist/sidepanel dist/images && cp src/manifest.json dist/manifest.json && cp src/sidepanel/index.html dist/sidepanel/index.html && cp images/qrcode.jpg dist/images/qrcode.jpg",
+    "local-server": "node scripts/neonagent-local-server.mjs",
     "test": "vitest run",
     "test:watch": "vitest"
   },

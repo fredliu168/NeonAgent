@@ -26,6 +26,121 @@ export interface AgentStreamDelta {
 
 type TokenParamName = "max_tokens" | "max_completion_tokens";
 
+function summarizeSerializedMessages(messages: unknown[]): string {
+  const summary = messages.map((message, index) => {
+    if (!message || typeof message !== "object") {
+      return { index, invalid: true };
+    }
+
+    const msg = message as {
+      role?: string;
+      content?: unknown;
+      reasoning_content?: unknown;
+      tool_calls?: unknown[];
+      tool_call_id?: string;
+    };
+
+    const contentSummary = Array.isArray(msg.content)
+      ? msg.content.map((block) => {
+          if (!block || typeof block !== "object") {
+            return { invalid: true };
+          }
+          const typedBlock = block as { type?: string; thinking?: string; text?: string };
+          return {
+            type: typedBlock.type ?? null,
+            thinkingLength: typeof typedBlock.thinking === "string" ? typedBlock.thinking.length : 0,
+            textLength: typeof typedBlock.text === "string" ? typedBlock.text.length : 0
+          };
+        })
+      : typeof msg.content === "string"
+        ? { type: "string", length: msg.content.length }
+        : msg.content === null
+          ? { type: "null" }
+          : { type: typeof msg.content };
+
+    return {
+      index,
+      role: msg.role ?? null,
+      content: contentSummary,
+      reasoningLength: typeof msg.reasoning_content === "string" ? msg.reasoning_content.length : 0,
+      toolCalls: Array.isArray(msg.tool_calls) ? msg.tool_calls.length : 0,
+      toolCallId: typeof msg.tool_call_id === "string" ? msg.tool_call_id : null
+    };
+  });
+
+  return JSON.stringify(summary);
+}
+
+function summarizeAgentMessages(messages: AgentMessage[]): string {
+  const summary = messages.map((message, index) => ({
+    index,
+    role: message.role,
+    contentLength: typeof message.content === "string" ? message.content.length : 0,
+    hasNullContent: message.content === null,
+    reasoningLength: typeof message.reasoning_content === "string" ? message.reasoning_content.length : 0,
+    toolCalls: Array.isArray(message.tool_calls) ? message.tool_calls.length : 0,
+    toolCallId: typeof message.tool_call_id === "string" ? message.tool_call_id : null
+  }));
+
+  return JSON.stringify(summary);
+}
+
+function buildThinkingFormatError(
+  status: number,
+  text: string,
+  input: {
+    config: LLMConfig;
+    messages: AgentMessage[];
+  },
+  tokenParamName: TokenParamName,
+  thinkingFormat: "none" | "field" | "blocks"
+): Error {
+  const serializedMessages = serializeMessages(input.messages, thinkingFormat);
+  const rawSummary = summarizeAgentMessages(input.messages);
+  const summary = summarizeSerializedMessages(serializedMessages);
+  return new Error(
+    `Agent LLM request failed: ${status} ${text} [thinkingFormat=${thinkingFormat}, tokenParam=${tokenParamName}, rawMessageSummary=${rawSummary}, serializedMessageSummary=${summary}]`.trim()
+  );
+}
+
+function buildThinkingFormatAttemptsError(
+  attempts: Array<{
+    status: number;
+    text: string;
+    thinkingFormat: "none" | "field" | "blocks";
+    tokenParamName: TokenParamName;
+    input: {
+      config: LLMConfig;
+      messages: AgentMessage[];
+    };
+  }>
+): Error {
+  if (attempts.length === 0) {
+    return new Error("Agent LLM request failed: no attempts recorded");
+  }
+
+  const finalAttempt = attempts[attempts.length - 1];
+  const attemptsSummary = attempts.map((attempt) => ({
+    thinkingFormat: attempt.thinkingFormat,
+    tokenParam: attempt.tokenParamName,
+    status: attempt.status,
+    text: attempt.text,
+    serializedMessageSummary: JSON.parse(
+      summarizeSerializedMessages(serializeMessages(attempt.input.messages, attempt.thinkingFormat))
+    )
+  }));
+
+  const baseError = buildThinkingFormatError(
+    finalAttempt.status,
+    finalAttempt.text,
+    finalAttempt.input,
+    finalAttempt.tokenParamName,
+    finalAttempt.thinkingFormat
+  ).message;
+
+  return new Error(`${baseError} [attempts=${JSON.stringify(attemptsSummary)}]`);
+}
+
 function parseAgentStreamLine(dataLine: string): AgentStreamDelta | null {
   const raw = dataLine.slice("data:".length).trim();
   if (!raw || raw === "[DONE]") {
@@ -35,7 +150,7 @@ function parseAgentStreamLine(dataLine: string): AgentStreamDelta | null {
   let parsed: {
     choices?: Array<{
       delta?: {
-        content?: string;
+        content?: string | Array<{ type?: string; text?: string; thinking?: string }>;
         reasoning_content?: string;
         tool_calls?: Array<{
           index: number;
@@ -61,10 +176,28 @@ function parseAgentStreamLine(dataLine: string): AgentStreamDelta | null {
   }
 
   const delta = choice.delta;
-  const content =
-    typeof delta?.content === "string" ? delta.content : null;
-  const reasoning =
-    typeof delta?.reasoning_content === "string" ? delta.reasoning_content : null;
+
+  // content can be a plain string (OpenAI/DeepSeek) or a content-block array (Anthropic-style)
+  let content: string | null = null;
+  let reasoning: string | null = null;
+
+  if (typeof delta?.content === "string") {
+    content = delta.content;
+  } else if (Array.isArray(delta?.content)) {
+    for (const block of delta.content) {
+      if (block.type === "thinking" && typeof block.thinking === "string") {
+        reasoning = (reasoning ?? "") + block.thinking;
+      } else if (block.type === "text" && typeof block.text === "string") {
+        content = (content ?? "") + block.text;
+      }
+    }
+  }
+
+  // Also handle flat reasoning_content field (native DeepSeek)
+  if (reasoning === null && typeof delta?.reasoning_content === "string") {
+    reasoning = delta.reasoning_content;
+  }
+
   const finishReason = choice.finish_reason ?? null;
 
   let toolCalls: AgentStreamDelta["toolCalls"] = null;
@@ -90,22 +223,52 @@ function parseAgentStreamLine(dataLine: string): AgentStreamDelta | null {
 }
 
 /**
- * Serialize messages for the API request.
- * DeepSeek thinking mode requires assistant messages with reasoning_content
- * to pass the thinking block back as content[].thinking, otherwise the API
- * returns a 400 "content[].thinking must be passed back" error.
+ * Serialize messages for the API request according to the configured thinking format.
+ * - "none"   : strip reasoning_content (standard OpenAI-compatible APIs)
+ * - "field"  : keep as top-level reasoning_content field (native DeepSeek API)
+ * - "blocks" : convert to content[].thinking blocks (Anthropic-compatible APIs)
  */
-function serializeMessages(messages: AgentMessage[]): unknown[] {
+function serializeMessages(
+  messages: AgentMessage[],
+  thinkingFormat: "none" | "field" | "blocks"
+): unknown[] {
   return messages.map((msg) => {
-    if (msg.role === "assistant" && msg.reasoning_content) {
-      const contentBlocks: unknown[] = [
-        { type: "thinking", thinking: msg.reasoning_content }
-      ];
-      if (msg.content) {
-        contentBlocks.push({ type: "text", text: msg.content });
+    if (msg.role === "assistant") {
+      const { reasoning_content, content, tool_calls, ...rest } = msg as any;
+      const base = { ...rest, ...(tool_calls ? { tool_calls } : {}) };
+
+      // Anthropic-compatible proxies expect content[].thinking block returned
+      if (thinkingFormat === "blocks") {
+        const blocks: unknown[] = [
+          { type: "thinking", thinking: reasoning_content || "" }
+        ];
+        // Preserve the original content shape as closely as possible when replaying
+        // thinking mode. Some Anthropic-compatible proxies appear to validate the
+        // full assistant content array, not just the thinking block itself.
+        if (content && typeof content === "string") {
+          blocks.push({ type: "text", text: content });
+        } else if (Array.isArray(content)) {
+          for (const c of content) {
+            if (c.type !== "thinking") blocks.push(c);
+          }
+        }
+        const finalMsg: Record<string, unknown> = { ...base, content: blocks };
+        if (reasoning_content) {
+          finalMsg.reasoning_content = reasoning_content;
+        }
+        return finalMsg;
       }
-      const { reasoning_content: _rc, content: _c, ...rest } = msg;
-      return { ...rest, content: contentBlocks };
+
+      if (thinkingFormat === "field") {
+        const finalMsg: any = { ...base, content: content ?? null };
+        if (reasoning_content) {
+          finalMsg.reasoning_content = reasoning_content;
+        }
+        return finalMsg;
+      }
+
+      // "none" - strip reasoning_content
+      return { ...base, content: content ?? null };
     }
     return msg;
   });
@@ -120,7 +283,7 @@ function buildAgentRequestBody(input: {
     model: input.config.model,
     stream: true,
     temperature: input.config.temperature,
-    messages: serializeMessages(input.messages),
+    messages: serializeMessages(input.messages, input.config.thinkingFormat ?? "field"),
     tools: input.tools,
     tool_choice: "auto"
   };
@@ -135,6 +298,19 @@ function shouldRetryWithAlternateTokenParam(details: string, currentParam: Token
   return normalized.includes("unsupported parameter") && normalized.includes(currentParam);
 }
 
+function isThinkingFormatError(text: string): "needs_blocks" | "needs_field" | null {
+  const msg = text.toLowerCase();
+  // API requires content[].thinking blocks to be sent back
+  if (msg.includes("content[].thinking") && msg.includes("must be passed back")) {
+    return "needs_blocks";
+  }
+  // API doesn't understand type:"thinking" content blocks
+  if (msg.includes("unknown variant") && msg.includes("thinking")) {
+    return "needs_field";
+  }
+  return null;
+}
+
 async function postAgentStreamRequest(
   input: {
     config: LLMConfig;
@@ -143,8 +319,12 @@ async function postAgentStreamRequest(
     signal?: AbortSignal;
   },
   tokenParamName: TokenParamName,
-  fetcher: typeof fetch
+  fetcher: typeof fetch,
+  overrideThinkingFormat?: "none" | "field" | "blocks"
 ): Promise<Response> {
+  const effectiveConfig = overrideThinkingFormat
+    ? { ...input.config, thinkingFormat: overrideThinkingFormat }
+    : input.config;
   return fetcher(input.config.baseUrl, {
     method: "POST",
     headers: {
@@ -152,7 +332,7 @@ async function postAgentStreamRequest(
       Authorization: `Bearer ${input.config.apiKey}`
     },
     signal: input.signal,
-    body: buildAgentRequestBody(input, tokenParamName)
+    body: buildAgentRequestBody({ ...input, config: effectiveConfig }, tokenParamName)
   });
 }
 
@@ -168,23 +348,124 @@ async function requestAgentWithTokenFallback(
   const primaryParam: TokenParamName = "max_tokens";
   const secondaryParam: TokenParamName = "max_completion_tokens";
 
-  const primaryResponse = await postAgentStreamRequest(input, primaryParam, fetcher);
-  if (primaryResponse.ok) {
-    return primaryResponse;
+  // Attempt order for thinking formats when auto-retrying
+  const thinkingFormats: Array<"field" | "blocks" | "none"> = ["field", "blocks", "none"];
+
+  async function tryWithParam(tokenParam: TokenParamName): Promise<Response | null> {
+    const configFormat = input.config.thinkingFormat ?? "field";
+    const attempts: Array<{
+      status: number;
+      text: string;
+      thinkingFormat: "none" | "field" | "blocks";
+      tokenParamName: TokenParamName;
+      input: {
+        config: LLMConfig;
+        messages: AgentMessage[];
+      };
+    }> = [];
+
+    // First try with configured format
+    const resp = await postAgentStreamRequest(input, tokenParam, fetcher);
+    if (resp.ok) return resp;
+
+    const text = await resp.text();
+    attempts.push({
+      status: resp.status,
+      text,
+      thinkingFormat: configFormat,
+      tokenParamName: tokenParam,
+      input
+    });
+
+    // Check for token param retry
+    if (shouldRetryWithAlternateTokenParam(text, tokenParam)) {
+      return null; // signal caller to try secondary param
+    }
+
+    // Check for thinking format error — try all other formats
+    const formatHint = isThinkingFormatError(text);
+    if (formatHint) {
+      const order = formatHint === "needs_blocks"
+        ? (["blocks", "field"] as const)
+        : (["field", "none", "blocks"] as const);
+      for (const fmt of order) {
+        if (fmt === configFormat) continue;
+        const retryResp = await postAgentStreamRequest(input, tokenParam, fetcher, fmt);
+        if (retryResp.ok) {
+          // Persist the working format so subsequent loop iterations use it directly
+          input.config.thinkingFormat = fmt;
+          return retryResp;
+        }
+        attempts.push({
+          status: retryResp.status,
+          text: await retryResp.text().catch(() => "Unknown error"),
+          thinkingFormat: fmt,
+          tokenParamName: tokenParam,
+          input
+        });
+      }
+      throw buildThinkingFormatAttemptsError(attempts);
+    }
+
+    throw buildThinkingFormatError(resp.status, text, input, tokenParam, configFormat);
   }
 
-  const primaryText = typeof primaryResponse.text === "function" ? await primaryResponse.text() : "";
-  if (!shouldRetryWithAlternateTokenParam(primaryText, primaryParam)) {
-    throw new Error(`Agent LLM request failed: ${primaryResponse.status} ${primaryText}`.trim());
+  const primary = await tryWithParam(primaryParam);
+  if (primary) return primary;
+
+  // Retry with alternate token param
+  const fallbackResp = await postAgentStreamRequest(input, secondaryParam, fetcher);
+  if (fallbackResp.ok) return fallbackResp;
+
+  const fallbackText = await fallbackResp.text();
+  const fallbackAttempts: Array<{
+    status: number;
+    text: string;
+    thinkingFormat: "none" | "field" | "blocks";
+    tokenParamName: TokenParamName;
+    input: {
+      config: LLMConfig;
+      messages: AgentMessage[];
+    };
+  }> = [{
+    status: fallbackResp.status,
+    text: fallbackText,
+    thinkingFormat: input.config.thinkingFormat ?? "field",
+    tokenParamName: secondaryParam,
+    input
+  }];
+
+  const formatHint = isThinkingFormatError(fallbackText);
+  if (formatHint) {
+    const configFormat = input.config.thinkingFormat ?? "field";
+    const order = formatHint === "needs_blocks"
+      ? (["blocks", "field"] as const)
+      : (["field", "none", "blocks"] as const);
+    for (const fmt of order) {
+      if (fmt === configFormat) continue;
+      const retryResp = await postAgentStreamRequest(input, secondaryParam, fetcher, fmt);
+      if (retryResp.ok) {
+        input.config.thinkingFormat = fmt;
+        return retryResp;
+      }
+      fallbackAttempts.push({
+        status: retryResp.status,
+        text: await retryResp.text().catch(() => "Unknown error"),
+        thinkingFormat: fmt,
+        tokenParamName: secondaryParam,
+        input
+      });
+    }
+    throw buildThinkingFormatAttemptsError(fallbackAttempts);
   }
 
-  const fallbackResponse = await postAgentStreamRequest(input, secondaryParam, fetcher);
-  if (fallbackResponse.ok) {
-    return fallbackResponse;
-  }
-
-  const fallbackText = typeof fallbackResponse.text === "function" ? await fallbackResponse.text() : "";
-  throw new Error(`Agent LLM request failed: ${fallbackResponse.status} ${fallbackText}`.trim());
+  throw buildThinkingFormatError(
+    fallbackResp.status,
+    fallbackText,
+    input,
+    secondaryParam,
+    input.config.thinkingFormat ?? "field"
+  );
 }
 
 export interface AgentStreamCallbacks {

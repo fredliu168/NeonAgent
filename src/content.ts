@@ -2,13 +2,15 @@ type FeatureFlags = {
   unlockContextMenu: boolean;
   blockVisibilityDetection: boolean;
   aggressiveVisibilityBypass: boolean;
+  blockFullscreenRequests: boolean;
   enableFloatingBall: boolean;
 };
 
 type LLMConfig = {
   translationEnabled: boolean;
+  selectionTranslationEnabled: boolean;
   translationTargetLanguage: string;
-  translationDisplayMode: "below" | "hover";
+  translationDisplayMode: "replace" | "bilingual" | "below" | "hover";
   translationStyleColor: string;
   translationStyleBackground: string;
   translationStyleFontSize: number;
@@ -19,6 +21,8 @@ type LLMConfig = {
   unlockContextMenu: boolean;
   blockVisibilityDetection: boolean;
   aggressiveVisibilityBypass: boolean;
+  blockFullscreenRequests: boolean;
+  autoSolveCurrentPage: boolean;
   enableFloatingBall: boolean;
 };
 
@@ -71,6 +75,17 @@ type StyleHostLike = {
   head?: StyleContainerLike;
   documentElement?: StyleContainerLike;
   body?: StyleContainerLike;
+};
+
+type FullscreenDocumentLike = EventTargetLike & {
+  fullscreenElement?: unknown;
+  webkitFullscreenElement?: unknown;
+  mozFullScreenElement?: unknown;
+  msFullscreenElement?: unknown;
+  exitFullscreen?: () => Promise<void> | void;
+  webkitExitFullscreen?: () => Promise<void> | void;
+  mozCancelFullScreen?: () => Promise<void> | void;
+  msExitFullscreen?: () => Promise<void> | void;
 };
 
 const SELECTION_UNLOCK_STYLE_ID = "neonagent-selection-unlock-style";
@@ -304,14 +319,17 @@ function createVisibilityBypassRuntime(input: {
 }
 
 const FLOATING_BALL_ID = "neonagent-floating-ball";
+const FULLSCREEN_BLOCK_EVENT = "neonagent:set-fullscreen-block";
 const TRANSLATION_SOURCE_ATTR = "data-neonagent-translation-source";
 const TRANSLATION_HOST_ATTR = "data-neonagent-translation-host";
 const TRANSLATION_TEXT_ATTR = "data-neonagent-translation-text";
+const SELECTION_TRANSLATION_POPUP_ATTR = "data-neonagent-selection-translation";
 
 type TranslationSettings = {
   enabled: boolean;
+  selectionEnabled: boolean;
   targetLanguage: string;
-  displayMode: "below" | "hover";
+  displayMode: "replace" | "bilingual";
   styleColor: string;
   styleBackground: string;
   styleFontSize: number;
@@ -328,6 +346,8 @@ type TranslationRecord = {
   body: HTMLDivElement;
   sourceText: string;
   translatedText: string;
+  overlay: boolean;
+  displayMode?: "below" | "hover";
   onMouseEnter?: () => void;
   onMouseLeave?: () => void;
 };
@@ -336,13 +356,15 @@ const defaultFeatureFlags: FeatureFlags = {
   unlockContextMenu: false,
   blockVisibilityDetection: false,
   aggressiveVisibilityBypass: false,
+  blockFullscreenRequests: false,
   enableFloatingBall: false
 };
 
 const defaultTranslationSettings: TranslationSettings = {
   enabled: false,
+  selectionEnabled: false,
   targetLanguage: "中文",
-  displayMode: "below",
+  displayMode: "replace",
   styleColor: "#0f172a",
   styleBackground: "#f8fafc",
   styleFontSize: 14,
@@ -359,6 +381,19 @@ let translationObserver: MutationObserver | null = null;
 let translationTimer: ReturnType<typeof setTimeout> | null = null;
 let translationRunId = 0;
 let translationCounter = 0;
+let suppressTranslationObserver = false;
+let lastPageTranslationSignature = "";
+let pageTranslationInProgressSignature = "";
+let selectionTranslationCleanup: (() => void) | null = null;
+let selectionTranslationPopup: HTMLDivElement | null = null;
+let selectionTranslationRunId = 0;
+let lastSelectionTranslationKey = "";
+let autoSolveCurrentPageEnabled = false;
+let autoSolveObserver: MutationObserver | null = null;
+let autoSolveTimer: ReturnType<typeof setTimeout> | null = null;
+let autoSolveAttachTimer: ReturnType<typeof setTimeout> | null = null;
+let lastAutoSolveQuestionSignature = "";
+const sentAutoSolveSignatures = new Set<string>();
 
 function buildPageContext(): string {
   const title = document.title || "Untitled";
@@ -372,28 +407,63 @@ function normalizeText(input: string): string {
   return input.replace(/\s+/g, " ").trim();
 }
 
-function resolveExamQuestionRoots(): HTMLElement[] {
-  const explicit = Array.from(document.querySelectorAll<HTMLElement>(".question-item"));
-  if (explicit.length > 0) {
-    return explicit;
-  }
+function uniqueElements(nodes: HTMLElement[]): HTMLElement[] {
+  return Array.from(new Set(nodes));
+}
 
-  const generic = Array.from(
+function hasInteractiveOptionNodes(node: HTMLElement): boolean {
+  return node.querySelectorAll(
+    "input[type='radio'], input[type='checkbox'], label, [role='radio'], [role='checkbox'], .a-radio, .a-checkbox"
+  ).length >= 2;
+}
+
+function resolveExamQuestionRoots(): HTMLElement[] {
+  const explicit = Array.from(
     document.querySelectorAll<HTMLElement>(
-      '[data-question-id], [class*="question" i], [id*="question" i], [class*="topic" i]'
+      ".question-item, .question, .topic, .problem, .quiz-question, .exam-question"
     )
   );
-
-  if (generic.length > 0) {
-    return generic;
-  }
-
-  return Array.from(document.querySelectorAll<HTMLElement>("li, section, article, div"))
+  const generic = Array.from(
+    document.querySelectorAll<HTMLElement>(
+      [
+        "[data-question-id]",
+        "[data-question]",
+        '[class*="question" i]',
+        '[id*="question" i]',
+        '[class*="topic" i]',
+        '[id*="topic" i]',
+        '[class*="subject" i]',
+        '[class*="problem" i]',
+        '[class*="quiz" i]',
+        '[class*="exam" i]',
+        '[class*="ques" i]'
+      ].join(",")
+    )
+  );
+  const textLike = Array.from(document.querySelectorAll<HTMLElement>("li, section, article, div, form"))
     .filter((node) => {
       const text = normalizeText(node.innerText || "");
-      return /^[0-9]+[.、]\s*/.test(text) && /[A-H][.、:)）\s]/.test(text);
+      if (text.length < 12 || text.length > 6000) {
+        return false;
+      }
+      return (
+        /(?:^|\s)[0-9]{1,3}[.、)）]\s*/.test(text) ||
+        /(?:单选|多选|判断|题目|请选择|以下|下列)/.test(text)
+      ) && (countOptionMarkers(text) >= 2 || hasInteractiveOptionNodes(node));
+    });
+
+  return uniqueElements([...explicit, ...generic, ...textLike])
+    .filter((node) => {
+      const text = normalizeText(node.innerText || "");
+      if (text.length < 8 || text.length > 8000) {
+        return false;
+      }
+      const hasOptionNodes = node.querySelectorAll(
+        ".question-attrs-wrap .a-radio, .question-attrs-wrap .a-checkbox, [data-option], [class*='option' i], .answer-item, li, label"
+      ).length >= 2 || hasInteractiveOptionNodes(node);
+      return hasOptionNodes || countOptionMarkers(text) >= 2;
     })
-    .slice(0, 20);
+    .slice(0, 60);
 }
 
 function parseOptionTextFromNode(el: HTMLElement): string | null {
@@ -419,7 +489,7 @@ function extractOptionsFromQuestionText(rawText: string): Array<{ label: string;
   // When the DOM yields "X Y. content" style (prefix-letter before actual option letter),
   // the gap between X. and Y. is empty — those empty chunks are skipped below.
   // We assign sequential A, B, C, D… so labels are never shifted by prefix noise.
-  const markerRegex = /([A-H])[.、:)）]/gi;
+  const markerRegex = /(?:^|\s)([A-H])(?:[.、:)）]|\s+)/gi;
   const markers = Array.from(text.matchAll(markerRegex));
   if (markers.length < 2) {
     return [];
@@ -445,6 +515,86 @@ function extractOptionsFromQuestionText(rawText: string): Array<{ label: string;
   }
 
   return options;
+}
+
+function countOptionMarkers(rawText: string): number {
+  return Array.from(normalizeText(rawText).matchAll(/(?:^|\s)[A-H](?:[.、:)）]|\s+)/gi)).length;
+}
+
+function cleanExamStem(rawText: string): string {
+  let text = normalizeText(rawText);
+
+  if (text.length > 220) {
+    const candidates = Array.from(text.matchAll(/(?:^|\s)\d{1,3}\s+([^\d\s][\s\S]*)/g))
+      .map((match) => normalizeText(match[1] ?? ""))
+      .filter((candidate) => /[\u4e00-\u9fffA-Za-z]/.test(candidate));
+    const last = candidates.at(-1);
+    if (last) {
+      text = last;
+    }
+  }
+
+  return normalizeText(text
+    .replace(/^\s*(?:第?\s*)?[0-9]{1,3}\s*[.、)）:：-]?\s*/, "")
+    .replace(/已完成\s*\d+\s*\/\s*\d+\s*题/gi, "")
+    .replace(/剩余[:：]?\s*\d{1,2}:\d{2}:\d{2}/gi, "")
+    .replace(/座位号[:：]?\s*\S+/gi, ""));
+}
+
+function stripQuestionNumber(rawText: string): string {
+  return cleanExamStem(rawText);
+}
+
+function collectExamQuestionsFromText(rawText: string): ExamQuestion[] {
+  const lines = rawText
+    .split(/\n+/)
+    .map((line) => normalizeText(line))
+    .filter(Boolean);
+
+  const blocks: string[] = [];
+  let current: string[] = [];
+
+  for (const line of lines) {
+    const startsQuestion = /^(?:第?\s*)?[0-9]{1,3}\s*[.、)）:：-]\s*/.test(line) && countOptionMarkers(line) >= 1;
+    const standaloneQuestion = /^(?:第?\s*)?[0-9]{1,3}\s*[.、)）:：-]\s*/.test(line);
+
+    if ((startsQuestion || standaloneQuestion) && current.length > 0 && countOptionMarkers(current.join(" ")) >= 2) {
+      blocks.push(current.join(" "));
+      current = [line];
+      continue;
+    }
+
+    current.push(line);
+  }
+
+  if (current.length > 0) {
+    blocks.push(current.join(" "));
+  }
+
+  return blocks
+    .map((block, index): ExamQuestion | null => {
+      const options = extractOptionsFromQuestionText(block).slice(0, 8);
+      if (options.length < 2) {
+        return null;
+      }
+
+      const firstMarker = normalizeText(block).search(/(?:^|\s)[A-H](?:[.、:)）]|\s+)/i);
+      const rawStem = firstMarker > 0 ? block.slice(0, firstMarker) : block;
+      const stem = stripQuestionNumber(rawStem);
+      if (!stem) {
+        return null;
+      }
+
+      return {
+        id: `q_${index + 1}`,
+        stem,
+        options,
+        questionType: options.length === 2 && options.some((option) => /正确|错误|对|错|true|false/i.test(option.text))
+          ? "judgement"
+          : "single"
+      } satisfies ExamQuestion;
+    })
+    .filter((question): question is ExamQuestion => !!question);
 }
 
 /**
@@ -485,6 +635,7 @@ function collectExamQuestionsFromPage(): ExamQuestion[] {
   const questionNodes = resolveExamQuestionRoots();
 
   const result: ExamQuestion[] = [];
+  const seen = new Set<string>();
 
   for (let i = 0; i < questionNodes.length; i += 1) {
     const node = questionNodes[i];
@@ -500,17 +651,17 @@ function collectExamQuestionsFromPage(): ExamQuestion[] {
     if (!rawStem) {
       const fullText = node.innerText || "";
       // Match the first standalone option letter preceded by whitespace
-      const cut = fullText.search(/[ \n\t][A-H][.、:)）]/);
+      const cut = fullText.search(/(?:^|[\s\n\r\t])[A-H](?:[.、:)）]|\s+)/i);
       rawStem = cut > 0 ? fullText.slice(0, cut) : fullText;
     }
-    const stem = normalizeText(rawStem);
+    const stem = stripQuestionNumber(rawStem);
 
     // --- Option node collection ---
     // Scoped: prefer explicit exam-widget option containers; exclude <label>
     // sub-elements (they contain only the letter and cause duplicates).
     const scopedOptionNodes = Array.from(
       node.querySelectorAll<HTMLElement>(
-        ".question-attrs-wrap .a-radio, .question-attrs-wrap .a-checkbox, .question-attrs-wrap li"
+        ".question-attrs-wrap .a-radio, .question-attrs-wrap .a-checkbox, .question-attrs-wrap li, label"
       )
     );
 
@@ -544,6 +695,12 @@ function collectExamQuestionsFromPage(): ExamQuestion[] {
       continue;
     }
 
+    const key = `${stem}::${options.map((option) => option.text).join("|")}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+
     result.push({
       id: node.dataset.questionId || `q_${i + 1}`,
       stem,
@@ -552,7 +709,137 @@ function collectExamQuestionsFromPage(): ExamQuestion[] {
     });
   }
 
-  return result;
+  if (result.length > 0) {
+    return result;
+  }
+
+  return collectExamQuestionsFromText(document.body?.innerText || "");
+}
+
+function buildExamQuestionSignature(questions: ExamQuestion[]): string {
+  return questions
+    .map((question) => {
+      const type = question.questionType ?? "single";
+      return `${normalizeText(question.stem)}::${type}::${question.options.length}`;
+    })
+    .join("\n")
+    .slice(0, 12000);
+}
+
+function requestAutoSolveCurrentPage(reason: string): void {
+  if (!autoSolveCurrentPageEnabled) {
+    return;
+  }
+
+  const questions = collectExamQuestionsFromPage();
+  if (questions.length === 0) {
+    return;
+  }
+
+  const signature = buildExamQuestionSignature(questions);
+  if (!signature || signature === lastAutoSolveQuestionSignature || sentAutoSolveSignatures.has(signature)) {
+    return;
+  }
+  lastAutoSolveQuestionSignature = signature;
+  sentAutoSolveSignatures.add(signature);
+  if (sentAutoSolveSignatures.size > 50) {
+    const oldest = sentAutoSolveSignatures.values().next().value;
+    if (oldest) {
+      sentAutoSolveSignatures.delete(oldest);
+    }
+  }
+
+  const runtime = getChromeRuntime();
+  if (!runtime?.sendMessage) {
+    applyAutoSolveCurrentPage(false);
+    return;
+  }
+
+  try {
+    void runtime.sendMessage({
+      type: "AUTO_SOLVE_CURRENT_PAGE_REQUEST",
+      payload: {
+        questionCount: questions.length,
+        signature,
+        reason,
+        title: document.title,
+        url: location.href
+      }
+    }).catch((error) => {
+      if (isExtensionContextInvalidated(error)) {
+        applyAutoSolveCurrentPage(false);
+      }
+    });
+  } catch (error) {
+    if (isExtensionContextInvalidated(error)) {
+      applyAutoSolveCurrentPage(false);
+    }
+  }
+}
+
+function scheduleAutoSolveCurrentPage(reason: string): void {
+  if (!autoSolveCurrentPageEnabled) {
+    return;
+  }
+
+  if (autoSolveTimer) {
+    clearTimeout(autoSolveTimer);
+  }
+
+  autoSolveTimer = setTimeout(() => {
+    autoSolveTimer = null;
+    requestAutoSolveCurrentPage(reason);
+  }, 900);
+}
+
+function applyAutoSolveCurrentPage(enabled: boolean): void {
+  autoSolveCurrentPageEnabled = enabled;
+
+  if (!enabled) {
+    if (autoSolveTimer) {
+      clearTimeout(autoSolveTimer);
+      autoSolveTimer = null;
+    }
+    if (autoSolveAttachTimer) {
+      clearTimeout(autoSolveAttachTimer);
+      autoSolveAttachTimer = null;
+    }
+    autoSolveObserver?.disconnect();
+    autoSolveObserver = null;
+    lastAutoSolveQuestionSignature = "";
+    sentAutoSolveSignatures.clear();
+    return;
+  }
+
+  attachAutoSolveObserver();
+  scheduleAutoSolveCurrentPage("enabled");
+}
+
+function attachAutoSolveObserver(): void {
+  if (!autoSolveCurrentPageEnabled || autoSolveObserver) {
+    return;
+  }
+
+  if (!document.body) {
+    if (!autoSolveAttachTimer) {
+      autoSolveAttachTimer = setTimeout(() => {
+        autoSolveAttachTimer = null;
+        attachAutoSolveObserver();
+        scheduleAutoSolveCurrentPage("body_ready_retry");
+      }, 500);
+    }
+    return;
+  }
+
+  autoSolveObserver = new MutationObserver(() => {
+    scheduleAutoSolveCurrentPage("page_mutation");
+  });
+  autoSolveObserver.observe(document.body, {
+    childList: true,
+    subtree: true,
+    characterData: true
+  });
+  scheduleAutoSolveCurrentPage("observer_attached");
 }
 
 function applyExamAnswersToPage(matches: ExamAnswerMatch[]): { applied: number } {
@@ -672,6 +959,64 @@ function enableVisibilityBypass(aggressive = false): () => void {
   });
 }
 
+function enableFullscreenBlock(): () => void {
+  const blockedRequest = (() => Promise.reject(new DOMException("Fullscreen requests are blocked by NeonAgent", "NotAllowedError"))) as () => Promise<void>;
+  const requestMethods = [
+    "requestFullscreen",
+    "webkitRequestFullscreen",
+    "webkitRequestFullScreen",
+    "mozRequestFullScreen",
+    "msRequestFullscreen"
+  ] as const;
+  const cleaners: Array<() => void> = [];
+  const elementPrototype = Element.prototype as unknown as Record<string, unknown>;
+
+  for (const method of requestMethods) {
+    if (method in elementPrototype) {
+      cleaners.push(overrideFunction(elementPrototype, method, blockedRequest));
+    }
+  }
+
+  const exitFullscreen = (): void => {
+    const doc = document as FullscreenDocumentLike;
+    const isFullscreen = Boolean(
+      doc.fullscreenElement ||
+      doc.webkitFullscreenElement ||
+      doc.mozFullScreenElement ||
+      doc.msFullscreenElement
+    );
+    if (!isFullscreen) return;
+
+    try {
+      const exit =
+        doc.exitFullscreen ??
+        doc.webkitExitFullscreen ??
+        doc.mozCancelFullScreen ??
+        doc.msExitFullscreen;
+      void exit?.call(doc);
+    } catch {
+      // ignored
+    }
+  };
+
+  const fullscreenEvents = [
+    "fullscreenchange",
+    "webkitfullscreenchange",
+    "mozfullscreenchange",
+    "MSFullscreenChange"
+  ];
+  for (const event of fullscreenEvents) {
+    document.addEventListener(event, exitFullscreen, true);
+    cleaners.push(() => document.removeEventListener(event, exitFullscreen, true));
+  }
+
+  exitFullscreen();
+
+  return () => {
+    cleaners.forEach((fn) => fn());
+  };
+}
+
 function setFloatingBall(enabled: boolean): void {
   const existing = document.getElementById(FLOATING_BALL_ID);
 
@@ -702,6 +1047,12 @@ function setFloatingBall(enabled: boolean): void {
   document.documentElement.appendChild(btn);
 }
 
+function syncMainWorldFullscreenBlock(enabled: boolean): void {
+  window.dispatchEvent(new CustomEvent(FULLSCREEN_BLOCK_EVENT, {
+    detail: { enabled }
+  }));
+}
+
 function applyFeatureFlags(flags: FeatureFlags): void {
   while (cleanupFns.length > 0) {
     const fn = cleanupFns.pop();
@@ -718,6 +1069,11 @@ function applyFeatureFlags(flags: FeatureFlags): void {
     cleanupFns.push(enableVisibilityBypass(flags.aggressiveVisibilityBypass));
   }
 
+  if (flags.blockFullscreenRequests) {
+    cleanupFns.push(enableFullscreenBlock());
+  }
+  syncMainWorldFullscreenBlock(flags.blockFullscreenRequests);
+
   setFloatingBall(flags.enableFloatingBall);
 }
 
@@ -726,6 +1082,7 @@ function flagsFromConfig(config: Partial<LLMConfig>): FeatureFlags {
     unlockContextMenu: !!config.unlockContextMenu,
     blockVisibilityDetection: !!config.blockVisibilityDetection,
     aggressiveVisibilityBypass: !!config.aggressiveVisibilityBypass,
+    blockFullscreenRequests: !!config.blockFullscreenRequests,
     enableFloatingBall: !!config.enableFloatingBall
   };
 }
@@ -737,8 +1094,13 @@ function translationSettingsFromConfig(config: Partial<LLMConfig>): TranslationS
 
   return {
     enabled: !!config.translationEnabled,
+    selectionEnabled: !!config.selectionTranslationEnabled,
     targetLanguage,
-    displayMode: config.translationDisplayMode === "hover" ? "hover" : "below",
+    displayMode: config.translationDisplayMode === "bilingual" ||
+      config.translationDisplayMode === "below" ||
+      config.translationDisplayMode === "hover"
+      ? "bilingual"
+      : "replace",
     styleColor: typeof config.translationStyleColor === "string" && config.translationStyleColor.trim()
       ? config.translationStyleColor.trim()
       : defaultTranslationSettings.styleColor,
@@ -815,6 +1177,17 @@ function removeTranslationRecord(id: string): void {
   translationRecords.delete(id);
 }
 
+function withSuppressedTranslationObserver(fn: () => void): void {
+  suppressTranslationObserver = true;
+  try {
+    fn();
+  } finally {
+    queueMicrotask(() => {
+      suppressTranslationObserver = false;
+    });
+  }
+}
+
 function clearAllTranslations(): void {
   translationRunId += 1;
   if (translationTimer) {
@@ -829,8 +1202,17 @@ function clearAllTranslations(): void {
   }
 
   document.querySelectorAll(`[${TRANSLATION_SOURCE_ATTR}]`).forEach((node) => {
+    const originalText = node.getAttribute(TRANSLATION_TEXT_ATTR);
+    if (originalText !== null) {
+      withSuppressedTranslationObserver(() => {
+        node.textContent = originalText;
+      });
+    }
     node.removeAttribute(TRANSLATION_SOURCE_ATTR);
+    node.removeAttribute(TRANSLATION_TEXT_ATTR);
   });
+  lastPageTranslationSignature = "";
+  pageTranslationInProgressSignature = "";
 }
 
 function getTranslationInsertPosition(node: HTMLElement): InsertPosition {
@@ -842,10 +1224,39 @@ function getTranslationInsertPosition(node: HTMLElement): InsertPosition {
   return "beforeend";
 }
 
-function ensureTranslationRecord(node: HTMLElement, id: string, position?: InsertPosition): TranslationRecord {
+function positionTranslationOverlay(record: TranslationRecord): void {
+  if (!record.source.isConnected) {
+    return;
+  }
+  const rect = record.source.getBoundingClientRect();
+  record.host.style.position = "absolute";
+  record.host.style.left = `${Math.max(8, rect.left + window.scrollX)}px`;
+  record.host.style.top = `${Math.max(8, rect.bottom + window.scrollY + 4)}px`;
+  record.host.style.width = `${Math.max(160, rect.width)}px`;
+  record.host.style.maxWidth = "min(720px, calc(100vw - 16px))";
+  record.host.style.margin = "0";
+  record.host.style.zIndex = "2147483646";
+}
+
+function ensureTranslationRecord(
+  node: HTMLElement,
+  id: string,
+  position?: InsertPosition,
+  overlay = false,
+  attach = true
+): TranslationRecord {
   const existing = translationRecords.get(id);
   if (existing) {
-    if (position) {
+    existing.overlay = overlay;
+    if (!attach) {
+      existing.host.remove();
+    } else if (overlay) {
+      const overlayRoot = document.body ?? document.documentElement;
+      if (existing.host.parentElement !== overlayRoot) {
+        overlayRoot.appendChild(existing.host);
+      }
+      positionTranslationOverlay(existing);
+    } else if (position) {
       node.insertAdjacentElement(position, existing.host);
     }
     return existing;
@@ -869,21 +1280,34 @@ function ensureTranslationRecord(node: HTMLElement, id: string, position?: Inser
   shadow.appendChild(style);
   shadow.appendChild(body);
 
-  node.insertAdjacentElement(position || getTranslationInsertPosition(node), host);
-
   const record: TranslationRecord = {
     id,
     source: node,
     host,
     body,
     sourceText: "",
-    translatedText: ""
+    translatedText: "",
+    overlay,
+    displayMode: "below"
   };
+
+  if (!attach) {
+    // Replacement mode tracks source/translated text without adding layout nodes.
+  } else if (overlay) {
+    (document.body ?? document.documentElement).appendChild(host);
+    positionTranslationOverlay(record);
+  } else {
+    node.insertAdjacentElement(position || getTranslationInsertPosition(node), host);
+  }
+
   translationRecords.set(id, record);
   return record;
 }
 
 function renderTranslationRecord(record: TranslationRecord): void {
+  if (record.overlay) {
+    positionTranslationOverlay(record);
+  }
   record.body.textContent = record.translatedText;
   record.body.style.color = translationSettings.styleColor;
   record.body.style.background = translationSettings.styleBackground;
@@ -895,12 +1319,12 @@ function renderTranslationRecord(record: TranslationRecord): void {
 
   if (!record.onMouseEnter) {
     record.onMouseEnter = () => {
-      if (translationSettings.displayMode === "hover") {
+      if ((record.displayMode ?? "below") === "hover") {
         record.host.style.display = "block";
       }
     };
     record.onMouseLeave = () => {
-      if (translationSettings.displayMode === "hover") {
+      if ((record.displayMode ?? "below") === "hover") {
         record.host.style.display = "none";
       }
     };
@@ -908,7 +1332,95 @@ function renderTranslationRecord(record: TranslationRecord): void {
     record.source.addEventListener("mouseleave", record.onMouseLeave);
   }
 
-  record.host.style.display = translationSettings.displayMode === "hover" ? "none" : "block";
+  record.host.style.display = (record.displayMode ?? "below") === "hover" ? "none" : "block";
+}
+
+function createBilingualColumn(label: string, text: string, muted: boolean): HTMLDivElement {
+  const column = document.createElement("div");
+  column.style.minWidth = "0";
+
+  if (label) {
+    const labelEl = document.createElement("div");
+    labelEl.textContent = label;
+    labelEl.style.marginBottom = "4px";
+    labelEl.style.fontSize = "12px";
+    labelEl.style.fontWeight = "700";
+    labelEl.style.opacity = "0.72";
+    column.appendChild(labelEl);
+  }
+
+  const textEl = document.createElement("div");
+  textEl.textContent = text;
+  textEl.style.whiteSpace = "pre-wrap";
+  textEl.style.wordBreak = "break-word";
+  textEl.style.opacity = muted ? "0.78" : "1";
+
+  column.appendChild(textEl);
+  return column;
+}
+
+function renderBilingualTranslationRecord(
+  record: TranslationRecord,
+  options: {
+    sourceText: string;
+    translatedText: string;
+    sourceLabel: string;
+    targetLabel: string;
+    layout: "stacked" | "side-by-side";
+  }
+): void {
+  record.body.textContent = "";
+  record.body.style.color = options.sourceText ? translationSettings.styleColor : "inherit";
+  record.body.style.background = "transparent";
+  record.body.style.fontSize = `${translationSettings.styleFontSize}px`;
+  record.body.style.fontWeight = translationSettings.styleBold ? "700" : "400";
+  record.body.style.fontStyle = translationSettings.styleItalic ? "italic" : "normal";
+  record.body.style.display = "block";
+  record.body.style.gap = "0";
+  record.body.style.lineHeight = "1.6";
+  record.body.style.gridTemplateColumns = "";
+
+  if (options.sourceText) {
+    record.body.appendChild(createBilingualColumn(options.sourceLabel, options.sourceText, true));
+  }
+  record.body.appendChild(createBilingualColumn(options.targetLabel, options.translatedText, false));
+
+  if (!record.onMouseEnter) {
+    record.onMouseEnter = () => {
+      if ((record.displayMode ?? "below") === "hover") {
+        record.host.style.display = "block";
+      }
+    };
+    record.onMouseLeave = () => {
+      if ((record.displayMode ?? "below") === "hover") {
+        record.host.style.display = "none";
+      }
+    };
+    record.source.addEventListener("mouseenter", record.onMouseEnter);
+    record.source.addEventListener("mouseleave", record.onMouseLeave);
+  }
+
+  record.host.style.display = (record.displayMode ?? "below") === "hover" ? "none" : "block";
+}
+
+function renderAutoTranslationRecord(record: TranslationRecord): void {
+  if (translationSettings.displayMode === "replace") {
+    record.host.remove();
+    withSuppressedTranslationObserver(() => {
+      record.source.textContent = record.translatedText;
+    });
+    return;
+  }
+
+  renderBilingualTranslationRecord(record, {
+    sourceText: "",
+    translatedText: record.translatedText,
+    sourceLabel: "",
+    targetLabel: "",
+    layout: "stacked"
+  });
+  const sourceColor = window.getComputedStyle?.(record.source).color;
+  record.body.style.color = sourceColor && sourceColor !== "rgba(0, 0, 0, 0)" ? sourceColor : "inherit";
 }
 
 function resolvePageElement(selector: string, index: number): { element: HTMLElement } | { error: string } {
@@ -923,14 +1435,15 @@ function resolvePageElement(selector: string, index: number): { element: HTMLEle
 }
 
 function applyTranslationDisplayMode(record: TranslationRecord, displayMode: "below" | "hover"): void {
+  record.displayMode = displayMode;
   if (!record.onMouseEnter) {
     record.onMouseEnter = () => {
-      if (displayMode === "hover") {
+      if ((record.displayMode ?? "below") === "hover") {
         record.host.style.display = "block";
       }
     };
     record.onMouseLeave = () => {
-      if (displayMode === "hover") {
+      if ((record.displayMode ?? "below") === "hover") {
         record.host.style.display = "none";
       }
     };
@@ -960,8 +1473,73 @@ function createInsertedTextBlock(text: string): HTMLDivElement {
   return block;
 }
 
+function cleanTranslationOutput(text: string): string {
+  let output = text.trim();
+  output = output.replace(/^```(?:json|markdown|text|[a-z-]+)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  output = output.replace(/^["'“”‘’]+|["'“”‘’]+$/g, "").trim();
+
+  if (/(?:没有|未|没)(?:提供|给出|输入).{0,12}(?:需要|要)?翻译|请提供.{0,12}(?:需要|要)?翻译|no\s+(?:text|content|paragraph).{0,20}(?:provided|given)|(?:text|content|paragraph)\s+(?:was\s+)?not\s+(?:provided|given)/i.test(output)) {
+    return "";
+  }
+
+  const reasoningPattern = /\b(?:The user wants me to translate|I (?:need|should|will) translate|Since the instruction|Given the context|Wait, let me|Actually,|This appears to be|This could be|the most appropriate translation)\b/i;
+  if (reasoningPattern.test(output)) {
+    const cjkMatches = output.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}][\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\s，。！？、；：,.!?;:（）()《》“”"'‘’-]*$/gu);
+    if (cjkMatches?.length) {
+      output = cjkMatches[cjkMatches.length - 1].replace(/^[\s，。！？、；：,.!?;:（）()《》“”"'‘’-]+|[\s，。！？、；：,.!?;:（）()《》“”"'‘’-]+$/g, "").trim();
+    } else {
+      return "";
+    }
+  }
+
+  const labelPattern = /^(?:翻译(?:结果|如下|为)?|译文|目标语言译文|translation|translated(?:\s+text)?|result|answer)\s*[:：\-—]\s*/i;
+  for (let i = 0; i < 3; i += 1) {
+    const next = output.replace(labelPattern, "").trim();
+    if (next === output) break;
+    output = next;
+  }
+
+  const lines = output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (lines.length > 1) {
+    const filtered = lines.filter((line) => !/^(?:以下是|这是|好的|当然|sure\b|here(?:'s| is)\b)/i.test(line));
+    if (filtered.length > 0) {
+      output = filtered.join("\n").trim();
+    }
+  }
+
+  return output;
+}
+
+function finishSelectionTranslationPopup(popup: HTMLDivElement, text: string, rect: DOMRect | null, fallback?: { x: number; y: number }): void {
+  const cleaned = cleanTranslationOutput(text);
+  if (!cleaned) {
+    detachSelectionTranslationPopup();
+    lastSelectionTranslationKey = "";
+    return;
+  }
+  popup.textContent = cleaned;
+  positionSelectionTranslationPopup(popup, rect, fallback);
+}
+
+function getChromeRuntime(): typeof chrome.runtime | null {
+  if (typeof chrome === "undefined" || !chrome.runtime) {
+    return null;
+  }
+  return chrome.runtime;
+}
+
+function isExtensionContextInvalidated(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /Extension context invalidated/i.test(message);
+}
+
 async function requestTranslationsBatch(texts: string[]): Promise<string[]> {
-  const response = await chrome.runtime.sendMessage({
+  const runtime = getChromeRuntime();
+  if (!runtime?.sendMessage) {
+    throw new Error("扩展运行时不可用，请刷新页面后重试");
+  }
+
+  const response = await runtime.sendMessage({
     type: "TRANSLATE_SEGMENTS",
     payload: {
       segments: texts,
@@ -974,7 +1552,408 @@ async function requestTranslationsBatch(texts: string[]): Promise<string[]> {
     throw new Error(message);
   }
 
-  return response.data.translations;
+  return response.data.translations.map(cleanTranslationOutput);
+}
+
+function requestTranslationStream(
+  text: string,
+  onDelta: (delta: string) => void
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let port: chrome.runtime.Port | null = null;
+    let accumulated = "";
+    let settled = false;
+
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      try {
+        port?.disconnect();
+      } catch {
+        // ignored
+      }
+      if (error) {
+        reject(error);
+      } else {
+        resolve(cleanTranslationOutput(accumulated));
+      }
+    };
+
+    const runtime = getChromeRuntime();
+    if (!runtime?.connect) {
+      reject(new Error("扩展运行时不可用，请刷新页面后重试"));
+      return;
+    }
+
+    try {
+      port = runtime.connect({ name: "TRANSLATE_SEGMENT_STREAM" });
+    } catch (error) {
+      reject(error instanceof Error ? error : new Error(String(error)));
+      return;
+    }
+
+    port.onMessage.addListener((message: { type?: string; delta?: string; text?: string; error?: string }) => {
+      if (message.type === "delta" && typeof message.delta === "string") {
+        accumulated += message.delta;
+        onDelta(message.delta);
+        return;
+      }
+      if (message.type === "done") {
+        if (typeof message.text === "string") {
+          accumulated = message.text;
+        }
+        finish();
+        return;
+      }
+      if (message.type === "error") {
+        finish(new Error(message.error || "Translation failed"));
+      }
+    });
+
+    port.onDisconnect.addListener(() => {
+      if (!settled) {
+        const lastError = getChromeRuntime()?.lastError?.message;
+        if (lastError) {
+          finish(new Error(lastError));
+        } else {
+          finish();
+        }
+      }
+    });
+
+    port.postMessage({
+      text,
+      targetLanguage: translationSettings.targetLanguage
+    });
+  });
+}
+
+function removeSelectionTranslationPopup(): void {
+  selectionTranslationRunId += 1;
+  selectionTranslationPopup?.remove();
+  selectionTranslationPopup = null;
+}
+
+function detachSelectionTranslationPopup(): void {
+  selectionTranslationPopup?.remove();
+  selectionTranslationPopup = null;
+}
+
+function stopSelectionTranslationSilently(): void {
+  selectionTranslationCleanup?.();
+  selectionTranslationCleanup = null;
+  selectionTranslationPopup?.remove();
+  selectionTranslationPopup = null;
+  lastSelectionTranslationKey = "";
+}
+
+function positionSelectionTranslationPopup(popup: HTMLDivElement, rect: DOMRect | null, fallback?: { x: number; y: number }): void {
+  const x = rect ? rect.left + window.scrollX : fallback?.x ?? 16;
+  const y = rect ? rect.bottom + window.scrollY + 8 : fallback?.y ?? 16;
+  popup.style.left = `${Math.max(8, x)}px`;
+  popup.style.top = `${Math.max(8, y)}px`;
+}
+
+function withAlphaColor(color: string, alpha: number): string {
+  const trimmed = color.trim();
+  const hex = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(trimmed);
+  if (hex) {
+    const raw = hex[1].length === 3
+      ? hex[1].split("").map((char) => `${char}${char}`).join("")
+      : hex[1];
+    const r = parseInt(raw.slice(0, 2), 16);
+    const g = parseInt(raw.slice(2, 4), 16);
+    const b = parseInt(raw.slice(4, 6), 16);
+    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+  }
+
+  const rgb = /^rgba?\(\s*(\d+)[,\s]+(\d+)[,\s]+(\d+)(?:[,\s/]+[\d.]+)?\s*\)$/i.exec(trimmed);
+  if (rgb) {
+    return `rgba(${rgb[1]}, ${rgb[2]}, ${rgb[3]}, ${alpha})`;
+  }
+
+  return `rgba(248, 250, 252, ${alpha})`;
+}
+
+function parseRgbColor(color: string): { r: number; g: number; b: number } | null {
+  const trimmed = color.trim();
+  const hex = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(trimmed);
+  if (hex) {
+    const raw = hex[1].length === 3
+      ? hex[1].split("").map((char) => `${char}${char}`).join("")
+      : hex[1];
+    return {
+      r: parseInt(raw.slice(0, 2), 16),
+      g: parseInt(raw.slice(2, 4), 16),
+      b: parseInt(raw.slice(4, 6), 16)
+    };
+  }
+
+  const rgb = /^rgba?\(\s*(\d+)[,\s]+(\d+)[,\s]+(\d+)(?:[,\s/]+[\d.]+)?\s*\)$/i.exec(trimmed);
+  return rgb
+    ? { r: Number(rgb[1]), g: Number(rgb[2]), b: Number(rgb[3]) }
+    : null;
+}
+
+function readableTextColorForBackground(color: string): string {
+  const rgb = parseRgbColor(color);
+  if (!rgb) return translationSettings.styleColor || "#0f172a";
+  const luminance = (0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b) / 255;
+  return luminance < 0.48 ? "#f8fafc" : "#0f172a";
+}
+
+function isTransparentColor(color: string): boolean {
+  const normalized = color.trim().toLowerCase();
+  return !normalized ||
+    normalized === "transparent" ||
+    normalized === "rgba(0, 0, 0, 0)" ||
+    normalized === "rgba(0,0,0,0)";
+}
+
+function resolveElementBackgroundColor(element: Element | null): string {
+  let current: Element | null = element;
+  while (current) {
+    const background = window.getComputedStyle?.(current).backgroundColor || "";
+    if (!isTransparentColor(background)) {
+      return background;
+    }
+    current = current.parentElement;
+  }
+
+  const bodyBackground = document.body ? window.getComputedStyle?.(document.body).backgroundColor || "" : "";
+  if (!isTransparentColor(bodyBackground)) {
+    return bodyBackground;
+  }
+
+  const rootBackground = window.getComputedStyle?.(document.documentElement).backgroundColor || "";
+  return isTransparentColor(rootBackground) ? "#f8fafc" : rootBackground;
+}
+
+function resolvePopupBaseBackground(rect: DOMRect | null, fallback?: { x: number; y: number }): string {
+  const clientX = rect ? rect.left + rect.width / 2 : fallback ? fallback.x - window.scrollX : 16;
+  const clientY = rect ? rect.top + rect.height / 2 : fallback ? fallback.y - window.scrollY : 16;
+  const element = document.elementFromPoint?.(clientX, clientY) ?? null;
+  return resolveElementBackgroundColor(element);
+}
+
+function createSelectionTranslationPopup(text: string, rect: DOMRect | null, fallback?: { x: number; y: number }): HTMLDivElement {
+  detachSelectionTranslationPopup();
+
+  const popup = document.createElement("div");
+  popup.setAttribute(SELECTION_TRANSLATION_POPUP_ATTR, "true");
+  popup.style.position = "absolute";
+  popup.style.zIndex = "2147483647";
+  popup.style.boxSizing = "border-box";
+  popup.style.width = "max-content";
+  popup.style.maxWidth = "min(420px, calc(100vw - 16px))";
+  popup.style.minWidth = "0";
+  popup.style.padding = "10px 12px";
+  popup.style.borderRadius = "8px";
+  const baseBackground = resolvePopupBaseBackground(rect, fallback);
+  popup.style.border = "0";
+  popup.style.boxShadow = "0 12px 32px rgba(15, 23, 42, .16)";
+  popup.style.background = withAlphaColor(baseBackground, 0.42);
+  popup.style.backdropFilter = "blur(18px) saturate(1.35)";
+  popup.style.setProperty?.("-webkit-backdrop-filter", "blur(18px) saturate(1.35)");
+  popup.style.color = readableTextColorForBackground(baseBackground);
+  popup.style.fontSize = `${Math.max(12, translationSettings.styleFontSize)}px`;
+  popup.style.fontWeight = translationSettings.styleBold ? "700" : "400";
+  popup.style.fontStyle = translationSettings.styleItalic ? "italic" : "normal";
+  popup.style.lineHeight = "1.55";
+  popup.style.whiteSpace = "pre-wrap";
+  popup.style.wordBreak = "break-word";
+  popup.style.pointerEvents = "auto";
+  popup.textContent = text;
+
+  (document.body ?? document.documentElement).appendChild(popup);
+  positionSelectionTranslationPopup(popup, rect, fallback);
+  selectionTranslationPopup = popup;
+  return popup;
+}
+
+function getCurrentSelectionText(): { text: string; rect: DOMRect | null } {
+  const selection = window.getSelection?.();
+  const text = normalizeText(selection?.toString() || "");
+  if (!selection || selection.rangeCount === 0 || !text) {
+    return { text: "", rect: null };
+  }
+
+  const range = selection.getRangeAt(0);
+  const rect = range.getBoundingClientRect();
+  return { text, rect: rect.width || rect.height ? rect : null };
+}
+
+function shouldTranslateSelectionText(text: string): boolean {
+  return text.length > 0 && text.length <= 800;
+}
+
+async function translateSelectionText(text: string, rect: DOMRect | null, fallback?: { x: number; y: number }): Promise<void> {
+  if (!translationSettings.selectionEnabled || !shouldTranslateSelectionText(text)) {
+    return;
+  }
+
+  const key = `${translationSettings.targetLanguage}::${text}`;
+  if (key === lastSelectionTranslationKey && selectionTranslationPopup) {
+    return;
+  }
+  lastSelectionTranslationKey = key;
+
+  const runId = ++selectionTranslationRunId;
+  const popup = createSelectionTranslationPopup("翻译中...", rect, fallback);
+
+  try {
+    let streamedText = "";
+    const finalText = await requestTranslationStream(text, (delta) => {
+      if (runId !== selectionTranslationRunId || !translationSettings.selectionEnabled) {
+        return;
+      }
+      streamedText += delta;
+      popup.textContent = cleanTranslationOutput(streamedText) || "翻译中...";
+      positionSelectionTranslationPopup(popup, rect, fallback);
+    });
+
+    if (runId !== selectionTranslationRunId || !translationSettings.selectionEnabled) {
+      return;
+    }
+    finishSelectionTranslationPopup(popup, finalText || streamedText || "", rect, fallback);
+  } catch (streamError) {
+    if (isExtensionContextInvalidated(streamError)) {
+      stopSelectionTranslationSilently();
+      return;
+    }
+
+    try {
+      const [fallbackTranslation] = await requestTranslationsBatch([text]);
+      if (runId === selectionTranslationRunId && translationSettings.selectionEnabled) {
+        finishSelectionTranslationPopup(popup, fallbackTranslation, rect, fallback);
+      }
+    } catch (error) {
+      if (isExtensionContextInvalidated(error)) {
+        stopSelectionTranslationSilently();
+        return;
+      }
+      if (runId === selectionTranslationRunId) {
+        popup.textContent = `翻译失败：${error instanceof Error ? error.message : String(error)}`;
+      }
+    }
+  }
+}
+
+function enableSelectionTranslation(): void {
+  if (selectionTranslationCleanup || !document.body) {
+    return;
+  }
+
+  const translateCurrentSelection = (event?: MouseEvent): void => {
+    window.setTimeout(() => {
+      const { text, rect } = getCurrentSelectionText();
+      const fallback = event ? { x: event.pageX + 8, y: event.pageY + 8 } : undefined;
+      void translateSelectionText(text, rect, fallback);
+    }, 0);
+  };
+
+  const onDoubleClick = (event: MouseEvent): void => {
+    if ((event.target as Element | null)?.closest?.(`[${SELECTION_TRANSLATION_POPUP_ATTR}]`)) {
+      return;
+    }
+    translateCurrentSelection(event);
+  };
+
+  const onMouseUp = (event: MouseEvent): void => {
+    if ((event.target as Element | null)?.closest?.(`[${SELECTION_TRANSLATION_POPUP_ATTR}]`)) {
+      return;
+    }
+    translateCurrentSelection(event);
+  };
+
+  const onMouseDown = (event: MouseEvent): void => {
+    if ((event.target as Element | null)?.closest?.(`[${SELECTION_TRANSLATION_POPUP_ATTR}]`)) {
+      return;
+    }
+    removeSelectionTranslationPopup();
+    lastSelectionTranslationKey = "";
+  };
+
+  document.addEventListener("dblclick", onDoubleClick, true);
+  document.addEventListener("mouseup", onMouseUp, true);
+  document.addEventListener("mousedown", onMouseDown, true);
+
+  selectionTranslationCleanup = () => {
+    document.removeEventListener("dblclick", onDoubleClick, true);
+    document.removeEventListener("mouseup", onMouseUp, true);
+    document.removeEventListener("mousedown", onMouseDown, true);
+    removeSelectionTranslationPopup();
+  };
+}
+
+function syncSelectionTranslation(): void {
+  if (!translationSettings.selectionEnabled) {
+    selectionTranslationCleanup?.();
+    selectionTranslationCleanup = null;
+    return;
+  }
+
+  if (!document.body) {
+    document.addEventListener("DOMContentLoaded", () => {
+      if (translationSettings.selectionEnabled) {
+        enableSelectionTranslation();
+      }
+    }, { once: true });
+    return;
+  }
+
+  enableSelectionTranslation();
+}
+
+async function translateParagraphIntoRecord(
+  item: { id: string; node: HTMLElement; text: string },
+  runId: number
+): Promise<void> {
+  const isReplacementMode = translationSettings.displayMode === "replace";
+  const record = ensureTranslationRecord(item.node, item.id, undefined, false, !isReplacementMode);
+  record.source = item.node;
+  record.sourceText = item.text;
+  record.translatedText = "翻译中...";
+  if (!item.node.hasAttribute(TRANSLATION_TEXT_ATTR)) {
+    item.node.setAttribute(TRANSLATION_TEXT_ATTR, item.text);
+  }
+  renderAutoTranslationRecord(record);
+
+  try {
+    let streamedText = "";
+    const finalText = await requestTranslationStream(item.text, (delta) => {
+      if (runId !== translationRunId || !translationSettings.enabled) {
+        return;
+      }
+      streamedText += delta;
+      record.translatedText = cleanTranslationOutput(streamedText);
+      renderAutoTranslationRecord(record);
+    });
+
+    if (runId !== translationRunId || !translationSettings.enabled) {
+      return;
+    }
+
+    record.translatedText = cleanTranslationOutput(finalText || streamedText || "");
+    if (!record.translatedText) {
+      removeTranslationRecord(item.id);
+      return;
+    }
+    renderAutoTranslationRecord(record);
+    item.node.setAttribute(TRANSLATION_TEXT_ATTR, item.text);
+  } catch {
+    const [fallback] = await requestTranslationsBatch([item.text]);
+    if (runId !== translationRunId || !translationSettings.enabled) {
+      return;
+    }
+    record.translatedText = cleanTranslationOutput(fallback || "");
+    if (!record.translatedText) {
+      removeTranslationRecord(item.id);
+      return;
+    }
+    renderAutoTranslationRecord(record);
+    item.node.setAttribute(TRANSLATION_TEXT_ATTR, item.text);
+  }
 }
 
 async function runTranslationScan(): Promise<void> {
@@ -983,6 +1962,7 @@ async function runTranslationScan(): Promise<void> {
   }
 
   const runId = ++translationRunId;
+  const runSignature = pageTranslationInProgressSignature;
   const nodes = collectTranslatableElements();
   const activeIds = new Set<string>();
   const pending: Array<{ id: string; node: HTMLElement; text: string }> = [];
@@ -991,14 +1971,27 @@ async function runTranslationScan(): Promise<void> {
     const id = ensureTranslationId(node);
     activeIds.add(id);
 
-    const text = normalizeText(node.innerText || node.textContent || "");
+    const existingSourceText = node.getAttribute(TRANSLATION_TEXT_ATTR);
+    if (existingSourceText && translationSettings.displayMode === "bilingual" && node.textContent !== existingSourceText) {
+      withSuppressedTranslationObserver(() => {
+        node.textContent = existingSourceText;
+      });
+    }
+
+    const text = existingSourceText || normalizeText(node.innerText || node.textContent || "");
     if (!text) {
       continue;
     }
 
-    const record = ensureTranslationRecord(node, id);
+    const record = ensureTranslationRecord(
+      node,
+      id,
+      undefined,
+      false,
+      translationSettings.displayMode === "bilingual"
+    );
     if (record.sourceText === text && record.translatedText) {
-      renderTranslationRecord(record);
+      renderAutoTranslationRecord(record);
       continue;
     }
 
@@ -1019,22 +2012,15 @@ async function runTranslationScan(): Promise<void> {
     }
 
     const batch = pending.slice(start, start + translationSettings.batchSize);
-    const translations = await requestTranslationsBatch(batch.map((item) => item.text));
+    await Promise.all(batch.map((item) => translateParagraphIntoRecord(item, runId)));
     if (runId !== translationRunId || !translationSettings.enabled) {
       return;
     }
+  }
 
-    translations.forEach((translatedText, index) => {
-      const item = batch[index];
-      if (!item) {
-        return;
-      }
-      const record = ensureTranslationRecord(item.node, item.id);
-      record.sourceText = item.text;
-      record.translatedText = translatedText;
-      renderTranslationRecord(record);
-      item.node.setAttribute(TRANSLATION_TEXT_ATTR, item.text);
-    });
+  if (runSignature && runId === translationRunId && translationSettings.enabled) {
+    lastPageTranslationSignature = runSignature;
+    pageTranslationInProgressSignature = "";
   }
 }
 
@@ -1062,6 +2048,10 @@ function ensureTranslationObserver(): void {
 
   translationObserver = new MutationObserver((mutations) => {
     const hasRelevantChange = mutations.some((mutation) => {
+      if (suppressTranslationObserver) {
+        return false;
+      }
+
       if (mutation.type === "characterData") {
         return true;
       }
@@ -1085,6 +2075,7 @@ function ensureTranslationObserver(): void {
 
 function applyTranslationSettings(next: TranslationSettings): void {
   translationSettings = next;
+  syncSelectionTranslation();
 
   if (!translationSettings.enabled) {
     clearAllTranslations();
@@ -1103,6 +2094,42 @@ function applyTranslationSettings(next: TranslationSettings): void {
 
   ensureTranslationObserver();
   scheduleTranslationScan();
+}
+
+function buildPageTranslationSignature(settings: TranslationSettings): string {
+  const texts = collectTranslatableElements()
+    .map((node) => normalizeText(node.getAttribute(TRANSLATION_TEXT_ATTR) || node.innerText || node.textContent || ""))
+    .filter(Boolean)
+    .slice(0, 200);
+
+  return [
+    location.href.split("#")[0],
+    settings.targetLanguage,
+    settings.displayMode,
+    settings.styleColor,
+    settings.styleBackground,
+    settings.styleFontSize,
+    settings.styleBold ? "bold" : "normal",
+    settings.styleItalic ? "italic" : "regular",
+    texts.join("\n").slice(0, 20000)
+  ].join("\n---\n");
+}
+
+function translateCurrentPageOnce(next: TranslationSettings): { skipped: boolean; count: number } {
+  const settings = {
+    ...next,
+    enabled: true
+  };
+  const signature = buildPageTranslationSignature(settings);
+  const hasTranslations = translationRecords.size > 0;
+
+  if (signature && hasTranslations && (signature === lastPageTranslationSignature || signature === pageTranslationInProgressSignature)) {
+    return { skipped: true, count: translationRecords.size };
+  }
+
+  pageTranslationInProgressSignature = signature;
+  applyTranslationSettings(settings);
+  return { skipped: false, count: translationRecords.size };
 }
 
 // ── Agent Page Tool Handlers ──
@@ -1125,6 +2152,13 @@ function agentReadPageContent(args: Record<string, unknown>): string {
   }
   const text = (el as HTMLElement).innerText || el.textContent || "";
   return text.slice(0, maxLength);
+}
+
+function agentTranslateCurrentPage(): string {
+  const result = translateCurrentPageOnce(translationSettings);
+  return result.skipped
+    ? "Current page has already been translated with the same settings."
+    : "Started translating the current page.";
 }
 
 function agentQuerySelector(args: Record<string, unknown>): string {
@@ -1232,6 +2266,85 @@ function agentUpdateTranslationOnPage(args: Record<string, unknown>): string {
   return existingId
     ? `Updated translation for ${selector}[${index}] in place`
     : `Created translation for ${selector}[${index}] using ${displayMode} mode`;
+}
+
+function agentWriteBilingualTranslationToPage(args: Record<string, unknown>): string {
+  const selector = typeof args.selector === "string" ? args.selector : "";
+  const translatedText = typeof args.translatedText === "string" ? args.translatedText : "";
+  const index = typeof args.index === "number" ? args.index : 0;
+  const displayMode = args.displayMode === "hover" ? "hover" : "below";
+  const position = typeof args.position === "string" ? (args.position as InsertPosition) : undefined;
+  const layout = args.layout === "side-by-side" ? "side-by-side" : "stacked";
+  const sourceLabel = typeof args.sourceLabel === "string" && args.sourceLabel.trim() ? args.sourceLabel.trim() : "原文";
+  const targetLabel = typeof args.targetLabel === "string" && args.targetLabel.trim() ? args.targetLabel.trim() : "译文";
+
+  if (!selector) return "Error: selector is required";
+  if (!translatedText.trim()) return "Error: translatedText is required";
+
+  const resolved = resolvePageElement(selector, index);
+  if ("error" in resolved) return resolved.error;
+
+  const sourceText = typeof args.sourceText === "string" && args.sourceText.trim()
+    ? args.sourceText.trim()
+    : normalizeText(resolved.element.innerText || resolved.element.textContent || "");
+  if (!sourceText) return "Error: sourceText is empty";
+
+  const id = ensureTranslationId(resolved.element);
+  const record = ensureTranslationRecord(resolved.element, id, position);
+  record.source = resolved.element;
+  record.sourceText = sourceText;
+  record.translatedText = translatedText.trim();
+  renderBilingualTranslationRecord(record, {
+    sourceText,
+    translatedText: translatedText.trim(),
+    sourceLabel,
+    targetLabel,
+    layout
+  });
+  applyTranslationDisplayMode(record, displayMode);
+
+  return `Wrote bilingual translation near ${selector}[${index}] using ${layout} layout and ${displayMode} mode`;
+}
+
+function agentUpdateBilingualTranslationOnPage(args: Record<string, unknown>): string {
+  const selector = typeof args.selector === "string" ? args.selector : "";
+  const translatedText = typeof args.translatedText === "string" ? args.translatedText : "";
+  const index = typeof args.index === "number" ? args.index : 0;
+  const displayMode = args.displayMode === "hover" ? "hover" : "below";
+  const position = typeof args.position === "string" ? (args.position as InsertPosition) : undefined;
+  const layout = args.layout === "side-by-side" ? "side-by-side" : "stacked";
+  const sourceLabel = typeof args.sourceLabel === "string" && args.sourceLabel.trim() ? args.sourceLabel.trim() : "原文";
+  const targetLabel = typeof args.targetLabel === "string" && args.targetLabel.trim() ? args.targetLabel.trim() : "译文";
+
+  if (!selector) return "Error: selector is required";
+  if (!translatedText.trim()) return "Error: translatedText is required";
+
+  const resolved = resolvePageElement(selector, index);
+  if ("error" in resolved) return resolved.error;
+
+  const sourceText = typeof args.sourceText === "string" && args.sourceText.trim()
+    ? args.sourceText.trim()
+    : normalizeText(resolved.element.innerText || resolved.element.textContent || "");
+  if (!sourceText) return "Error: sourceText is empty";
+
+  const existingId = resolved.element.getAttribute(TRANSLATION_SOURCE_ATTR);
+  const id = existingId || ensureTranslationId(resolved.element);
+  const record = ensureTranslationRecord(resolved.element, id, position);
+  record.source = resolved.element;
+  record.sourceText = sourceText;
+  record.translatedText = translatedText.trim();
+  renderBilingualTranslationRecord(record, {
+    sourceText,
+    translatedText: translatedText.trim(),
+    sourceLabel,
+    targetLabel,
+    layout
+  });
+  applyTranslationDisplayMode(record, displayMode);
+
+  return existingId
+    ? `Updated bilingual translation for ${selector}[${index}] in place`
+    : `Created bilingual translation for ${selector}[${index}] using ${layout} layout and ${displayMode} mode`;
 }
 
 function agentInsertTextBlock(args: Record<string, unknown>): string {
@@ -1626,6 +2739,131 @@ function agentExecuteScript(args: Record<string, unknown>): string {
   }
 }
 
+function agentInspectVisibilityDetection(args: Record<string, unknown>): string {
+  const maxScripts = typeof args.maxScripts === "number" ? Math.max(1, args.maxScripts) : 80;
+  const maxSnippetLength = typeof args.maxSnippetLength === "number"
+    ? Math.max(80, args.maxSnippetLength)
+    : 220;
+  const keywords = [
+    "visibilitychange",
+    "webkitvisibilitychange",
+    "mozvisibilitychange",
+    "msvisibilitychange",
+    "visibilityState",
+    "document.hidden",
+    "hidden",
+    "blur",
+    "focus",
+    "pagehide",
+    "freeze",
+    "beforeunload",
+    "切屏",
+    "切换屏幕"
+  ];
+
+  const bodyText = typeof document.body?.innerText === "string"
+    ? document.body.innerText
+    : (document.body?.textContent ?? "");
+
+  const findSnippet = (text: string, keyword: string): string => {
+    const index = text.indexOf(keyword);
+    if (index < 0) return "";
+    const half = Math.floor(maxSnippetLength / 2);
+    return text
+      .slice(Math.max(0, index - half), index + keyword.length + half)
+      .replace(/\s+/g, " ")
+      .trim();
+  };
+
+  const propertyDescriptor = (target: object, key: "visibilityState" | "hidden") => {
+    let proto: object | null = Object.getPrototypeOf(target);
+    while (proto) {
+      const descriptor = Object.getOwnPropertyDescriptor(proto, key);
+      if (descriptor) {
+        return {
+          owner: proto.constructor?.name || "Object",
+          configurable: descriptor.configurable,
+          enumerable: descriptor.enumerable,
+          hasGetter: typeof descriptor.get === "function",
+          getterPreview: String(descriptor.get ?? "").slice(0, 180)
+        };
+      }
+      proto = Object.getPrototypeOf(proto);
+    }
+    return null;
+  };
+
+  const functionPreview = (value: unknown): string | null => {
+    return typeof value === "function" ? String(value).slice(0, 240) : null;
+  };
+
+  const scripts = Array.from(document.querySelectorAll<HTMLScriptElement>("script")).slice(0, maxScripts);
+  const scriptSignals = scripts
+    .map((script, index) => {
+      const src = script.src || script.getAttribute("src") || "";
+      const inlineText = src ? "" : (script.textContent || "");
+      const haystack = `${src}\n${inlineText}`;
+      const matches = keywords.filter((keyword) => haystack.includes(keyword));
+      if (matches.length === 0) return null;
+      return {
+        index,
+        src,
+        inlineLength: inlineText.length,
+        matches,
+        snippet: inlineText ? findSnippet(inlineText, matches[0]) : ""
+      };
+    })
+    .filter((item): item is NonNullable<typeof item> => item !== null);
+
+  let evalAllowed = false;
+  let evalError = "";
+  try {
+    // This is a diagnostic probe only; it does not run page logic.
+    evalAllowed = new Function("return true")() === true;
+  } catch (error) {
+    evalError = error instanceof Error ? error.message : String(error);
+  }
+
+  const textSignals = keywords
+    .map((keyword) => ({ keyword, snippet: findSnippet(bodyText, keyword) }))
+    .filter((item) => item.snippet);
+
+  const report = {
+    url: location.href,
+    title: document.title || "",
+    visibility: {
+      state: document.visibilityState,
+      hidden: document.hidden,
+      visibilityStateDescriptor: propertyDescriptor(document, "visibilityState"),
+      hiddenDescriptor: propertyDescriptor(document, "hidden")
+    },
+    handlerProperties: {
+      documentOnvisibilitychange: functionPreview(document.onvisibilitychange),
+      windowOnblur: functionPreview(window.onblur),
+      windowOnfocus: functionPreview(window.onfocus),
+      windowOnpagehide: functionPreview(window.onpagehide),
+      bodyOnblurAttr: document.body?.getAttribute?.("onblur") ?? null,
+      bodyOnfocusAttr: document.body?.getAttribute?.("onfocus") ?? null,
+      bodyOnmouseleaveAttr: document.body?.getAttribute?.("onmouseleave") ?? null
+    },
+    cspEvalProbe: {
+      allowed: evalAllowed,
+      error: evalError
+    },
+    pageTextSignals: {
+      checkedLength: bodyText.length,
+      matches: textSignals
+    },
+    scriptSignals: {
+      checkedScripts: scripts.length,
+      matches: scriptSignals
+    },
+    note: "只读诊断：浏览器不会暴露 addEventListener 注册列表，因此报告只包含 DOM/属性/脚本文本中可直接观察到的证据。"
+  };
+
+  return JSON.stringify(report, null, 2);
+}
+
 function agentWaitForElement(args: Record<string, unknown>): Promise<string> {
   const selector = typeof args.selector === "string" ? args.selector : "";
   const timeout = typeof args.timeout === "number" ? args.timeout : 5000;
@@ -1718,6 +2956,266 @@ function agentPressKey(args: Record<string, unknown>): string {
   return `Pressed key "${key}" on <${target.tagName.toLowerCase()}>`;
 }
 
+type ApiTrafficResource = PerformanceResourceTiming & {
+  responseStatus?: number;
+};
+
+type ApiTrafficSummaryBucket = {
+  count: number;
+  totalDurationMs: number;
+  totalTransferSize: number;
+};
+
+const API_TRAFFIC_INITIATOR_TYPES = new Set(["fetch", "xmlhttprequest", "beacon"]);
+
+function isLikelyApiUrl(url: URL): boolean {
+  const path = url.pathname.toLowerCase();
+  return /(^|\/)(api|graphql|rpc|rest|ajax|json|v\d+)(\/|$)/.test(path) ||
+    path.endsWith(".json") ||
+    url.searchParams.has("graphql") ||
+    url.searchParams.has("api");
+}
+
+function createApiTrafficUrlMatcher(pattern: unknown): (url: string) => boolean {
+  if (typeof pattern !== "string" || !pattern.trim()) {
+    return () => true;
+  }
+
+  const trimmed = pattern.trim();
+  const regexMatch = /^\/(.+)\/([dgimsuvy]*)$/.exec(trimmed);
+  if (regexMatch) {
+    try {
+      const regex = new RegExp(regexMatch[1], regexMatch[2]);
+      return (url: string) => regex.test(url);
+    } catch {
+      // Fall back to substring matching for malformed regex input.
+    }
+  }
+
+  const needle = trimmed.toLowerCase();
+  return (url: string) => url.toLowerCase().includes(needle);
+}
+
+function getApiTrafficResources(args: Record<string, unknown>): ApiTrafficResource[] {
+  const includeAllResources = args.includeAllResources === true;
+  const sinceMs = typeof args.sinceMs === "number" && args.sinceMs > 0 ? args.sinceMs : 0;
+  const startedAfter = sinceMs > 0 ? performance.now() - sinceMs : Number.NEGATIVE_INFINITY;
+  const matchesUrl = createApiTrafficUrlMatcher(args.urlPattern);
+
+  return performance
+    .getEntriesByType("resource")
+    .filter((entry): entry is ApiTrafficResource => entry.entryType === "resource")
+    .filter((entry) => entry.startTime >= startedAfter)
+    .filter((entry) => matchesApiTrafficResource(entry, matchesUrl, includeAllResources));
+}
+
+function matchesApiTrafficResource(
+  entry: ApiTrafficResource,
+  matchesUrl: (url: string) => boolean,
+  includeAllResources: boolean
+): boolean {
+  if (!matchesUrl(entry.name)) return false;
+  if (includeAllResources) return true;
+  if (API_TRAFFIC_INITIATOR_TYPES.has(entry.initiatorType)) return true;
+  try {
+    return isLikelyApiUrl(new URL(entry.name, location.href));
+  } catch {
+    return false;
+  }
+}
+
+function formatApiTrafficEntry(entry: ApiTrafficResource) {
+  let parsed: URL | null = null;
+  try {
+    parsed = new URL(entry.name, location.href);
+  } catch {
+    // Keep parsed null for non-standard resource names.
+  }
+
+  return {
+    url: entry.name,
+    origin: parsed?.origin ?? "",
+    path: parsed ? `${parsed.pathname}${parsed.search}` : "",
+    initiatorType: entry.initiatorType || "unknown",
+    startTimeMs: Number(entry.startTime.toFixed(1)),
+    ageMs: Number(Math.max(0, performance.now() - entry.startTime).toFixed(1)),
+    durationMs: Number(entry.duration.toFixed(1)),
+    transferSize: entry.transferSize || 0,
+    encodedBodySize: entry.encodedBodySize || 0,
+    decodedBodySize: entry.decodedBodySize || 0,
+    responseStatus: typeof entry.responseStatus === "number" ? entry.responseStatus : null,
+    protocol: entry.nextHopProtocol || ""
+  };
+}
+
+function addApiTrafficBucket(
+  buckets: Record<string, ApiTrafficSummaryBucket>,
+  key: string,
+  entry: ApiTrafficResource
+): void {
+  const bucket = buckets[key] ?? {
+    count: 0,
+    totalDurationMs: 0,
+    totalTransferSize: 0
+  };
+  bucket.count += 1;
+  bucket.totalDurationMs += entry.duration;
+  bucket.totalTransferSize += entry.transferSize || 0;
+  buckets[key] = bucket;
+}
+
+function sortApiTrafficBuckets(buckets: Record<string, ApiTrafficSummaryBucket>) {
+  return Object.entries(buckets)
+    .map(([key, bucket]) => ({
+      key,
+      count: bucket.count,
+      totalDurationMs: Number(bucket.totalDurationMs.toFixed(1)),
+      avgDurationMs: Number((bucket.totalDurationMs / bucket.count).toFixed(1)),
+      totalTransferSize: bucket.totalTransferSize
+    }))
+    .sort((a, b) => b.count - a.count || b.totalTransferSize - a.totalTransferSize);
+}
+
+function agentListApiTraffic(args: Record<string, unknown>): string {
+  const limit = typeof args.limit === "number" && args.limit > 0 ? Math.min(args.limit, 200) : 50;
+  const resources = getApiTrafficResources(args)
+    .sort((a, b) => b.startTime - a.startTime)
+    .slice(0, limit)
+    .map(formatApiTrafficEntry);
+
+  return JSON.stringify({
+    pageUrl: location.href,
+    count: resources.length,
+    note: "数据来自 Performance Resource Timing；部分站点可能因缓存、跨域 Timing-Allow-Origin 或浏览器限制导致状态码/大小为 0 或 null。",
+    requests: resources
+  }, null, 2);
+}
+
+function agentAnalyzeApiTraffic(args: Record<string, unknown>): string {
+  const topN = typeof args.topN === "number" && args.topN > 0 ? Math.min(args.topN, 50) : 10;
+  const resources = getApiTrafficResources(args);
+  const byHost: Record<string, ApiTrafficSummaryBucket> = {};
+  const byEndpoint: Record<string, ApiTrafficSummaryBucket> = {};
+  const byStatus: Record<string, ApiTrafficSummaryBucket> = {};
+  const byInitiatorType: Record<string, ApiTrafficSummaryBucket> = {};
+
+  let totalDurationMs = 0;
+  let totalTransferSize = 0;
+  let totalEncodedBodySize = 0;
+  let totalDecodedBodySize = 0;
+
+  for (const entry of resources) {
+    totalDurationMs += entry.duration;
+    totalTransferSize += entry.transferSize || 0;
+    totalEncodedBodySize += entry.encodedBodySize || 0;
+    totalDecodedBodySize += entry.decodedBodySize || 0;
+
+    let parsed: URL | null = null;
+    try {
+      parsed = new URL(entry.name, location.href);
+    } catch {
+      // Keep unparseable entries grouped under unknown.
+    }
+
+    const host = parsed?.host ?? "unknown";
+    const endpoint = parsed ? `${parsed.origin}${parsed.pathname}` : entry.name;
+    const status = typeof entry.responseStatus === "number" ? String(entry.responseStatus) : "unknown";
+    const initiatorType = entry.initiatorType || "unknown";
+
+    addApiTrafficBucket(byHost, host, entry);
+    addApiTrafficBucket(byEndpoint, endpoint, entry);
+    addApiTrafficBucket(byStatus, status, entry);
+    addApiTrafficBucket(byInitiatorType, initiatorType, entry);
+  }
+
+  const slowest = [...resources]
+    .sort((a, b) => b.duration - a.duration)
+    .slice(0, topN)
+    .map(formatApiTrafficEntry);
+  const largest = [...resources]
+    .sort((a, b) => (b.transferSize || 0) - (a.transferSize || 0))
+    .slice(0, topN)
+    .map(formatApiTrafficEntry);
+
+  return JSON.stringify({
+    pageUrl: location.href,
+    totalRequests: resources.length,
+    totalDurationMs: Number(totalDurationMs.toFixed(1)),
+    avgDurationMs: resources.length > 0 ? Number((totalDurationMs / resources.length).toFixed(1)) : 0,
+    totalTransferSize,
+    totalEncodedBodySize,
+    totalDecodedBodySize,
+    byHost: sortApiTrafficBuckets(byHost),
+    byEndpoint: sortApiTrafficBuckets(byEndpoint).slice(0, topN),
+    byStatus: sortApiTrafficBuckets(byStatus),
+    byInitiatorType: sortApiTrafficBuckets(byInitiatorType),
+    slowest,
+    largest,
+    note: "数据来自 Performance Resource Timing；无法读取请求/响应正文，部分状态码和大小可能因浏览器或跨域限制不可用。"
+  }, null, 2);
+}
+
+function agentWaitForApiTraffic(args: Record<string, unknown>): Promise<string> {
+  const urlPattern = typeof args.urlPattern === "string" ? args.urlPattern.trim() : "";
+  if (!urlPattern) return Promise.resolve("Error: urlPattern is required");
+
+  const timeout = typeof args.timeout === "number" && args.timeout > 0 ? args.timeout : 5000;
+  const includeExisting = args.includeExisting !== false;
+  const includeAllResources = args.includeAllResources === true;
+  const matchesUrl = createApiTrafficUrlMatcher(urlPattern);
+
+  if (includeExisting) {
+    const existing = getApiTrafficResources(args)
+      .sort((a, b) => b.startTime - a.startTime)[0];
+    if (existing) {
+      return Promise.resolve(JSON.stringify({
+        matchedExisting: true,
+        request: formatApiTrafficEntry(existing)
+      }, null, 2));
+    }
+  }
+
+  if (typeof PerformanceObserver !== "function") {
+    return Promise.resolve("Error: PerformanceObserver is not available in this page");
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (output: string): void => {
+      if (settled) return;
+      settled = true;
+      observer.disconnect();
+      clearTimeout(timer);
+      resolve(output);
+    };
+
+    const observer = new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) {
+        if (entry.entryType !== "resource") continue;
+        const resource = entry as ApiTrafficResource;
+        if (!matchesApiTrafficResource(resource, matchesUrl, includeAllResources)) {
+          continue;
+        }
+        finish(JSON.stringify({
+          matchedExisting: false,
+          request: formatApiTrafficEntry(resource)
+        }, null, 2));
+        return;
+      }
+    });
+
+    const timer = setTimeout(() => {
+      finish(`Timeout waiting for API traffic matching "${urlPattern}" (${timeout}ms)`);
+    }, timeout);
+
+    try {
+      observer.observe({ entryTypes: ["resource"] });
+    } catch (error) {
+      finish(`Error: cannot observe resource timing (${error instanceof Error ? error.message : String(error)})`);
+    }
+  });
+}
+
 function executeAgentTool(
   toolName: string,
   args: Record<string, unknown>
@@ -1739,12 +3237,18 @@ function executeAgentTool(
       return agentClickCanvas(args);
     case "click_canvas_cell":
       return agentClickCanvasCell(args);
+    case "translate_current_page":
+      return agentTranslateCurrentPage();
     case "write_translation_to_page":
       return agentWriteTranslationToPage(args);
     case "remove_translation_from_page":
       return agentRemoveTranslationFromPage(args);
     case "update_translation_on_page":
       return agentUpdateTranslationOnPage(args);
+    case "write_bilingual_translation_to_page":
+      return agentWriteBilingualTranslationToPage(args);
+    case "update_bilingual_translation_on_page":
+      return agentUpdateBilingualTranslationOnPage(args);
     case "insert_text_block":
       return agentInsertTextBlock(args);
     case "type_text":
@@ -1755,12 +3259,20 @@ function executeAgentTool(
       return agentScrollPage(args);
     case "execute_script":
       return agentExecuteScript(args);
+    case "inspect_visibility_detection":
+      return agentInspectVisibilityDetection(args);
     case "wait_for_element":
       return agentWaitForElement(args);
     case "get_form_data":
       return agentGetFormData(args);
     case "press_key":
       return agentPressKey(args);
+    case "list_api_traffic":
+      return agentListApiTraffic(args);
+    case "analyze_api_traffic":
+      return agentAnalyzeApiTraffic(args);
+    case "wait_for_api_traffic":
+      return agentWaitForApiTraffic(args);
     default:
       return `Unknown tool: ${toolName}`;
   }
@@ -1774,6 +3286,11 @@ function createContentMessageHandler(options?: {
   const applyFlags = options?.applyFlags ?? applyFeatureFlags;
 
   return (message: { type?: string; payload?: unknown }, _sender: unknown, sendResponse: (response: unknown) => void) => {
+    if (message.type === "PING") {
+      sendResponse({ ok: true, data: "PONG" });
+      return;
+    }
+
     if (message.type === "GET_PAGE_CONTEXT") {
       sendResponse({ ok: true, data: getContext() });
       return;
@@ -1789,6 +3306,23 @@ function createContentMessageHandler(options?: {
     if (message.type === "APPLY_TRANSLATION_SETTINGS") {
       const payload = message.payload as Partial<LLMConfig> | undefined;
       applyTranslationSettings(translationSettingsFromConfig(payload ?? {}));
+      sendResponse({ ok: true });
+      return;
+    }
+
+    if (message.type === "TRANSLATE_CURRENT_PAGE_ONCE") {
+      const payload = message.payload as Partial<LLMConfig> | undefined;
+      const result = translateCurrentPageOnce(translationSettingsFromConfig({
+        ...(payload ?? {}),
+        translationEnabled: true
+      }));
+      sendResponse({ ok: true, data: result });
+      return;
+    }
+
+    if (message.type === "APPLY_AUTO_SOLVE_SETTINGS") {
+      const payload = message.payload as { autoSolveCurrentPage?: boolean } | undefined;
+      applyAutoSolveCurrentPage(!!payload?.autoSolveCurrentPage);
       sendResponse({ ok: true });
       return;
     }
@@ -1846,6 +3380,7 @@ if (typeof chrome !== "undefined" && chrome.runtime?.onMessage) {
         const config = response.data as Partial<LLMConfig>;
         applyFeatureFlags(flagsFromConfig(config));
         applyTranslationSettings(translationSettingsFromConfig(config));
+        applyAutoSolveCurrentPage(!!config.autoSolveCurrentPage);
       }
     } catch {
       // ignored

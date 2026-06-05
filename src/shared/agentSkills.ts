@@ -8,6 +8,12 @@ import type { StorageLike } from "./storage.js";
 export interface SkillStep {
   /** Natural language instruction for the agent to follow */
   instruction: string;
+  /** Optional executable step kind. Existing skills remain instruction-only. */
+  type?: "instruction" | "tool";
+  /** Plugin/agent tool name to call when type is "tool". */
+  toolName?: string;
+  /** Tool arguments passed as JSON object when type is "tool". */
+  arguments?: Record<string, unknown>;
 }
 
 export interface Skill {
@@ -35,11 +41,38 @@ async function saveAll(storage: StorageLike, skills: Skill[]): Promise<void> {
   await storage.set(STORAGE_KEY, skills);
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+export function normalizeSkillStep(step: string | SkillStep): SkillStep {
+  if (typeof step === "string") {
+    return { instruction: step.trim(), type: "instruction" };
+  }
+
+  const type = step.type === "tool" ? "tool" : "instruction";
+  const instruction = typeof step.instruction === "string" ? step.instruction.trim() : "";
+  if (type === "tool") {
+    const toolName = typeof step.toolName === "string" ? step.toolName.trim() : "";
+    if (!toolName) {
+      throw new Error("Tool skill step requires toolName");
+    }
+    return {
+      instruction: instruction || `Call tool ${toolName}`,
+      type,
+      toolName,
+      arguments: isRecord(step.arguments) ? step.arguments : {}
+    };
+  }
+
+  return { instruction, type: "instruction" };
+}
+
 export async function createSkill(
   storage: StorageLike,
   name: string,
   description: string,
-  steps: string[],
+  steps: Array<string | SkillStep>,
   tags: string[] = []
 ): Promise<Skill> {
   const skills = await loadAll(storage);
@@ -57,7 +90,7 @@ export async function createSkill(
     id: `skill-${now}-${Math.random().toString(16).slice(2, 8)}`,
     name: name.trim(),
     description: description.trim(),
-    steps: steps.map((s) => ({ instruction: s.trim() })),
+    steps: steps.map((s) => normalizeSkillStep(s)),
     tags: tags.map((t) => t.trim().toLowerCase()),
     version: 1,
     createdAt: now,
@@ -127,7 +160,7 @@ export async function updateSkill(
   updates: {
     name?: string;
     description?: string;
-    steps?: string[];
+    steps?: Array<string | SkillStep>;
     tags?: string[];
   }
 ): Promise<Skill> {
@@ -152,7 +185,7 @@ export async function updateSkill(
     ...skill,
     name: updates.name?.trim() ?? skill.name,
     description: updates.description?.trim() ?? skill.description,
-    steps: updates.steps ? updates.steps.map((s) => ({ instruction: s.trim() })) : skill.steps,
+    steps: updates.steps ? updates.steps.map((s) => normalizeSkillStep(s)) : skill.steps,
     tags: updates.tags ? updates.tags.map((t) => t.trim().toLowerCase()) : skill.tags,
     version: skill.version + 1,
     updatedAt: Date.now()
@@ -187,7 +220,7 @@ export async function importSkills(
   data: Array<{
     name: string;
     description: string;
-    steps: string[] | SkillStep[];
+    steps: Array<string | SkillStep>;
     tags?: string[];
   }>
 ): Promise<{ imported: Skill[]; skipped: string[] }> {
@@ -203,9 +236,7 @@ export async function importSkills(
     if (existingNames.has(name.toLowerCase())) { skipped.push(name); continue; }
 
     const steps: SkillStep[] = Array.isArray(item.steps)
-      ? item.steps.map((s) =>
-          typeof s === "string" ? { instruction: s.trim() } : { instruction: (s as SkillStep).instruction?.trim() ?? "" }
-        )
+      ? item.steps.map((s) => normalizeSkillStep(s))
       : [];
     if (steps.length === 0) { skipped.push(name); continue; }
 
@@ -240,7 +271,8 @@ export function formatSkillsForPrompt(skills: Skill[]): string {
   const lines = skills.map((s) => {
     const tagStr = s.tags.length > 0 ? ` [${s.tags.join(", ")}]` : "";
     const usage = s.usageCount > 0 ? ` (已使用 ${s.usageCount} 次)` : "";
-    return `- **${s.name}** (id: ${s.id}): ${s.description}${tagStr}${usage}`;
+    const executable = s.steps.some((step) => step.type === "tool") ? " (包含可执行插件工具步骤，可用 run_skill 直接运行)" : "";
+    return `- **${s.name}** (id: ${s.id}): ${s.description}${tagStr}${usage}${executable}`;
   });
   return `# 已保存的技能\n以下是你之前学到的可复用技能，遇到相似任务时可直接调用：\n${lines.join("\n")}`;
 }
@@ -250,7 +282,12 @@ export function formatSkillsForPrompt(skills: Skill[]): string {
  */
 export function formatSkillForExecution(skill: Skill): string {
   const header = `执行技能「${skill.name}」(v${skill.version}):\n${skill.description}\n\n步骤：`;
-  const steps = skill.steps.map((s, i) => `${i + 1}. ${s.instruction}`);
+  const steps = skill.steps.map((s, i) => {
+    if (s.type === "tool" && s.toolName) {
+      return `${i + 1}. [tool:${s.toolName}] ${s.instruction}\n   arguments: ${JSON.stringify(s.arguments ?? {})}`;
+    }
+    return `${i + 1}. ${s.instruction}`;
+  });
   return `${header}\n${steps.join("\n")}`;
 }
 
@@ -274,8 +311,12 @@ export function skillToMarkdown(skill: {
   lines.push("");
   for (let i = 0; i < skill.steps.length; i++) {
     const step = skill.steps[i];
-    const text = typeof step === "string" ? step : step.instruction;
-    lines.push(`${i + 1}. ${text}`);
+    const normalized = normalizeSkillStep(step);
+    if (normalized.type === "tool" && normalized.toolName) {
+      lines.push(`${i + 1}. [tool:${normalized.toolName}] ${normalized.instruction} ${JSON.stringify(normalized.arguments ?? {})}`);
+    } else {
+      lines.push(`${i + 1}. ${normalized.instruction}`);
+    }
   }
   if (skill.tags && skill.tags.length > 0) {
     lines.push("");

@@ -19,7 +19,7 @@ export function buildAgentSystemPrompt(context?: {
 - 你可以通过工具读取页面内容、查找元素、点击按钮、填写表单、执行 JavaScript 等。
 - 所有文本输出都会直接展示给用户，用简洁明了的语言描述你在做什么。
 - 工具执行结果会自动反馈给你，你根据结果决定下一步操作。
-- 为了避免单次加载过多工具，部分领域工具（如 translation, canvas, memory, skill, script_skill, task）是按需加载的，需要时请先调用 load_tool_category 加载它们，随后即可使用。
+- 为了避免单次加载过多工具，部分领域工具（如 translation, canvas, traffic, memory, skill, script_skill, task）是按需加载的，需要时请先调用 load_tool_category 加载它们，随后即可使用。
 - 如果某个操作失败，先分析原因再尝试其他方法，不要盲目重试。
 - 对于不确定的操作，先用 query_selector 或 read_page_content 了解页面结构。`);
 
@@ -35,6 +35,7 @@ export function buildAgentSystemPrompt(context?: {
 - 当你成功完成一个复杂的多步骤任务时，主动使用 create_skill 将其保存为技能。
 - 收到任务时，先检查是否有已保存的相关技能（系统会自动加载已有技能列表到上下文中）。
 - 使用 execute_skill 执行已有技能，它会返回步骤列表，你需要按步骤使用工具逐一执行。
+- 如果技能包含 [tool:工具名] 结构化步骤，优先使用 run_skill 让插件按顺序直接执行这些工具步骤。
 - 执行技能后如果发现步骤可以优化，使用 update_skill 自动升级技能，版本号会自动递增。
 - 技能适合保存的场景：重复性操作、固定流程的自动化、特定网站的标准操作等。
 - 使用 list_skills 搜索技能，使用 delete_skill 清理不再需要的技能。
@@ -72,7 +73,9 @@ export function buildAgentSystemPrompt(context?: {
 - 遇到页面跳转或动态加载时，使用 wait_for_element 等待目标元素出现。`);
 
   sections.push(`# 译文展示约定
+- 当用户要求“翻译当前页面 / 翻译这个页面 / 页面翻译”时，优先调用 translate_current_page；它等同翻译标签页的“翻译当前页面”按钮，不改变网页翻译开关状态。
 - 当任务涉及在页面上展示、替换或清理译文时，优先使用 write_translation_to_page、update_translation_on_page 和 remove_translation_from_page，不要先用 insert_text_block 或 execute_script 拼接临时 DOM。
+- 当用户要求中英文对照、双语对照、原文+译文展示时，优先使用 write_bilingual_translation_to_page 或 update_bilingual_translation_on_page；清理仍使用 remove_translation_from_page。
 - 初次展示译文时优先用 write_translation_to_page；如果目标元素附近已经有插件注入的译文块，优先用 update_translation_on_page 原地更新。
 - 用户要求撤销、清理或隐藏译文时，优先用 remove_translation_from_page；只有在需要插入普通备注或非译文提示时才使用 insert_text_block。`);
 

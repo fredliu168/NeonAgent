@@ -48,12 +48,46 @@ export function migrateConfig(config: LLMConfig): LLMConfig {
   // Normalize baseUrl
   next.baseUrl = normalizeBaseUrl(next.baseUrl);
 
+  // Migrate thinkingFormat: old stored "none" was the previous default before we understood
+  // that APIs returning reasoning_content need it sent back as a field
+  if (!next.thinkingFormat || next.thinkingFormat === "none") {
+    next.thinkingFormat = "field";
+  }
+
   if (!next.translationTargetLanguage.trim()) {
     next.translationTargetLanguage = DEFAULT_CONFIG.translationTargetLanguage;
   }
 
-  if (next.translationDisplayMode !== "below" && next.translationDisplayMode !== "hover") {
+  if (typeof next.selectionTranslationEnabled !== "boolean") {
+    next.selectionTranslationEnabled = DEFAULT_CONFIG.selectionTranslationEnabled;
+  }
+
+  if (next.translationDisplayMode === ("below" as unknown) || next.translationDisplayMode === ("hover" as unknown)) {
+    next.translationDisplayMode = "bilingual";
+  }
+
+  if (next.translationDisplayMode !== "replace" && next.translationDisplayMode !== "bilingual") {
     next.translationDisplayMode = DEFAULT_CONFIG.translationDisplayMode;
+  }
+
+  if (typeof next.localCommandEnabled !== "boolean") {
+    next.localCommandEnabled = DEFAULT_CONFIG.localCommandEnabled;
+  }
+
+  if (typeof next.blockFullscreenRequests !== "boolean") {
+    next.blockFullscreenRequests = DEFAULT_CONFIG.blockFullscreenRequests;
+  }
+
+  if (typeof next.autoSolveCurrentPage !== "boolean") {
+    next.autoSolveCurrentPage = DEFAULT_CONFIG.autoSolveCurrentPage;
+  }
+
+  if (!next.localCommandWsUrl.trim()) {
+    next.localCommandWsUrl = DEFAULT_CONFIG.localCommandWsUrl;
+  }
+
+  if (typeof next.localCommandToken !== "string") {
+    next.localCommandToken = DEFAULT_CONFIG.localCommandToken;
   }
 
   if (!Number.isFinite(next.translationStyleFontSize) || next.translationStyleFontSize <= 0) {
@@ -81,8 +115,9 @@ export const DEFAULT_CONFIG: LLMConfig = {
   agentMaxTokens: 102400,
   systemPrompt: "You are a helpful assistant.",
   translationEnabled: false,
+  selectionTranslationEnabled: false,
   translationTargetLanguage: "中文",
-  translationDisplayMode: "below",
+  translationDisplayMode: "replace",
   translationStyleColor: "#0f172a",
   translationStyleBackground: "#f8fafc",
   translationStyleFontSize: 14,
@@ -93,7 +128,13 @@ export const DEFAULT_CONFIG: LLMConfig = {
   unlockContextMenu: false,
   blockVisibilityDetection: false,
   aggressiveVisibilityBypass: false,
-  enableFloatingBall: false
+  blockFullscreenRequests: false,
+  autoSolveCurrentPage: false,
+  enableFloatingBall: false,
+  localCommandEnabled: false,
+  localCommandWsUrl: "ws://127.0.0.1:8787/neonagent",
+  localCommandToken: "",
+  thinkingFormat: "field"
 };
 
 export function validateConfig(input: LLMConfig): ValidationResult {
@@ -129,12 +170,16 @@ export function validateConfig(input: LLMConfig): ValidationResult {
     errors.push("translationEnabled must be boolean");
   }
 
+  if (typeof input.selectionTranslationEnabled !== "boolean") {
+    errors.push("selectionTranslationEnabled must be boolean");
+  }
+
   if (!input.translationTargetLanguage.trim()) {
     errors.push("translationTargetLanguage is required");
   }
 
-  if (input.translationDisplayMode !== "below" && input.translationDisplayMode !== "hover") {
-    errors.push("translationDisplayMode must be 'below' or 'hover'");
+  if (input.translationDisplayMode !== "replace" && input.translationDisplayMode !== "bilingual") {
+    errors.push("translationDisplayMode must be 'replace' or 'bilingual'");
   }
 
   if (!input.translationStyleColor.trim()) {
@@ -177,8 +222,37 @@ export function validateConfig(input: LLMConfig): ValidationResult {
     errors.push("aggressiveVisibilityBypass must be boolean");
   }
 
+  if (typeof input.blockFullscreenRequests !== "boolean") {
+    errors.push("blockFullscreenRequests must be boolean");
+  }
+
+  if (typeof input.autoSolveCurrentPage !== "boolean") {
+    errors.push("autoSolveCurrentPage must be boolean");
+  }
+
   if (typeof input.enableFloatingBall !== "boolean") {
     errors.push("enableFloatingBall must be boolean");
+  }
+
+  if (typeof input.localCommandEnabled !== "boolean") {
+    errors.push("localCommandEnabled must be boolean");
+  }
+
+  if (typeof input.localCommandWsUrl !== "string" || !input.localCommandWsUrl.trim()) {
+    errors.push("localCommandWsUrl is required");
+  } else {
+    try {
+      const parsed = new URL(input.localCommandWsUrl);
+      if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {
+        errors.push("localCommandWsUrl must use ws:// or wss://");
+      }
+    } catch {
+      errors.push("localCommandWsUrl must be a valid WebSocket URL");
+    }
+  }
+
+  if (typeof input.localCommandToken !== "string") {
+    errors.push("localCommandToken must be string");
   }
 
   return {

@@ -259,6 +259,20 @@ export const AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: "function",
     function: {
+      name: "translate_current_page",
+      description:
+        "一次性翻译当前页面，效果等同翻译标签页的“翻译当前页面”按钮。使用当前翻译设置，不改变侧边栏的网页翻译开关状态。",
+      parameters: {
+        type: "object",
+        properties: {},
+        required: [],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "write_translation_to_page",
       description:
         "将指定译文写回原页面，默认插入到目标元素下方，并使用插件自己的隔离样式显示。",
@@ -349,6 +363,114 @@ export const AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
           }
         },
         required: ["selector", "text"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "write_bilingual_translation_to_page",
+      description:
+        "将中英文对照翻译写回原页面，默认取目标元素文本作为原文，并把原文与译文以插件隔离样式并排或上下展示。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "目标元素的 CSS 选择器"
+          },
+          translatedText: {
+            type: "string",
+            description: "译文内容，例如中文或英文译文"
+          },
+          sourceText: {
+            type: "string",
+            description: "原文内容；不传则读取目标元素的文本"
+          },
+          sourceLabel: {
+            type: "string",
+            description: "原文标签，默认 '原文'"
+          },
+          targetLabel: {
+            type: "string",
+            description: "译文标签，默认 '译文'"
+          },
+          index: {
+            type: "integer",
+            description: "匹配到多个元素时的索引（从 0 开始），默认 0"
+          },
+          layout: {
+            type: "string",
+            enum: ["stacked", "side-by-side"],
+            description: "对照布局：stacked=上下对照，side-by-side=左右对照，默认 stacked"
+          },
+          displayMode: {
+            type: "string",
+            enum: ["below", "hover"],
+            description: "显示模式：below=始终显示，hover=悬停原文时显示，默认 below"
+          },
+          position: {
+            type: "string",
+            enum: ["beforebegin", "afterbegin", "beforeend", "afterend"],
+            description: "指定插入位置，不传则由系统根据目标元素类型自动决定最佳位置"
+          }
+        },
+        required: ["selector", "translatedText"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "update_bilingual_translation_on_page",
+      description:
+        "原地更新页面上已有的中英文对照翻译块；如果目标元素还没有对应翻译块，则自动创建。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "原文元素的 CSS 选择器"
+          },
+          translatedText: {
+            type: "string",
+            description: "新的译文内容"
+          },
+          sourceText: {
+            type: "string",
+            description: "新的原文内容；不传则读取目标元素的文本"
+          },
+          sourceLabel: {
+            type: "string",
+            description: "原文标签，默认 '原文'"
+          },
+          targetLabel: {
+            type: "string",
+            description: "译文标签，默认 '译文'"
+          },
+          index: {
+            type: "integer",
+            description: "匹配到多个元素时的索引（从 0 开始），默认 0"
+          },
+          layout: {
+            type: "string",
+            enum: ["stacked", "side-by-side"],
+            description: "对照布局：stacked=上下对照，side-by-side=左右对照，默认 stacked"
+          },
+          displayMode: {
+            type: "string",
+            enum: ["below", "hover"],
+            description: "显示模式：below=始终显示，hover=悬停原文时显示；不传则保持原模式或默认 below"
+          },
+          position: {
+            type: "string",
+            enum: ["beforebegin", "afterbegin", "beforeend", "afterend"],
+            description: "指定插入位置，不传则由系统根据目标元素类型自动决定最佳位置"
+          }
+        },
+        required: ["selector", "translatedText"],
         additionalProperties: false
       }
     }
@@ -497,6 +619,29 @@ export const AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: "function",
     function: {
+      name: "inspect_visibility_detection",
+      description:
+        "只读检查当前页面是否存在切屏/失焦检测线索。返回页面可见性状态、onblur/onfocus/onvisibilitychange 属性、页面文本中的切屏计数提示，以及脚本标签中的相关关键词命中；不会修改页面。",
+      parameters: {
+        type: "object",
+        properties: {
+          maxScripts: {
+            type: "integer",
+            description: "最多扫描的 script 标签数量，默认 80"
+          },
+          maxSnippetLength: {
+            type: "integer",
+            description: "关键词上下文片段最大长度，默认 220"
+          }
+        },
+        required: [],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "navigate",
       description: "让浏览器导航到指定 URL。导航后需要等待页面加载完成。",
       parameters: {
@@ -579,14 +724,107 @@ export const AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: "function",
     function: {
+      name: "list_api_traffic",
+      description:
+        "列出当前站点已产生的 API/接口请求流量，基于浏览器 Resource Timing 数据，可查看 fetch、XHR、beacon 等请求的 URL、耗时、传输大小、状态码等。",
+      parameters: {
+        type: "object",
+        properties: {
+          urlPattern: {
+            type: "string",
+            description: "按 URL 过滤，默认不过滤；支持普通子串，也支持 /pattern/flags 正则"
+          },
+          sinceMs: {
+            type: "integer",
+            description: "只返回最近多少毫秒内开始的请求；不传则返回当前页面生命周期内的请求"
+          },
+          limit: {
+            type: "integer",
+            description: "最多返回多少条，默认 50"
+          },
+          includeAllResources: {
+            type: "boolean",
+            description: "是否包含图片、脚本、CSS 等所有资源；默认 false，仅包含接口类请求或疑似 API URL"
+          }
+        },
+        required: [],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "analyze_api_traffic",
+      description:
+        "汇总分析当前站点 API/接口流量，输出请求数、总传输大小、平均/最大耗时、慢接口、流量最大的接口，并按域名、接口路径、状态码和请求类型聚合。",
+      parameters: {
+        type: "object",
+        properties: {
+          urlPattern: {
+            type: "string",
+            description: "按 URL 过滤，默认不过滤；支持普通子串，也支持 /pattern/flags 正则"
+          },
+          sinceMs: {
+            type: "integer",
+            description: "只分析最近多少毫秒内开始的请求；不传则分析当前页面生命周期内的请求"
+          },
+          topN: {
+            type: "integer",
+            description: "慢接口/大流量接口返回条数，默认 10"
+          },
+          includeAllResources: {
+            type: "boolean",
+            description: "是否包含图片、脚本、CSS 等所有资源；默认 false，仅包含接口类请求或疑似 API URL"
+          }
+        },
+        required: [],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "wait_for_api_traffic",
+      description:
+        "等待当前页面出现匹配条件的 API/接口请求，适合点击或输入后观察是否触发了目标接口。",
+      parameters: {
+        type: "object",
+        properties: {
+          urlPattern: {
+            type: "string",
+            description: "要等待的 URL 过滤条件；支持普通子串，也支持 /pattern/flags 正则"
+          },
+          timeout: {
+            type: "integer",
+            description: "最长等待毫秒数，默认 5000"
+          },
+          includeExisting: {
+            type: "boolean",
+            description: "是否先检查当前已存在的请求，默认 true"
+          },
+          includeAllResources: {
+            type: "boolean",
+            description: "是否匹配所有资源；默认 false，仅匹配接口类请求或疑似 API URL"
+          }
+        },
+        required: ["urlPattern"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "load_tool_category",
-      description: "按需加载特定领域的工具。可用领域包括：'canvas'（画布）、'translation'（页面翻译）、'memory'（长期记忆）、'skill'（原生技能）、'script_skill'（脚本技能）和 'task'（定时任务）。",
+      description: "按需加载特定领域的工具。可用领域包括：'canvas'（画布）、'translation'（页面翻译）、'traffic'（站点 API 接口流量分析）、'memory'（长期记忆）、'skill'（原生技能）、'script_skill'（脚本技能）和 'task'（定时任务）。",
       parameters: {
         type: "object",
         properties: {
           category: {
             type: "string",
-            enum: ["canvas", "translation", "memory", "skill", "script_skill", "task"],
+            enum: ["canvas", "translation", "traffic", "memory", "skill", "script_skill", "task"],
             description: "要加载的工具领域类别",
           },
         },
@@ -677,8 +915,22 @@ export const AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
           },
           steps: {
             type: "array",
-            items: { type: "string" },
-            description: "按顺序排列的步骤列表，每步是一条自然语言指令"
+            items: {
+              oneOf: [
+                { type: "string" },
+                {
+                  type: "object",
+                  properties: {
+                    instruction: { type: "string" },
+                    type: { type: "string", enum: ["instruction", "tool"] },
+                    toolName: { type: "string" },
+                    arguments: { type: "object" }
+                  },
+                  required: ["type", "toolName"]
+                }
+              ]
+            },
+            description: "按顺序排列的步骤列表。可以是自然语言指令，也可以是 {type:'tool', toolName, arguments, instruction} 结构化步骤，用于让 skill 直接控制插件工具。"
           },
           tags: {
             type: "array",
@@ -732,6 +984,29 @@ export const AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: "function",
     function: {
+      name: "run_skill",
+      description:
+        "直接运行一个已保存技能中的结构化工具步骤，用于通过 skill 控制插件工具。字符串/自然语言步骤会作为待执行说明返回，type='tool' 的步骤会按顺序调用对应页面工具、后台工具或脚本技能工具。",
+      parameters: {
+        type: "object",
+        properties: {
+          skillId: {
+            type: "string",
+            description: "要运行的技能 ID（从 list_skills 结果中获取）"
+          },
+          stopOnError: {
+            type: "boolean",
+            description: "某个工具步骤失败时是否停止，默认 true"
+          }
+        },
+        required: ["skillId"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "update_skill",
       description:
         "升级/更新一个已保存的技能。当你发现更好的操作方式时，可以更新技能的步骤或描述。版本号会自动递增。",
@@ -752,8 +1027,22 @@ export const AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
           },
           steps: {
             type: "array",
-            items: { type: "string" },
-            description: "新的步骤列表（可选）"
+            items: {
+              oneOf: [
+                { type: "string" },
+                {
+                  type: "object",
+                  properties: {
+                    instruction: { type: "string" },
+                    type: { type: "string", enum: ["instruction", "tool"] },
+                    toolName: { type: "string" },
+                    arguments: { type: "object" }
+                  },
+                  required: ["type", "toolName"]
+                }
+              ]
+            },
+            description: "新的步骤列表（可选）。支持字符串步骤或结构化工具步骤。"
           },
           tags: {
             type: "array",
@@ -1047,16 +1336,23 @@ export const PAGE_TOOLS = new Set([
   "inspect_canvas_pixel",
   "click_canvas",
   "click_canvas_cell",
+  "translate_current_page",
   "write_translation_to_page",
   "remove_translation_from_page",
   "update_translation_on_page",
+  "write_bilingual_translation_to_page",
+  "update_bilingual_translation_on_page",
   "insert_text_block",
   "type_text",
   "select_option",
   "scroll_page",
   "execute_script",
+  "inspect_visibility_detection",
   "wait_for_element",
   "get_form_data",
+  "list_api_traffic",
+  "analyze_api_traffic",
+  "wait_for_api_traffic",
   "press_key"
 ]);
 
@@ -1066,18 +1362,19 @@ export const BACKGROUND_TOOLS = new Set([
   "get_current_time",
   "load_tool_category",
   "save_memory", "search_memories", "delete_memory",
-  "create_skill", "list_skills", "execute_skill", "update_skill", "delete_skill",
+  "create_skill", "list_skills", "execute_skill", "run_skill", "update_skill", "delete_skill",
   "install_script_skill", "list_script_skills", "update_script_skill", "uninstall_script_skill",
   "create_scheduled_task", "list_scheduled_tasks", "update_scheduled_task", "delete_scheduled_task"
 ]);
 
-export type ToolCategory = "canvas" | "translation" | "memory" | "skill" | "script_skill" | "task";
+export type ToolCategory = "canvas" | "translation" | "traffic" | "memory" | "skill" | "script_skill" | "task";
 
 export const TOOL_CATEGORIES: Record<ToolCategory, string[]> = {
   canvas: ["query_canvas", "inspect_canvas_pixel", "click_canvas", "click_canvas_cell"],
-  translation: ["write_translation_to_page", "remove_translation_from_page", "update_translation_on_page", "insert_text_block"],
+  translation: ["translate_current_page", "write_translation_to_page", "remove_translation_from_page", "update_translation_on_page", "write_bilingual_translation_to_page", "update_bilingual_translation_on_page", "insert_text_block"],
+  traffic: ["list_api_traffic", "analyze_api_traffic", "wait_for_api_traffic"],
   memory: ["save_memory", "search_memories", "delete_memory"],
-  skill: ["create_skill", "list_skills", "execute_skill", "update_skill", "delete_skill"],
+  skill: ["create_skill", "list_skills", "execute_skill", "run_skill", "update_skill", "delete_skill"],
   script_skill: ["install_script_skill", "list_script_skills", "update_script_skill", "uninstall_script_skill"],
   task: ["create_scheduled_task", "list_scheduled_tasks", "update_scheduled_task", "delete_scheduled_task"]
 };
@@ -1085,5 +1382,5 @@ export const TOOL_CATEGORIES: Record<ToolCategory, string[]> = {
 export const CORE_TOOLS = new Set([
   "get_page_info", "read_page_content", "query_selector", "click_element",
   "type_text", "wait_for_element", "navigate", "scroll_page", "execute_script",
-  "press_key", "get_form_data", "select_option", "get_current_time", "load_tool_category"
+  "inspect_visibility_detection", "press_key", "get_form_data", "select_option", "get_current_time", "load_tool_category", "translate_current_page"
 ]);

@@ -84,7 +84,7 @@ function parseStreamDelta(dataLine: string): StreamDelta | null {
   }
 
   let parsed: {
-    choices?: Array<{ delta?: { content?: string; reasoning_content?: string } }>;
+    choices?: Array<{ delta?: { content?: string | Array<{ type?: string; text?: string; thinking?: string }>; reasoning_content?: string } }>;
   };
 
   try {
@@ -94,8 +94,25 @@ function parseStreamDelta(dataLine: string): StreamDelta | null {
   }
 
   const delta = parsed.choices?.[0]?.delta;
-  const content = typeof delta?.content === "string" ? delta.content : null;
-  const reasoning = typeof delta?.reasoning_content === "string" ? delta.reasoning_content : null;
+
+  let content: string | null = null;
+  let reasoning: string | null = null;
+
+  if (typeof delta?.content === "string") {
+    content = delta.content;
+  } else if (Array.isArray(delta?.content)) {
+    for (const block of delta.content) {
+      if (block.type === "thinking" && typeof block.thinking === "string") {
+        reasoning = (reasoning ?? "") + block.thinking;
+      } else if (block.type === "text" && typeof block.text === "string") {
+        content = (content ?? "") + block.text;
+      }
+    }
+  }
+
+  if (reasoning === null && typeof delta?.reasoning_content === "string") {
+    reasoning = delta.reasoning_content;
+  }
 
   if (content === null && reasoning === null) {
     return null;

@@ -725,7 +725,8 @@
         line-height: 1.3;
       }
 
-      #status {
+      #status,
+      #translationStatus {
         margin-top: 8px;
         font-size: 12px;
       }
@@ -791,6 +792,7 @@
     <nav class="tab-bar">
       <button class="tab-btn active" data-tab="tabChat">对话</button>
       <button class="tab-btn" data-tab="tabAgent">智能体</button>
+      <button class="tab-btn" data-tab="tabTranslate">翻译</button>
       <button class="tab-btn" data-tab="tabSettings">设置</button>
       <button class="tab-btn" data-tab="tabAbout">关于</button>
     </nav>
@@ -914,7 +916,17 @@
           <label for="agentMaxTokens">智能体 Max Tokens</label>
           <input id="agentMaxTokens" type="number" placeholder="102400" min="1" />
 
-          <button id="saveConfig" class="btn-primary" style="margin-top: 4px;">保存配置</button>
+          <label for="thinkingFormat">Thinking 回传格式</label>
+          <select id="thinkingFormat" style="width:100%;padding:6px 8px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;background:#fff;">
+            <option value="field">reasoning_content 字段（原生 DeepSeek）</option>
+            <option value="blocks">content[].thinking 块（Anthropic 兼容）</option>
+            <option value="none">不回传（标准 OpenAI 兼容）</option>
+          </select>
+
+          <div style="display:flex;gap:4px;margin-top:4px;">
+            <button id="saveConfig" class="btn-primary" style="flex:1;">保存配置</button>
+            <button id="testLlmConfig" class="btn-secondary" style="flex:1;padding:4px 10px;font-size:12px;">测试大模型</button>
+          </div>
           <div style="display:flex;gap:4px;margin-top:4px;">
             <button id="exportConfig" class="btn-secondary" style="flex:1;padding:4px 10px;font-size:12px;">导出配置</button>
             <button id="importConfigBtn" class="btn-secondary" style="flex:1;padding:4px 10px;font-size:12px;">导入配置</button>
@@ -926,6 +938,19 @@
         <section class="card">
           <h2>功能开关</h2>
           <div class="switch-group">
+            <div class="switch-row">
+              <label><input id="localCommandEnabled" type="checkbox" /> 启用本地命令 WebSocket</label>
+            </div>
+            <label for="localCommandWsUrl">本地命令 WebSocket URL</label>
+            <input id="localCommandWsUrl" type="text" placeholder="ws://127.0.0.1:8787/neonagent" />
+            <label for="localCommandToken">本地命令 Token</label>
+            <input id="localCommandToken" type="password" placeholder="可选，用于校验 Codex 命令来源" />
+            <div style="display:flex;align-items:center;gap:6px;margin-top:6px;">
+              <span id="localCommandStatus" class="setting-hint" style="flex:1;margin:0;">WebSocket 未启用</span>
+              <button id="refreshLocalCommandStatus" class="btn-secondary" style="padding:2px 8px;font-size:11px;">刷新</button>
+            </div>
+            <div class="setting-hint">NeonAgent 会主动连接这个本地服务，收到 Codex/OpenClaw 命令后直接执行智能体、工具或 Skill。</div>
+
             <div class="switch-row">
               <label><input id="unlockContextMenu" type="checkbox" /> 解除右键限制</label>
             </div>
@@ -941,24 +966,49 @@
             </div>
             <div class="setting-hint">仅在"屏蔽切屏检测"开启时生效</div>
 
+            <div class="switch-row">
+              <label><input id="blockFullscreenRequests" type="checkbox" /> 限制页面自动全屏</label>
+            </div>
+            <div class="setting-hint">拦截网页脚本调用全屏 API，并在页面进入全屏时自动退出</div>
+
+            <div class="switch-row">
+              <label><input id="autoSolveCurrentPage" type="checkbox" /> 当前页面自动解题</label>
+            </div>
+            <div class="setting-hint">勾选后自动判断当前页面是否包含题目；检测到题目时调用一键解题，并在对话框显示过程与答案</div>
+
           </div>
         </section>
 
         <section class="card">
-          <h2>对照翻译</h2>
+          <h2>页面上下文</h2>
+          <pre id="context"></pre>
+        </section>
+      </div>
+    </main>
+
+    <!-- ===== Translation Tab ===== -->
+    <main id="tabTranslate" class="tab-content">
+      <div class="settings-scroll">
+        <section class="card">
+          <h2>网页翻译</h2>
+
+          <button id="translateCurrentPage" class="btn-primary" style="width:100%;margin-bottom:10px;">翻译当前页面</button>
 
           <div class="switch-row">
-            <label><input id="translationEnabled" type="checkbox" /> 启用当前网页对照翻译</label>
+            <label><input id="translationEnabled" type="checkbox" /> 启用当前网页翻译</label>
           </div>
-          <div class="setting-hint">以段落为单位翻译，动态内容会自动续译。</div>
+          <div class="switch-row">
+            <label><input id="selectionTranslationEnabled" type="checkbox" /> 启用双击/划词翻译</label>
+          </div>
+          <div class="setting-hint">以段落为单位流式翻译，可直接替换原文或在原文下方显示译文。</div>
 
           <label for="translationTargetLanguage">目标语言</label>
           <input id="translationTargetLanguage" type="text" placeholder="中文 / English / 日本語" />
 
           <label for="translationDisplayMode">显示模式</label>
           <select id="translationDisplayMode">
-            <option value="below">原文下方显示译文</option>
-            <option value="hover">悬停时显示译文</option>
+            <option value="replace">直接替换为目标语言</option>
+            <option value="bilingual">原文下方显示译文</option>
           </select>
 
           <label for="translationDebounceMs">翻译防抖（毫秒）</label>
@@ -976,7 +1026,7 @@
               <input id="translationStyleColor" type="color" value="#0f172a" />
             </div>
             <div>
-              <label for="translationStyleBackground">背景高亮</label>
+              <label for="translationStyleBackground">划词卡片背景</label>
               <input id="translationStyleBackground" type="color" value="#f8fafc" />
             </div>
           </div>
@@ -994,11 +1044,7 @@
             <button id="applyTranslation" class="btn-primary" style="flex:1;">应用到当前页</button>
             <button id="clearTranslation" class="btn-secondary" style="flex:1;">清除当前页译文</button>
           </div>
-        </section>
-
-        <section class="card">
-          <h2>页面上下文</h2>
-          <pre id="context"></pre>
+          <div id="translationStatus"></div>
         </section>
       </div>
     </main>

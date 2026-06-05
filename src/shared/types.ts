@@ -8,8 +8,9 @@ export interface LLMConfig {
   agentMaxTokens: number;
   systemPrompt: string;
   translationEnabled: boolean;
+  selectionTranslationEnabled: boolean;
   translationTargetLanguage: string;
-  translationDisplayMode: "below" | "hover";
+  translationDisplayMode: "replace" | "bilingual";
   translationStyleColor: string;
   translationStyleBackground: string;
   translationStyleFontSize: number;
@@ -20,13 +21,26 @@ export interface LLMConfig {
   unlockContextMenu: boolean;
   blockVisibilityDetection: boolean;
   aggressiveVisibilityBypass: boolean;
+  blockFullscreenRequests: boolean;
+  autoSolveCurrentPage: boolean;
   enableFloatingBall: boolean;
+  /** Built-in local command WebSocket client for Codex/OpenClaw control. */
+  localCommandEnabled: boolean;
+  localCommandWsUrl: string;
+  localCommandToken: string;
+  /** How to pass thinking/reasoning back to the API on subsequent turns.
+   * "none"   – strip reasoning_content (standard OpenAI-compatible APIs)
+   * "field"  – keep as top-level reasoning_content field (native DeepSeek API)
+   * "blocks" – convert to content[].thinking blocks (Anthropic-compatible APIs)
+   */
+  thinkingFormat: "none" | "field" | "blocks";
 }
 
 export interface FeatureFlags {
   unlockContextMenu: boolean;
   blockVisibilityDetection: boolean;
   aggressiveVisibilityBypass: boolean;
+  blockFullscreenRequests: boolean;
   enableFloatingBall: boolean;
 }
 
