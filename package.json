@@ -10,7 +10,7 @@
     "generate-icons": "node scripts/generate-icons.mjs",
     "local-server": "node scripts/neonagent-local-server.mjs",
     "test": "vitest run",
-    "test:ci": "vitest run --reporter=basic --no-file-parallelism --maxWorkers=1 --minWorkers=1 --retry=1",
+    "test:ci": "vitest run --reporter=basic --retry=1",
     "test:watch": "vitest"
   },
   "devDependencies": {
