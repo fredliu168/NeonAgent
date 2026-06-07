@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="NeonAgent icon">
+  <defs>
+    <linearGradient id="bg" x1="18" y1="12" x2="112" y2="118" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="0.55" stop-color="#12343b"/>
+      <stop offset="1" stop-color="#0f766e"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="34" y1="28" x2="96" y2="100" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#a7f3d0"/>
+      <stop offset="0.48" stop-color="#2dd4bf"/>
+      <stop offset="1" stop-color="#38bdf8"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="url(#bg)"/>
+  <path d="M36 91V36l56 56V37" fill="none" stroke="url(#mark)" stroke-width="13" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)"/>
+  <circle cx="36" cy="36" r="8" fill="#ecfeff"/>
+  <circle cx="92" cy="92" r="8" fill="#ecfeff"/>
+  <circle cx="92" cy="37" r="6" fill="#99f6e4"/>
+  <path d="M32 102c16 8 48 10 68-4" fill="none" stroke="#67e8f9" stroke-width="5" stroke-linecap="round" opacity="0.65"/>
+</svg>

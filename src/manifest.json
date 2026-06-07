@@ -1,8 +1,14 @@
 {
   "manifest_version": 3,
-  "name": "NeonAgent",
-  "version": "0.1.1",
+  "name": "NeonAgent v0.1.2",
+  "version": "0.1.2",
   "description": "AI assistant side panel for lawful and authorized learning scenarios.",
+  "icons": {
+    "16": "images/icon-16.png",
+    "32": "images/icon-32.png",
+    "48": "images/icon-48.png",
+    "128": "images/icon-128.png"
+  },
   "permissions": ["storage", "sidePanel", "activeTab", "scripting", "alarms", "offscreen"],
   "host_permissions": ["<all_urls>"],
   "externally_connectable": {
@@ -29,7 +35,13 @@
     }
   ],
   "action": {
-    "default_title": "Open NeonAgent"
+    "default_title": "Open NeonAgent",
+    "default_icon": {
+      "16": "images/icon-16.png",
+      "32": "images/icon-32.png",
+      "48": "images/icon-48.png",
+      "128": "images/icon-128.png"
+    }
   },
   "sandbox": {
     "pages": ["sandbox.html"]

@@ -350,6 +350,10 @@ type TranslationRecord = {
   displayMode?: "below" | "hover";
   onMouseEnter?: () => void;
   onMouseLeave?: () => void;
+  lastRenderedSourceText?: string;
+  lastRenderedTranslatedText?: string;
+  lastRenderedDisplayMode?: TranslationSettings["displayMode"];
+  lastRenderedStyleSignature?: string;
 };
 
 const defaultFeatureFlags: FeatureFlags = {
@@ -409,6 +413,17 @@ function normalizeText(input: string): string {
 
 function uniqueElements(nodes: HTMLElement[]): HTMLElement[] {
   return Array.from(new Set(nodes));
+}
+
+function buildAutoTranslationRenderStyleSignature(settings: TranslationSettings): string {
+  return [
+    settings.displayMode,
+    settings.styleColor,
+    settings.styleBackground,
+    settings.styleFontSize,
+    settings.styleBold ? "bold" : "normal",
+    settings.styleItalic ? "italic" : "normal"
+  ].join("|");
 }
 
 function hasInteractiveOptionNodes(node: HTMLElement): boolean {
@@ -1125,6 +1140,13 @@ function isTranslationHost(node: Element | null): boolean {
   return !!node?.hasAttribute?.(TRANSLATION_HOST_ATTR);
 }
 
+function hasTranslationBlockDescendant(node: HTMLElement): boolean {
+  if (typeof node.querySelector !== "function") {
+    return false;
+  }
+  return node.querySelector(`[${TRANSLATION_HOST_ATTR}]`) !== null;
+}
+
 function isTranslatableElement(node: HTMLElement): boolean {
   const tag = node.tagName.toLowerCase();
   const allowedTags = new Set(["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "figcaption", "td", "th"]);
@@ -1140,13 +1162,30 @@ function isTranslatableElement(node: HTMLElement): boolean {
     return false;
   }
 
+  if (hasTranslationBlockDescendant(node)) {
+    return false;
+  }
+
   const text = normalizeText(node.innerText || node.textContent || "");
   return text.length >= 2;
 }
 
 function collectTranslatableElements(): HTMLElement[] {
-  return Array.from(document.querySelectorAll<HTMLElement>("p, h1, h2, h3, h4, h5, h6, li, blockquote, figcaption, td, th"))
-    .filter((node) => isTranslatableElement(node));
+  const candidates = Array.from(
+    document.querySelectorAll<HTMLElement>("p, h1, h2, h3, h4, h5, h6, li, blockquote, figcaption, td, th")
+  ).filter((node) => isTranslatableElement(node));
+  const candidateSet = new Set(candidates);
+
+  return candidates.filter((node) => {
+    let parent = node.parentElement;
+    while (parent) {
+      if (candidateSet.has(parent as HTMLElement)) {
+        return false;
+      }
+      parent = parent.parentElement;
+    }
+    return true;
+  });
 }
 
 function ensureTranslationId(node: HTMLElement): string {
@@ -1304,6 +1343,26 @@ function ensureTranslationRecord(
   return record;
 }
 
+function markAutoTranslationRendered(record: TranslationRecord): void {
+  record.lastRenderedSourceText = record.sourceText;
+  record.lastRenderedTranslatedText = record.translatedText;
+  record.lastRenderedDisplayMode = translationSettings.displayMode;
+  record.lastRenderedStyleSignature = buildAutoTranslationRenderStyleSignature(translationSettings);
+}
+
+function shouldRerenderAutoTranslation(record: TranslationRecord, sourceText: string): boolean {
+  if (!record.translatedText) {
+    return false;
+  }
+
+  return (
+    record.lastRenderedSourceText !== sourceText ||
+    record.lastRenderedTranslatedText !== record.translatedText ||
+    record.lastRenderedDisplayMode !== translationSettings.displayMode ||
+    record.lastRenderedStyleSignature !== buildAutoTranslationRenderStyleSignature(translationSettings)
+  );
+}
+
 function renderTranslationRecord(record: TranslationRecord): void {
   if (record.overlay) {
     positionTranslationOverlay(record);
@@ -1409,6 +1468,7 @@ function renderAutoTranslationRecord(record: TranslationRecord): void {
     withSuppressedTranslationObserver(() => {
       record.source.textContent = record.translatedText;
     });
+    markAutoTranslationRendered(record);
     return;
   }
 
@@ -1421,6 +1481,7 @@ function renderAutoTranslationRecord(record: TranslationRecord): void {
   });
   const sourceColor = window.getComputedStyle?.(record.source).color;
   record.body.style.color = sourceColor && sourceColor !== "rgba(0, 0, 0, 0)" ? sourceColor : "inherit";
+  markAutoTranslationRendered(record);
 }
 
 function resolvePageElement(selector: string, index: number): { element: HTMLElement } | { error: string } {
@@ -1991,7 +2052,9 @@ async function runTranslationScan(): Promise<void> {
       translationSettings.displayMode === "bilingual"
     );
     if (record.sourceText === text && record.translatedText) {
-      renderAutoTranslationRecord(record);
+      if (shouldRerenderAutoTranslation(record, text)) {
+        renderAutoTranslationRecord(record);
+      }
       continue;
     }
 
@@ -2115,19 +2178,25 @@ function buildPageTranslationSignature(settings: TranslationSettings): string {
   ].join("\n---\n");
 }
 
+function isPageAlreadyTranslated(settings: TranslationSettings): boolean {
+  const signature = buildPageTranslationSignature(settings);
+  if (!signature || translationRecords.size === 0) {
+    return false;
+  }
+
+  return signature === lastPageTranslationSignature || signature === pageTranslationInProgressSignature;
+}
+
 function translateCurrentPageOnce(next: TranslationSettings): { skipped: boolean; count: number } {
   const settings = {
     ...next,
     enabled: true
   };
-  const signature = buildPageTranslationSignature(settings);
-  const hasTranslations = translationRecords.size > 0;
-
-  if (signature && hasTranslations && (signature === lastPageTranslationSignature || signature === pageTranslationInProgressSignature)) {
+  if (isPageAlreadyTranslated(settings)) {
     return { skipped: true, count: translationRecords.size };
   }
 
-  pageTranslationInProgressSignature = signature;
+  pageTranslationInProgressSignature = buildPageTranslationSignature(settings);
   applyTranslationSettings(settings);
   return { skipped: false, count: translationRecords.size };
 }
@@ -3317,6 +3386,24 @@ function createContentMessageHandler(options?: {
         translationEnabled: true
       }));
       sendResponse({ ok: true, data: result });
+      return;
+    }
+
+    if (message.type === "CHECK_CURRENT_PAGE_TRANSLATION_STATUS") {
+      const payload = message.payload as Partial<LLMConfig> | undefined;
+      const settings = translationSettingsFromConfig({
+        ...(payload ?? {}),
+        translationEnabled: true
+      });
+      const signature = buildPageTranslationSignature(settings);
+      sendResponse({
+        ok: true,
+        data: {
+          translated: isPageAlreadyTranslated(settings),
+          count: translationRecords.size,
+          signature
+        }
+      });
       return;
     }
 

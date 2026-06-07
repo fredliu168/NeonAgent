@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>NeonAgent</title>
+    <title>NeonAgent v0.1.2</title>
     <style>
       /* =========== Reset & Base =========== */
       *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -19,27 +19,12 @@
         font-size: 13px;
       }
 
-      /* =========== Header =========== */
-      .app-header {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 10px 14px 0;
-        background: #fff;
-      }
-
-      .app-header h1 {
-        font-size: 15px;
-        font-weight: 700;
-        color: #0f766e;
-      }
-
       .tab-bar {
         display: flex;
         gap: 0;
         border-bottom: 2px solid #e2e8f0;
         background: #fff;
-        padding: 0 14px;
+        padding: 8px 14px 0;
       }
 
       .tab-btn {
@@ -144,6 +129,7 @@
         display: flex;
         flex-direction: column;
         gap: 10px;
+        background: #ffffff;
       }
 
       .msg {
@@ -197,9 +183,20 @@
         color: #64748b;
         min-height: 16px;
         line-height: 16px;
+        background: #ffffff;
       }
 
       .status-bar:empty { display: none; }
+
+      .agent-iter-bar {
+        padding: 6px 12px 0;
+        font-size: 11px;
+        color: #94a3b8;
+        line-height: 1.4;
+        background: #ffffff;
+      }
+
+      .agent-iter-bar:empty { display: none; }
 
       /* Thinking block */
       .thinking-block {
@@ -570,9 +567,9 @@
 
       /* Input area */
       .input-area {
-        padding: 8px 12px 10px;
-        background: #fff;
-        border-top: 1px solid #e2e8f0;
+        padding: 10px 12px 12px;
+        background: #ffffff;
+        border-top: none;
       }
 
       .input-row {
@@ -593,10 +590,146 @@
 
       .input-row input:focus { border-color: #0f766e; }
 
+      .input-row select {
+        width: 160px;
+        padding: 8px 10px;
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        background: #fff;
+        font-size: 12px;
+        color: #334155;
+        outline: none;
+        flex-shrink: 0;
+      }
+
+      .input-row select:focus { border-color: #0f766e; }
+
       .action-row {
         display: flex;
         gap: 6px;
         flex-wrap: wrap;
+      }
+
+      .chat-composer {
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-radius: 28px;
+        padding: 18px 18px 14px;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,.25);
+      }
+
+      .chat-composer-input {
+        display: block;
+        width: 100%;
+        min-height: 24px;
+        resize: none;
+        border: none;
+        outline: none;
+        appearance: none;
+        background: transparent;
+        color: #1f2937;
+        font-size: 12px;
+        line-height: 1.5;
+        font-family: inherit;
+      }
+
+      .chat-composer-input::placeholder {
+        color: #6b7280;
+        font-size: 12px;
+      }
+
+      .chat-composer-footer {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin-top: 14px;
+      }
+
+      .chat-composer-left,
+      .chat-composer-right {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .chat-composer .btn-accent {
+        background: transparent;
+        color: #d4d4d4;
+        border: none;
+        padding: 7px 12px;
+        font-weight: 500;
+        box-shadow: none;
+      }
+
+      .chat-composer .btn-accent:hover {
+        background: #353535;
+      }
+
+      .chat-composer-model {
+        min-width: 92px;
+        max-width: 112px;
+        border: none;
+        border-radius: 999px;
+        background: #ffffff;
+        color: #1f2937;
+        padding: 7px 10px 7px 12px;
+        font-size: 12px;
+        outline: none;
+        box-shadow: none;
+        text-align: right;
+        text-align-last: right;
+      }
+
+      .chat-composer-model:focus {
+        outline: none;
+        box-shadow: none;
+      }
+
+      .chat-composer .btn-secondary {
+        border: none;
+        background: transparent;
+        color: #64748b;
+        box-shadow: none;
+      }
+
+      .chat-composer .btn-secondary:hover {
+        background: #f3f4f6;
+      }
+
+      .tool-icon-btn {
+        filter: grayscale(1);
+        opacity: .68;
+        transition: filter .15s, opacity .15s, background .15s;
+      }
+
+      .tool-icon-btn:hover,
+      .tool-icon-btn.active {
+        filter: none;
+        opacity: 1;
+      }
+
+      .tool-icon-btn.active {
+        background: #eef2ff;
+      }
+
+      .chat-send-btn {
+        width: 32px;
+        height: 32px;
+        min-width: 32px;
+        min-height: 32px;
+        border-radius: 9999px !important;
+        padding: 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        background: #d9d9d9;
+        color: #1f2937;
+        font-size: 16px;
+      }
+
+      .chat-send-btn:hover {
+        background: #efefef;
       }
 
       /* =========== Buttons =========== */
@@ -650,6 +783,60 @@
         padding: 12px;
       }
 
+      .settings-subtab-bar {
+        display: flex;
+        gap: 4px;
+        padding: 10px 12px;
+        background: #fff;
+        border-bottom: 1px solid #e2e8f0;
+        align-items: center;
+      }
+
+      .settings-subtab-btn {
+        padding: 8px 14px;
+        border: 0;
+        border-radius: 10px 10px 0 0;
+        background: transparent;
+        color: #64748b;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: color .15s, background .15s, box-shadow .15s;
+        position: relative;
+      }
+
+      .settings-subtab-btn:hover {
+        color: #0f766e;
+        background: #f8fafc;
+      }
+
+      .settings-subtab-btn.active {
+        background: #ffffff;
+        color: #0f766e;
+        box-shadow: 0 -1px 0 #e2e8f0, 1px 0 0 #e2e8f0, -1px 0 0 #e2e8f0;
+      }
+
+      .settings-subtab-btn.active::after {
+        content: "";
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: -10px;
+        height: 10px;
+        background: #ffffff;
+      }
+
+      .settings-subtab-panel {
+        display: none;
+        flex: 1;
+        min-height: 0;
+        overflow: hidden;
+      }
+
+      .settings-subtab-panel.active {
+        display: flex;
+      }
+
       .card {
         background: #fff;
         border-radius: 10px;
@@ -688,6 +875,364 @@
       }
 
       .card input:focus { border-color: #0f766e; }
+
+      .api-key-row {
+        position: relative;
+        margin-bottom: 8px;
+      }
+
+      .api-key-row input {
+        width: 100%;
+        padding-right: 40px;
+        margin-bottom: 0;
+      }
+
+      .api-key-toggle-btn {
+        position: absolute;
+        right: 8px;
+        top: 50%;
+        transform: translateY(-50%);
+        width: 24px;
+        height: 24px;
+        min-width: 24px;
+        border: none;
+        border-radius: 999px;
+        background: transparent;
+        color: #64748b;
+        font-size: 14px;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        transition: color .15s, opacity .15s, transform .15s;
+        padding: 0;
+        line-height: 1;
+      }
+
+      .api-key-toggle-btn:hover {
+        color: #0f766e;
+      }
+
+      .api-key-toggle-btn.active {
+        color: #0f766e;
+      }
+
+      .api-provider-tabs {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-bottom: 8px;
+      }
+
+      .api-config-subtab-bar {
+        display: flex;
+        gap: 6px;
+        margin-bottom: 10px;
+      }
+
+      .api-config-subtab-btn {
+        height: 30px;
+        padding: 0 12px;
+        border: 1px solid #dbe2ea;
+        border-radius: 999px;
+        background: #f8fafc;
+        color: #475569;
+        font-size: 12px;
+        cursor: pointer;
+        transition: background .15s, border-color .15s, color .15s;
+      }
+
+      .api-config-subtab-btn.active {
+        background: #0f766e;
+        border-color: #0f766e;
+        color: #fff;
+      }
+
+      .api-config-subtab-btn:hover {
+        border-color: #0f766e;
+        color: #0f766e;
+        background: #ecfeff;
+      }
+
+      .api-config-subtab-btn.push-right {
+        margin-left: auto;
+      }
+
+      .api-config-subtab-panel {
+        display: none;
+      }
+
+      .api-config-subtab-panel.active {
+        display: block;
+      }
+
+      .api-provider-list {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .api-provider-list-empty {
+        padding: 10px 12px;
+        border: 1px dashed #cbd5e1;
+        border-radius: 10px;
+        background: #f8fafc;
+        color: #64748b;
+        font-size: 11px;
+        line-height: 1.5;
+      }
+
+      .api-provider-list-status {
+        margin: 0 0 8px;
+        padding: 8px 10px;
+        border-radius: 10px;
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        font-size: 11px;
+        line-height: 1.5;
+        color: #64748b;
+      }
+
+      .api-provider-list-status:empty {
+        display: none;
+      }
+
+      .api-provider-list-item {
+        border: 1px solid #e2e8f0;
+        border-radius: 12px;
+        padding: 12px 14px;
+        background: #f8fafc;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        transition: border-color .15s, background .15s, box-shadow .15s;
+      }
+
+      .api-provider-list-item.is-active {
+        border-color: #86efac;
+        background: linear-gradient(180deg, #f0fdf4 0%, #f8fafc 100%);
+        box-shadow: 0 1px 3px rgba(22, 101, 52, .08);
+      }
+
+      .api-provider-list-item.is-editing {
+        border-color: #0f766e;
+        box-shadow: 0 0 0 1px rgba(15, 118, 110, .08), 0 2px 8px rgba(15, 118, 110, .08);
+      }
+
+      .api-provider-list-item-header {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 0;
+      }
+
+      .api-provider-list-item-title {
+        font-size: 13px;
+        font-weight: 700;
+        color: #334155;
+        line-height: 1.35;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 100%;
+      }
+
+      .api-provider-list-item-meta {
+        font-size: 11px;
+        color: #64748b;
+        line-height: 1.5;
+        word-break: break-all;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+
+      .api-provider-list-item-meta strong {
+        color: #334155;
+        font-weight: 600;
+      }
+
+      .api-provider-list-item-actions {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        justify-content: flex-start;
+        margin-top: 2px;
+      }
+
+      .api-provider-list-item-editor {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        padding: 10px 12px;
+        border: 1px solid #dbe2ea;
+        border-radius: 10px;
+        background: #ffffff;
+      }
+
+      .api-provider-inline-field {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+
+      .api-provider-inline-field-label {
+        font-size: 11px;
+        color: #475569;
+        font-weight: 600;
+      }
+
+      .api-provider-inline-field input,
+      .api-provider-inline-field textarea {
+        width: 100%;
+        border: 1px solid #dbe2ea;
+        border-radius: 8px;
+        padding: 7px 9px;
+        font-size: 12px;
+        line-height: 1.4;
+        color: #1f2937;
+        background: #fff;
+        outline: none;
+      }
+
+      .api-provider-inline-field input:focus,
+      .api-provider-inline-field textarea:focus {
+        border-color: #0f766e;
+        box-shadow: 0 0 0 2px rgba(15, 118, 110, .08);
+      }
+
+      .api-provider-inline-field textarea {
+        min-height: 78px;
+        resize: vertical;
+      }
+
+      .api-provider-inline-field-hint {
+        font-size: 10px;
+        color: #64748b;
+        line-height: 1.4;
+      }
+
+      .api-provider-list-item-editor-actions {
+        display: flex;
+        gap: 6px;
+        justify-content: flex-end;
+        flex-wrap: wrap;
+      }
+
+      .api-provider-list-item-editor-actions .api-provider-action-btn {
+        padding: 5px 10px;
+      }
+
+      .api-provider-list-item-editor-actions .api-provider-action-btn.is-save {
+        border-color: #14b8a6;
+        background: #0f766e;
+        color: #ffffff;
+      }
+
+      .api-provider-list-item-editor-actions .api-provider-action-btn.is-save:hover {
+        background: #115e59;
+        border-color: #115e59;
+      }
+
+      .api-provider-list-item-editor-actions .api-provider-action-btn.is-cancel {
+        border-color: #dbe2ea;
+        background: #fff;
+        color: #475569;
+      }
+
+      .api-provider-list-item-editor-actions .api-provider-action-btn.is-cancel:hover {
+        background: #f8fafc;
+        border-color: #94a3b8;
+      }
+
+      .api-provider-action-btn {
+        border: 1px solid #dbe2ea;
+        border-radius: 8px;
+        padding: 4px 8px;
+        background: #fff;
+        color: #475569;
+        font-size: 11px;
+        line-height: 1.2;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        transition: all .15s;
+        white-space: nowrap;
+      }
+
+      .api-provider-action-btn:hover { border-color: #94a3b8; background: #f8fafc; }
+      .api-provider-action-btn:disabled { opacity: .5; cursor: not-allowed; }
+
+      .api-provider-action-btn--enable {
+        border-color: #86efac;
+        background: #f0fdf4;
+        color: #166534;
+      }
+
+      .api-provider-action-btn--enable:hover { border-color: #4ade80; background: #dcfce7; }
+
+      .api-provider-action-btn--edit {
+        border-color: #dbe2ea;
+        background: #fff;
+      }
+
+      .api-provider-action-btn--test {
+        border-color: #bfdbfe;
+        background: #eff6ff;
+        color: #1d4ed8;
+      }
+
+      .api-provider-action-btn--test:hover { border-color: #60a5fa; background: #dbeafe; }
+
+      .api-provider-action-btn--delete {
+        border-color: #fecaca;
+        background: #fef2f2;
+        color: #b91c1c;
+      }
+
+      .api-provider-action-btn--delete:hover { border-color: #fca5a5; background: #fee2e2; }
+
+      .api-provider-tab,
+      .api-provider-add-btn {
+        height: 30px;
+        padding: 0 12px;
+        border: 1px solid #dbe2ea;
+        border-radius: 999px;
+        background: #f8fafc;
+        color: #475569;
+        font-size: 12px;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        transition: background .15s, border-color .15s, color .15s, transform .15s;
+      }
+
+      .api-provider-tab:hover,
+      .api-provider-add-btn:hover {
+        border-color: #0f766e;
+        color: #0f766e;
+        background: #ecfeff;
+      }
+
+      .api-provider-tab.active {
+        background: #0f766e;
+        border-color: #0f766e;
+        color: #fff;
+      }
+
+      .api-provider-add-btn {
+        width: 30px;
+        min-width: 30px;
+        font-size: 16px;
+        line-height: 1;
+      }
+
+      .api-base-url-input[readonly] {
+        background: #f8fafc;
+        color: #475569;
+      }
 
       .switch-group {
         margin-top: 4px;
@@ -732,10 +1277,14 @@
       }
 
       #context {
+        width: 100%;
+        height: 100%;
+        flex: 1;
         white-space: pre-wrap;
         font-size: 11px;
         line-height: 1.5;
-        max-height: 200px;
+        min-height: 0;
+        max-height: none;
         overflow: auto;
         color: #475569;
         background: #f8fafc;
@@ -746,6 +1295,40 @@
       #context:empty::after {
         content: "尚未加载页面上下文";
         color: #94a3b8;
+      }
+
+      #chatContext {
+        flex: 1;
+        white-space: pre-wrap;
+        font-size: 11px;
+        line-height: 1.5;
+        min-height: 0;
+        max-height: none;
+        overflow: auto;
+        color: #475569;
+        background: #f8fafc;
+        border-radius: 6px;
+        padding: 8px;
+      }
+
+      #chatContext:empty::after {
+        content: "点击“读取页面”后，这里会显示当前页面内容";
+        color: #94a3b8;
+      }
+
+      .page-scroll {
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        padding: 12px;
+      }
+
+      .page-panel {
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+        margin: 0;
       }
 
       .about-link {
@@ -785,16 +1368,12 @@
     </style>
   </head>
   <body>
-    <!-- Header & Tabs -->
-    <header class="app-header">
-      <h1>NeonAgent</h1>
-    </header>
+    <!-- Tabs -->
     <nav class="tab-bar">
       <button class="tab-btn active" data-tab="tabChat">对话</button>
       <button class="tab-btn" data-tab="tabAgent">智能体</button>
       <button class="tab-btn" data-tab="tabTranslate">翻译</button>
       <button class="tab-btn" data-tab="tabSettings">设置</button>
-      <button class="tab-btn" data-tab="tabAbout">关于</button>
     </nav>
 
     <div id="injectionNotice" hidden></div>
@@ -820,14 +1399,17 @@
 
       <!-- Input area -->
       <div class="input-area">
-        <div class="input-row">
-          <input id="chatInput" type="text" placeholder="输入消息..." />
-          <button id="sendChat" class="btn-primary" title="发送">&#10148;</button>
-          <button id="stopChat" class="btn-secondary" title="停止">&#9632;</button>
-        </div>
-        <div class="action-row">
-          <button id="askAndAutoFill" class="btn-accent">一键解题</button>
-          <button id="loadContext" class="btn-secondary">读取页面</button>
+        <div class="chat-composer">
+          <textarea id="chatInput" class="chat-composer-input" placeholder="输入消息..." rows="1"></textarea>
+          <div class="chat-composer-footer">
+            <div class="chat-composer-left">
+              <button id="askAndAutoFill" class="btn-accent">解题</button>
+            </div>
+            <div class="chat-composer-right">
+              <select id="chatModel" class="chat-composer-model" title="选择对话模型"></select>
+              <button id="chatAction" class="btn-primary chat-send-btn" title="发送">↑</button>
+            </div>
+          </div>
         </div>
       </div>
     </main>
@@ -843,20 +1425,23 @@
           <button id="clearAgentSessions" title="清空全部">&empty;</button>
         </div>
       </div>
+      <div id="agentIterInfo" class="agent-iter-bar"></div>
       <div id="agentMessages" class="message-flow"></div>
       <div id="agentStatus" class="status-bar"></div>
       <div class="input-area">
-        <div class="input-row">
-          <input id="agentInput" type="text" placeholder="告诉智能体你想做什么..." />
-          <button id="sendAgent" class="btn-primary" title="发送">&#10148;</button>
-          <button id="stopAgent" class="btn-secondary" title="停止">&#9632;</button>
-        </div>
-        <div class="action-row">
-          <button id="clearAgent" class="btn-secondary">清空记录</button>
-          <button id="toggleMemories" class="btn-secondary">🧠 记忆</button>
-          <button id="toggleSkills" class="btn-secondary">📦 技能库</button>
-          <button id="toggleTasks" class="btn-secondary">⏰ 定时任务</button>
-          <span id="agentIterInfo" style="font-size:11px;color:#94a3b8;line-height:28px;"></span>
+        <div class="chat-composer">
+          <textarea id="agentInput" class="chat-composer-input" placeholder="告诉智能体你想做什么..." rows="1"></textarea>
+          <div class="chat-composer-footer">
+            <div class="chat-composer-left">
+              <button id="toggleMemories" class="btn-secondary tool-icon-btn" title="记忆" aria-label="记忆">🧠</button>
+              <button id="toggleSkills" class="btn-secondary tool-icon-btn" title="技能" aria-label="技能">🧩</button>
+              <button id="toggleTasks" class="btn-secondary tool-icon-btn" title="定时" aria-label="定时">⏰</button>
+            </div>
+            <div class="chat-composer-right">
+              <select id="agentModel" class="chat-composer-model" title="选择智能体模型"></select>
+              <button id="agentAction" class="btn-primary chat-send-btn" title="发送">↑</button>
+            </div>
+          </div>
         </div>
         <div id="memoriesPanel" class="skills-panel" hidden>
           <div class="skills-header">
@@ -895,15 +1480,31 @@
 
     <!-- ===== Settings Tab ===== -->
     <main id="tabSettings" class="tab-content">
+      <div class="settings-subtab-bar">
+        <button class="settings-subtab-btn active" data-settings-tab="settingsConfigPanel">配置</button>
+        <button class="settings-subtab-btn" data-settings-tab="settingsPagePanel">页面</button>
+        <button class="settings-subtab-btn" data-settings-tab="settingsAboutPanel">关于</button>
+      </div>
+      <section id="settingsConfigPanel" class="settings-subtab-panel active">
       <div class="settings-scroll">
         <section class="card">
           <h2>API 配置</h2>
+          <div class="api-config-subtab-bar">
+            <button id="apiConfigListTabBtn" class="api-config-subtab-btn" type="button" data-api-config-tab="apiConfigListPanel">配置列表</button>
+            <button id="apiConfigEditTabBtn" class="api-config-subtab-btn push-right active" type="button" data-api-config-tab="apiConfigEditPanel" title="当前配置">+</button>
+          </div>
+          <section id="apiConfigEditPanel" class="api-config-subtab-panel active">
+          <div id="apiProviderTabs" class="api-provider-tabs"></div>
+          <div class="setting-hint" style="margin: -2px 0 8px;">这里是新增入口。选择预设或自定义后填写参数，保存成功后会出现在“配置列表”。</div>
           <label for="baseUrl">Base URL</label>
-          <input id="baseUrl" type="text" placeholder="https://api.openai.com" />
+          <input id="baseUrl" class="api-base-url-input" type="text" placeholder="选择供应商或输入自定义地址" />
           <p style="font-size:11px;color:#6b7280;margin:2px 0 0;">只需填写域名或 IP，无需添加 /v1/chat/completions</p>
 
           <label for="apiKey">API Key</label>
-          <input id="apiKey" type="password" placeholder="sk-***" />
+          <div class="api-key-row">
+            <input id="apiKey" type="password" placeholder="sk-***" />
+            <button id="toggleApiKeyVisibility" type="button" class="api-key-toggle-btn" title="显示 API Key" aria-label="显示 API Key">👁</button>
+          </div>
 
           <label for="model">Model</label>
           <select id="model" style="width:100%;padding:6px 8px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;background:#fff;"></select>
@@ -933,6 +1534,12 @@
             <input id="configImportFile" type="file" accept=".json" hidden />
           </div>
           <div id="status"></div>
+          </section>
+          <section id="apiConfigListPanel" class="api-config-subtab-panel">
+            <div class="setting-hint" style="margin: 0 0 8px;">这里只显示已经保存成功的大模型供应商配置。</div>
+            <div id="apiProviderListStatus" class="api-provider-list-status"></div>
+            <div id="apiProviderList" class="api-provider-list"></div>
+          </section>
         </section>
 
         <section class="card">
@@ -979,11 +1586,85 @@
           </div>
         </section>
 
-        <section class="card">
-          <h2>页面上下文</h2>
-          <pre id="context"></pre>
-        </section>
       </div>
+      </section>
+      <section id="settingsPagePanel" class="settings-subtab-panel">
+        <div class="settings-scroll">
+          <section class="card page-panel">
+            <h2>页面</h2>
+            <div class="action-row" style="margin-bottom: 10px;">
+              <button id="loadContext" class="btn-secondary">读取页面</button>
+            </div>
+            <pre id="context"></pre>
+          </section>
+        </div>
+      </section>
+      <section id="settingsAboutPanel" class="settings-subtab-panel">
+        <div class="settings-scroll">
+          <section class="card">
+            <h2>NeonAgent</h2>
+            <p style="font-size:12px;color:#475569;line-height:1.6;margin-bottom:8px;">
+              一款支持网页交互和大模型能力的浏览器智能体插件。
+            </p>
+            <p class="about-link">
+              GitHub：
+              <a href="https://github.com/fredliu168/NeonAgent" target="_blank" rel="noopener noreferrer">
+                https://github.com/fredliu168/NeonAgent
+              </a>
+            </p>
+            <div class="about-qrcode">
+              <img src="../images/qrcode.jpg" alt="NeonAgent 二维码" />
+              <span>扫码了解更多</span>
+            </div>
+          </section>
+
+          <section class="card">
+            <h2>🧠 核心能力</h2>
+            <div style="font-size:12px;color:#475569;line-height:1.8;">
+              <p><b>浏览器智能体</b> — 基于 Agent Loop 架构，智能体可自主决策并调用 24 个内置工具与网页交互，包括页面读取、元素点击、表单填写、脚本执行、导航等。</p>
+              <p><b>智能对话</b> — 支持 OpenAI 兼容的多种大模型接入，Markdown 渲染、实时流式输出，多会话管理与历史持久化。</p>
+              <p><b>自动答题</b> — 一键解题模式，AI 自动识别页面题目并填充答案。</p>
+            </div>
+          </section>
+
+          <section class="card">
+            <h2>💡 记忆系统</h2>
+            <div style="font-size:12px;color:#475569;line-height:1.8;">
+              <p>智能体可主动保存用户偏好、操作经验等信息，跨会话持久可用。</p>
+              <p>当记忆超过 50 条时自动调用 LLM 智能压缩合并，减少 token 占用。</p>
+              <p>支持 Markdown 格式导入/导出，方便备份和迁移。</p>
+            </div>
+          </section>
+
+          <section class="card">
+            <h2>📦 技能系统</h2>
+            <div style="font-size:12px;color:#475569;line-height:1.8;">
+              <p>将多步骤操作保存为可复用技能，支持一键执行、版本自动递增、使用统计。</p>
+              <p>支持 Markdown 格式编辑、导入/导出，方便团队共享和迁移。</p>
+            </div>
+          </section>
+
+          <section class="card">
+            <h2>⏰ 定时任务</h2>
+            <div style="font-size:12px;color:#475569;line-height:1.8;">
+              <p>支持创建单次、间隔、每日、每周四种调度类型的定时任务。</p>
+              <p>任务触发时自动启动智能体执行预设指令，适用于签到、定期检查等场景。</p>
+            </div>
+          </section>
+
+          <section class="card">
+            <h2>🛡️ 环境破解</h2>
+            <div style="font-size:12px;color:#475569;line-height:1.8;">
+              <p>解除右键限制、页面文字选择限制、切屏检测绕过、插件检测对抗。</p>
+            </div>
+          </section>
+
+          <section class="card" style="text-align:center;color:#94a3b8;font-size:11px;">
+            <p>NeonAgent v0.1.2</p>
+            <p style="margin-top:4px;">本工具仅供学习研究使用，严禁用于违反考试规则或非法用途。</p>
+          </section>
+        </div>
+      </section>
     </main>
 
     <!-- ===== Translation Tab ===== -->
@@ -1049,74 +1730,6 @@
       </div>
     </main>
 
-    <!-- ===== About Tab ===== -->
-    <main id="tabAbout" class="tab-content">
-      <div class="settings-scroll">
-        <section class="card">
-          <h2>NeonAgent</h2>
-          <p style="font-size:12px;color:#475569;line-height:1.6;margin-bottom:8px;">
-            NeonAgent 是一款集成大语言模型能力的 Chrome 浏览器智能体插件，旨在通过 AI 能力和网页交互技术，为用户提供强大的自动化辅助工具。
-          </p>
-          <p class="about-link">
-            开源地址：
-            <a href="https://github.com/fredliu168/NeonAgent" target="_blank" rel="noopener noreferrer">
-              https://github.com/fredliu168/NeonAgent
-            </a>
-          </p>
-          <div class="about-qrcode">
-            <img src="../images/qrcode.jpg" alt="NeonAgent 二维码" />
-            <span>扫码查看项目或联系方式</span>
-          </div>
-        </section>
-
-        <section class="card">
-          <h2>🧠 核心能力</h2>
-          <div style="font-size:12px;color:#475569;line-height:1.8;">
-            <p><b>浏览器智能体</b> — 基于 Agent Loop 架构，智能体可自主决策并调用 24 个内置工具与网页交互，包括页面读取、元素点击、表单填写、脚本执行、导航等。</p>
-            <p><b>智能对话</b> — 支持 OpenAI 兼容的多种大模型接入，Markdown 渲染、实时流式输出，多会话管理与历史持久化。</p>
-            <p><b>自动答题</b> — 一键解题模式，AI 自动识别页面题目并填充答案。</p>
-          </div>
-        </section>
-
-        <section class="card">
-          <h2>💡 记忆系统</h2>
-          <div style="font-size:12px;color:#475569;line-height:1.8;">
-            <p>智能体可主动保存用户偏好、操作经验等信息，跨会话持久可用。</p>
-            <p>当记忆超过 50 条时自动调用 LLM 智能压缩合并，减少 token 占用。</p>
-            <p>支持 Markdown 格式导入/导出，方便备份和迁移。</p>
-          </div>
-        </section>
-
-        <section class="card">
-          <h2>📦 技能系统</h2>
-          <div style="font-size:12px;color:#475569;line-height:1.8;">
-            <p>将多步骤操作保存为可复用技能，支持一键执行、版本自动递增、使用统计。</p>
-            <p>支持 Markdown 格式编辑、导入/导出，方便团队共享和迁移。</p>
-          </div>
-        </section>
-
-        <section class="card">
-          <h2>⏰ 定时任务</h2>
-          <div style="font-size:12px;color:#475569;line-height:1.8;">
-            <p>支持创建单次、间隔、每日、每周四种调度类型的定时任务。</p>
-            <p>任务触发时自动启动智能体执行预设指令，适用于签到、定期检查等场景。</p>
-          </div>
-        </section>
-
-        <section class="card">
-          <h2>🛡️ 环境破解</h2>
-          <div style="font-size:12px;color:#475569;line-height:1.8;">
-            <p>解除右键限制、页面文字选择限制、切屏检测绕过、插件检测对抗。</p>
-          </div>
-        </section>
-
-        <section class="card" style="text-align:center;color:#94a3b8;font-size:11px;">
-          <p>NeonAgent v0.1.0</p>
-          <p style="margin-top:4px;">本工具仅供学习研究使用，严禁用于违反考试规则或非法用途。</p>
-        </section>
-      </div>
-    </main>
-
-    <script type="module" src="index.js"></script>
+    <script type="module" src="../../dist/sidepanel/index.js"></script>
   </body>
 </html>

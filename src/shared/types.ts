@@ -1,3 +1,13 @@
+export interface ApiProvider {
+  id: string;
+  name: string;
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  models: string[];
+  builtIn?: boolean;
+}
+
 export interface LLMConfig {
   baseUrl: string;
   apiKey: string;
@@ -28,6 +38,8 @@ export interface LLMConfig {
   localCommandEnabled: boolean;
   localCommandWsUrl: string;
   localCommandToken: string;
+  apiProviders?: ApiProvider[];
+  activeApiProviderId?: string;
   /** How to pass thinking/reasoning back to the API on subsequent turns.
    * "none"   – strip reasoning_content (standard OpenAI-compatible APIs)
    * "field"  – keep as top-level reasoning_content field (native DeepSeek API)

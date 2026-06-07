@@ -1,4 +1,11 @@
-import { DEFAULT_CONFIG, migrateConfig, normalizeBaseUrl, validateConfig } from "../shared/config.js";
+import {
+  CUSTOM_API_PROVIDER_ID,
+  DEFAULT_CONFIG,
+  createDefaultApiProviders,
+  migrateConfig,
+  normalizeBaseUrl,
+  validateConfig
+} from "../shared/config.js";
 import {
   createLLMStreamCancelMessage,
   createLLMStreamRequestMessage
@@ -18,6 +25,7 @@ import {
   formatInjectionDiagnosisNotice,
   sendMessageToTabWithEnsureDiagnosis
 } from "./tabMessaging.js";
+import type { ApiProvider } from "../shared/types.js";
 
 function byId<T extends HTMLElement>(id: string): T {
   const el = document.getElementById(id);
@@ -30,6 +38,7 @@ function byId<T extends HTMLElement>(id: string): T {
 const baseUrlInput = byId<HTMLInputElement>("baseUrl");
 const thinkingFormatInput = byId<HTMLSelectElement>("thinkingFormat");
 const apiKeyInput = byId<HTMLInputElement>("apiKey");
+const apiKeyVisibilityBtn = byId<HTMLButtonElement>("toggleApiKeyVisibility");
 const modelInput = byId<HTMLSelectElement>("model");
 const newModelInput = byId<HTMLInputElement>("newModel");
 const addModelBtn = byId<HTMLButtonElement>("addModel");
@@ -56,21 +65,37 @@ const localCommandWsUrlInput = byId<HTMLInputElement>("localCommandWsUrl");
 const localCommandTokenInput = byId<HTMLInputElement>("localCommandToken");
 const localCommandStatusEl = byId<HTMLSpanElement>("localCommandStatus");
 const refreshLocalCommandStatusBtn = byId<HTMLButtonElement>("refreshLocalCommandStatus");
+const apiProviderTabsEl = byId<HTMLDivElement>("apiProviderTabs");
+const apiConfigEditTabBtn = byId<HTMLButtonElement>("apiConfigEditTabBtn");
+const apiConfigListTabBtn = byId<HTMLButtonElement>("apiConfigListTabBtn");
+const apiConfigEditPanelEl = byId<HTMLElement>("apiConfigEditPanel");
+const apiConfigListPanelEl = byId<HTMLElement>("apiConfigListPanel");
+const apiProviderListEl = byId<HTMLDivElement>("apiProviderList");
+const apiProviderListStatusEl = byId<HTMLDivElement>("apiProviderListStatus");
 const statusEl = byId<HTMLDivElement>("status");
 const translationStatusEl = byId<HTMLDivElement>("translationStatus");
 const injectionNoticeEl = byId<HTMLDivElement>("injectionNotice");
 const contextEl = byId<HTMLPreElement>("context");
-const chatInput = byId<HTMLInputElement>("chatInput");
+const chatModelInput = byId<HTMLSelectElement>("chatModel");
+const chatInput = byId<HTMLTextAreaElement>("chatInput");
+const chatActionBtn = byId<HTMLButtonElement>("chatAction");
 const chatStatusEl = byId<HTMLDivElement>("chatStatus");
 const chatMessagesEl = byId<HTMLDivElement>("chatMessages");
 const examStatusEl = byId<HTMLDivElement>("examStatus");
 const chatSessionsEl = byId<HTMLDivElement>("chatSessions");
 const askAndAutoFillBtn = byId<HTMLButtonElement>("askAndAutoFill");
+const settingsSubtabButtons = Array.from(document.querySelectorAll<HTMLButtonElement>(".settings-subtab-btn"));
+const settingsSubtabPanels = Array.from(document.querySelectorAll<HTMLElement>(".settings-subtab-panel"));
 
 // ── Agent DOM elements ──
 const agentMessagesEl = byId<HTMLDivElement>("agentMessages");
 const agentStatusEl = byId<HTMLDivElement>("agentStatus");
-const agentInput = byId<HTMLInputElement>("agentInput");
+const agentInput = byId<HTMLTextAreaElement>("agentInput");
+const agentModelInput = byId<HTMLSelectElement>("agentModel");
+const agentActionBtn = byId<HTMLButtonElement>("agentAction");
+const toggleMemoriesBtn = byId<HTMLButtonElement>("toggleMemories");
+const toggleSkillsBtn = byId<HTMLButtonElement>("toggleSkills");
+const toggleTasksBtn = byId<HTMLButtonElement>("toggleTasks");
 const agentIterInfoEl = byId<HTMLSpanElement>("agentIterInfo");
 const agentSessionsEl = byId<HTMLDivElement>("agentSessions");
 const skillsPanelEl = byId<HTMLDivElement>("skillsPanel");
@@ -89,6 +114,865 @@ let chatSessions: ChatSession[] = [];
 let activeSessionId: string | null = null;
 let latestExamQuestions: ExamQuestion[] = [];
 let currentModels: string[] = [DEFAULT_CONFIG.model];
+let activeSettingsSubtabId = "settingsConfigPanel";
+let activeApiConfigSubtabId = "apiConfigListPanel";
+let apiKeyVisible = false;
+let apiProviders: ApiProvider[] = createDefaultApiProviders();
+let activeApiProviderId = CUSTOM_API_PROVIDER_ID;
+let formApiProviderId = CUSTOM_API_PROVIDER_ID;
+interface ApiProviderInlineDraft {
+  name: string;
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  modelsText: string;
+}
+
+let activeApiProviderInlineEditId: string | null = null;
+let activeApiProviderInlineDraft: ApiProviderInlineDraft | null = null;
+const CONFIGURED_API_PROVIDER_ID_PREFIX = "configured:";
+
+function sanitizeApiProviderForUi(provider: ApiProvider, fallbackId: string): ApiProvider {
+  const sanitizeModel = (value: string): string => value.replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, "");
+  const rawId = typeof provider.id === "string" ? provider.id : "";
+  const rawName = typeof provider.name === "string" ? provider.name : "";
+  const rawBaseUrl = typeof provider.baseUrl === "string" ? provider.baseUrl : "";
+  const rawApiKey = typeof provider.apiKey === "string" ? provider.apiKey : "";
+  const rawModel = typeof provider.model === "string" ? provider.model : "";
+  const fallbackModel = sanitizeModel(rawModel) || DEFAULT_CONFIG.model;
+  const models = Array.isArray(provider.models) && provider.models.length > 0
+    ? provider.models
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => sanitizeModel(item))
+      .filter(Boolean)
+    : [fallbackModel];
+  const normalizedModels = models.includes(fallbackModel) ? models : [fallbackModel, ...models];
+
+  return {
+    id: rawId.trim() || fallbackId,
+    name: rawName.trim() || rawId.trim() || "自定义",
+    baseUrl: rawBaseUrl.trim(),
+    apiKey: rawApiKey,
+    model: fallbackModel,
+    models: normalizedModels,
+    builtIn: provider.builtIn === true
+  };
+}
+
+function cloneApiProviders(providers: ApiProvider[]): ApiProvider[] {
+  return providers.map((provider) => ({
+    ...provider,
+    models: [...provider.models]
+  }));
+}
+
+function isApiProviderTemplate(provider: ApiProvider): boolean {
+  return provider.builtIn === true || provider.id === CUSTOM_API_PROVIDER_ID;
+}
+
+function toConfiguredApiProviderId(providerId: string): string {
+  return `${CONFIGURED_API_PROVIDER_ID_PREFIX}${providerId}`;
+}
+
+function createConfiguredApiProvider(template: ApiProvider): ApiProvider {
+  return {
+    ...template,
+    id: toConfiguredApiProviderId(template.id),
+    builtIn: false,
+    models: [...template.models]
+  };
+}
+
+function hasMaterializableTemplateData(provider: ApiProvider): boolean {
+  if (provider.builtIn === true) {
+    return Boolean(provider.apiKey.trim());
+  }
+
+  return Boolean(
+    provider.baseUrl.trim() ||
+    provider.apiKey.trim() ||
+    provider.model.trim() !== DEFAULT_CONFIG.model ||
+    provider.models.some((model) => model.trim() !== DEFAULT_CONFIG.model)
+  );
+}
+
+function upsertConfiguredApiProvider(template: ApiProvider): ApiProvider {
+  const configuredProvider = createConfiguredApiProvider(template);
+  const existingIndex = apiProviders.findIndex((provider) => provider.id === configuredProvider.id);
+
+  if (existingIndex >= 0) {
+    apiProviders = apiProviders.map((provider, index) => (
+      index === existingIndex
+        ? configuredProvider
+        : provider
+    ));
+  } else {
+    apiProviders = [...apiProviders, configuredProvider];
+  }
+
+  return configuredProvider;
+}
+
+function materializeTemplateProvider(selectedProvider: ApiProvider | undefined): ApiProvider | undefined {
+  if (!selectedProvider || !isApiProviderTemplate(selectedProvider) || !hasMaterializableTemplateData(selectedProvider)) {
+    return undefined;
+  }
+
+  return upsertConfiguredApiProvider(selectedProvider);
+}
+
+function createCleanApiProviderTemplates(): ApiProvider[] {
+  return createDefaultApiProviders().map((provider, index) =>
+    sanitizeApiProviderForUi(provider, `template-${index + 1}`)
+  );
+}
+
+function normalizeLoadedApiProvidersForUi(loadedProviders: ApiProvider[]): ApiProvider[] {
+  const configuredProviders = new Map<string, ApiProvider>();
+
+  for (const provider of loadedProviders) {
+    const configuredProvider = isApiProviderTemplate(provider)
+      ? (hasMaterializableTemplateData(provider) ? createConfiguredApiProvider(provider) : undefined)
+      : provider;
+
+    if (configuredProvider) {
+      if (isApiProviderTemplate(provider) && configuredProviders.has(configuredProvider.id)) {
+        continue;
+      }
+      configuredProviders.set(configuredProvider.id, configuredProvider);
+    }
+  }
+
+  return [
+    ...createCleanApiProviderTemplates(),
+    ...Array.from(configuredProviders.values()).map((provider) => ({
+      ...provider,
+      builtIn: false,
+      models: [...provider.models]
+    }))
+  ];
+}
+
+function resolveConfiguredProviderFromTemplate(templateProvider: ApiProvider | undefined): ApiProvider | undefined {
+  if (!templateProvider || !isApiProviderTemplate(templateProvider)) {
+    return undefined;
+  }
+  return apiProviders.find((provider) => provider.id === toConfiguredApiProviderId(templateProvider.id));
+}
+
+function findProviderByBaseUrlForUi(baseUrl: string): ApiProvider | undefined {
+  const normalizedBaseUrl = normalizeBaseUrl(baseUrl);
+  if (!normalizedBaseUrl) {
+    return undefined;
+  }
+
+  return apiProviders.find((provider) => (
+    !isApiProviderTemplate(provider) &&
+    normalizeBaseUrl(provider.baseUrl) === normalizedBaseUrl
+  )) ?? apiProviders.find((provider) => (
+    normalizeBaseUrl(provider.baseUrl) === normalizedBaseUrl
+  ));
+}
+
+function findTemplateProviderForEdit(sourceProvider: ApiProvider | undefined): ApiProvider | undefined {
+  if (!sourceProvider) {
+    return apiProviders.find((provider) => provider.id === CUSTOM_API_PROVIDER_ID)
+      ?? apiProviders.find((provider) => provider.builtIn === true)
+      ?? apiProviders[0];
+  }
+
+  if (isApiProviderTemplate(sourceProvider)) {
+    return sourceProvider;
+  }
+
+  const matchingBuiltIn = apiProviders.find((provider) => (
+    provider.builtIn === true &&
+    normalizeBaseUrl(provider.baseUrl) === normalizeBaseUrl(sourceProvider.baseUrl)
+  ));
+  if (matchingBuiltIn) {
+    matchingBuiltIn.apiKey = sourceProvider.apiKey;
+    matchingBuiltIn.model = sourceProvider.model;
+    matchingBuiltIn.models = [...sourceProvider.models];
+    return matchingBuiltIn;
+  }
+
+  const customTemplate = apiProviders.find((provider) => provider.id === CUSTOM_API_PROVIDER_ID);
+  if (customTemplate) {
+    customTemplate.baseUrl = sourceProvider.baseUrl;
+    customTemplate.apiKey = sourceProvider.apiKey;
+    customTemplate.model = sourceProvider.model;
+    customTemplate.models = [...sourceProvider.models];
+    return customTemplate;
+  }
+
+  return apiProviders.find((provider) => provider.builtIn === true) ?? apiProviders[0];
+}
+
+function getActiveApiProvider(providers = apiProviders, activeId = activeApiProviderId): ApiProvider | undefined {
+  return providers.find((provider) => provider.id === activeId)
+    ?? providers.find((provider) => provider.id === CUSTOM_API_PROVIDER_ID)
+    ?? providers[0];
+}
+
+function getFormApiProvider(): ApiProvider | undefined {
+  return getActiveApiProvider(apiProviders, formApiProviderId);
+}
+
+function normalizeModelList(models: string[], fallbackModel: string): string[] {
+  const unique: string[] = [];
+  for (const model of models) {
+    const cleaned = model.replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, "");
+    if (cleaned && !unique.includes(cleaned)) {
+      unique.push(cleaned);
+    }
+  }
+
+  if (unique.length === 0) {
+    unique.push(fallbackModel);
+  }
+
+  if (!unique.includes(fallbackModel)) {
+    unique.unshift(fallbackModel);
+  }
+
+  return unique;
+}
+
+function updateApiConfigSubtabUi(): void {
+  const isEdit = activeApiConfigSubtabId === "apiConfigEditPanel";
+  apiConfigEditTabBtn.classList.toggle("active", isEdit);
+  apiConfigListTabBtn.classList.toggle("active", !isEdit);
+  apiConfigEditPanelEl.classList.toggle("active", isEdit);
+  apiConfigListPanelEl.classList.toggle("active", !isEdit);
+}
+
+function createApiProviderInlineDraft(provider: ApiProvider): ApiProviderInlineDraft {
+  return {
+    name: provider.name,
+    baseUrl: provider.baseUrl,
+    apiKey: provider.apiKey,
+    model: provider.model,
+    modelsText: provider.models.join("\n")
+  };
+}
+
+function closeApiProviderInlineEditor(): void {
+  activeApiProviderInlineEditId = null;
+  activeApiProviderInlineDraft = null;
+}
+
+function openApiProviderInlineEditor(provider: ApiProvider): void {
+  activeApiProviderInlineEditId = provider.id;
+  activeApiProviderInlineDraft = createApiProviderInlineDraft(provider);
+  renderApiProviderList();
+}
+
+function toggleApiProviderInlineEditor(provider: ApiProvider): void {
+  if (activeApiProviderInlineEditId === provider.id) {
+    closeApiProviderInlineEditor();
+    renderApiProviderList();
+    return;
+  }
+
+  openApiProviderInlineEditor(provider);
+}
+
+function updateApiProviderInlineDraft(patch: Partial<ApiProviderInlineDraft>): void {
+  if (!activeApiProviderInlineDraft) {
+    return;
+  }
+  activeApiProviderInlineDraft = {
+    ...activeApiProviderInlineDraft,
+    ...patch
+  };
+}
+
+function parseApiProviderModelsDraft(modelsText: string, fallbackModel: string): string[] {
+  const normalized = modelsText
+    .split(/[\n,]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+  return normalizeModelList(normalized.length > 0 ? normalized : [fallbackModel], fallbackModel);
+}
+
+function buildApiProviderFromInlineDraft(provider: ApiProvider, draft: ApiProviderInlineDraft): { provider: ApiProvider; errors: string[] } {
+  const errors: string[] = [];
+  const name = draft.name.trim();
+  const baseUrl = draft.baseUrl.trim();
+  const model = draft.model.trim() || DEFAULT_CONFIG.model;
+
+  if (!name) {
+    errors.push("供应商名称不能为空");
+  }
+  if (!baseUrl) {
+    errors.push("Base URL 不能为空");
+  }
+
+  return {
+    provider: {
+      ...provider,
+      name: name || provider.name,
+      baseUrl: normalizeBaseUrl(baseUrl || provider.baseUrl),
+      apiKey: draft.apiKey,
+      model,
+      models: parseApiProviderModelsDraft(draft.modelsText, model)
+    },
+    errors
+  };
+}
+
+function createApiProviderInlineField(
+  label: string,
+  control: HTMLInputElement | HTMLTextAreaElement,
+  hint?: string
+): HTMLLabelElement {
+  const wrapper = document.createElement("label");
+  wrapper.className = "api-provider-inline-field";
+
+  const title = document.createElement("span");
+  title.className = "api-provider-inline-field-label";
+  title.textContent = label;
+  wrapper.appendChild(title);
+  wrapper.appendChild(control);
+
+  if (hint) {
+    const hintEl = document.createElement("span");
+    hintEl.className = "api-provider-inline-field-hint";
+    hintEl.textContent = hint;
+    wrapper.appendChild(hintEl);
+  }
+
+  return wrapper;
+}
+
+function renderApiProviderInlineEditor(provider: ApiProvider): HTMLElement {
+  const draft = activeApiProviderInlineDraft ?? createApiProviderInlineDraft(provider);
+  activeApiProviderInlineDraft = draft;
+
+  const editor = document.createElement("div");
+  editor.className = "api-provider-list-item-editor";
+
+  const nameInput = document.createElement("input");
+  nameInput.type = "text";
+  nameInput.value = draft.name;
+  nameInput.placeholder = "供应商名称";
+  nameInput.addEventListener("input", () => {
+    updateApiProviderInlineDraft({ name: nameInput.value });
+  });
+
+  const baseUrlInput = document.createElement("input");
+  baseUrlInput.type = "text";
+  baseUrlInput.value = draft.baseUrl;
+  baseUrlInput.placeholder = "Base URL";
+  baseUrlInput.addEventListener("input", () => {
+    updateApiProviderInlineDraft({ baseUrl: baseUrlInput.value });
+  });
+
+  const apiKeyInput = document.createElement("input");
+  apiKeyInput.type = "password";
+  apiKeyInput.value = draft.apiKey;
+  apiKeyInput.placeholder = "API Key";
+  apiKeyInput.addEventListener("input", () => {
+    updateApiProviderInlineDraft({ apiKey: apiKeyInput.value });
+  });
+
+  const modelInput = document.createElement("input");
+  modelInput.type = "text";
+  modelInput.value = draft.model;
+  modelInput.placeholder = "默认模型";
+  modelInput.addEventListener("input", () => {
+    updateApiProviderInlineDraft({ model: modelInput.value });
+  });
+
+  const modelsTextarea = document.createElement("textarea");
+  modelsTextarea.value = draft.modelsText;
+  modelsTextarea.placeholder = "一行一个模型，或用逗号分隔";
+  modelsTextarea.addEventListener("input", () => {
+    updateApiProviderInlineDraft({ modelsText: modelsTextarea.value });
+  });
+
+  editor.appendChild(createApiProviderInlineField("名称", nameInput));
+  editor.appendChild(createApiProviderInlineField("Base URL", baseUrlInput, "保留完整根地址即可，保存时会自动规范化。"));
+  editor.appendChild(createApiProviderInlineField("API Key", apiKeyInput));
+  editor.appendChild(createApiProviderInlineField("默认 Model", modelInput));
+  editor.appendChild(createApiProviderInlineField("可用模型", modelsTextarea, "一行一个模型名，或用逗号分隔。保存时会自动去重并保留默认模型。"));
+
+  const footer = document.createElement("div");
+  footer.className = "api-provider-list-item-editor-actions";
+
+  const saveBtn = createApiProviderActionButton(
+    "保存",
+    "保存当前编辑内容并收起",
+    "edit",
+    () => {
+      void saveInlineApiProviderDraft(provider.id);
+    }
+  );
+  saveBtn.classList.add("is-save");
+
+  const cancelBtn = createApiProviderActionButton(
+    "取消",
+    "放弃修改并收起",
+    "delete",
+    () => {
+      closeApiProviderInlineEditor();
+      renderApiProviderList();
+    }
+  );
+  cancelBtn.classList.add("is-cancel");
+
+  footer.appendChild(saveBtn);
+  footer.appendChild(cancelBtn);
+  editor.appendChild(footer);
+
+  return editor;
+}
+
+async function saveInlineApiProviderDraft(providerId: string): Promise<void> {
+  const provider = apiProviders.find((item) => item.id === providerId);
+  const draft = activeApiProviderInlineDraft;
+
+  if (!provider || !draft) {
+    closeApiProviderInlineEditor();
+    renderApiProviderList();
+    return;
+  }
+
+  const { provider: updatedProvider, errors } = buildApiProviderFromInlineDraft(provider, draft);
+  if (errors.length > 0) {
+    setStatus(errors.join("，"), true);
+    setApiProviderListStatus(errors.join("，"), true);
+    return;
+  }
+
+  apiProviders = apiProviders.map((item) => (item.id === providerId ? updatedProvider : item));
+  closeApiProviderInlineEditor();
+
+  if (providerId === activeApiProviderId) {
+    applyApiProviderToForm(updatedProvider, { setEnabled: true });
+  } else {
+    renderApiProviderTabs();
+    renderApiProviderList();
+  }
+
+  const saved = await saveConfig(`${updatedProvider.name} 已保存`, true);
+  if (!saved) {
+    return;
+  }
+
+  renderApiProviderTabs();
+  refreshApiProviderListIfVisible();
+}
+
+function commitOpenApiProviderInlineDraft(): boolean {
+  if (!activeApiProviderInlineEditId || !activeApiProviderInlineDraft) {
+    return true;
+  }
+
+  const provider = apiProviders.find((item) => item.id === activeApiProviderInlineEditId);
+  if (!provider) {
+    closeApiProviderInlineEditor();
+    return true;
+  }
+
+  const { provider: updatedProvider, errors } = buildApiProviderFromInlineDraft(provider, activeApiProviderInlineDraft);
+  if (errors.length > 0) {
+    const message = errors.join("，");
+    setStatus(message, true);
+    setApiProviderListStatus(message, true);
+    return false;
+  }
+
+  apiProviders = apiProviders.map((item) => (item.id === provider.id ? updatedProvider : item));
+  if (provider.id === activeApiProviderId) {
+    applyApiProviderToForm(updatedProvider, { setEnabled: true });
+  } else {
+    renderApiProviderTabs();
+    refreshApiProviderListIfVisible();
+  }
+
+  closeApiProviderInlineEditor();
+  return true;
+}
+
+function activateApiConfigSubtab(tabId: "apiConfigEditPanel" | "apiConfigListPanel"): void {
+  activeApiConfigSubtabId = tabId;
+  if (tabId !== "apiConfigListPanel") {
+    closeApiProviderInlineEditor();
+  }
+  updateApiConfigSubtabUi();
+  if (tabId !== "apiConfigListPanel") {
+    const editTemplate = findTemplateProviderForEdit(getActiveApiProvider());
+    if (editTemplate) {
+      applyApiProviderToForm(editTemplate);
+    }
+    return;
+  }
+
+  renderApiProviderList();
+}
+
+function maskApiKey(apiKey: string): string {
+  const trimmed = apiKey.trim();
+  if (!trimmed) {
+    return "未设置";
+  }
+  if (trimmed.length <= 8) {
+    return `${trimmed.slice(0, 2)}••••`;
+  }
+  return `${trimmed.slice(0, 4)}••••${trimmed.slice(-4)}`;
+}
+
+function createApiProviderActionButton(
+  label: string,
+  title: string,
+  variant: "enable" | "edit" | "test" | "delete",
+  onClick: () => void,
+  disabled = false
+): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = `api-provider-action-btn api-provider-action-btn--${variant}`;
+  button.textContent = label;
+  button.title = title;
+  button.disabled = disabled;
+  button.addEventListener("click", onClick);
+  return button;
+}
+
+function buildConfigForProvider(provider: ApiProvider, baseConfig = toConfig()): LLMConfig {
+  const model = provider.model.replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, "") || DEFAULT_CONFIG.model;
+  return {
+    ...baseConfig,
+    baseUrl: normalizeBaseUrl(provider.baseUrl),
+    apiKey: provider.apiKey.trim(),
+    model,
+    models: normalizeModelList(provider.models, model),
+    activeApiProviderId: provider.id,
+    apiProviders: cloneApiProviders(apiProviders)
+  };
+}
+
+function findFallbackActiveProviderId(excludeProviderId: string, baseConfig = toConfig()): string | undefined {
+  const candidates = [
+    ...apiProviders.filter((provider) => !isApiProviderTemplate(provider)),
+    ...apiProviders.filter((provider) => isApiProviderTemplate(provider))
+  ].filter((provider) => provider.id !== excludeProviderId);
+
+  for (const candidate of candidates) {
+    if (validateConfig(buildConfigForProvider(candidate, baseConfig)).valid) {
+      return candidate.id;
+    }
+  }
+
+  return candidates[0]?.id;
+}
+
+function renderApiProviderList(): void {
+  apiProviderListEl.innerHTML = "";
+  const fragment = document.createDocumentFragment();
+  const displayProviders = apiProviders.filter((provider) => {
+    return !isApiProviderTemplate(provider);
+  }).sort((a, b) => {
+    if (a.id === activeApiProviderId) return -1;
+    if (b.id === activeApiProviderId) return 1;
+    if (a.id === activeApiProviderInlineEditId) return -1;
+    if (b.id === activeApiProviderInlineEditId) return 1;
+    return a.name.localeCompare(b.name, "zh-Hans-CN");
+  });
+
+  if (displayProviders.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "api-provider-list-empty";
+    empty.textContent = "暂无已添加的大模型配置，预设供应商仅用于新增时选择。";
+    apiProviderListEl.appendChild(empty);
+    return;
+  }
+
+  if (activeApiProviderInlineEditId && !displayProviders.some((provider) => provider.id === activeApiProviderInlineEditId)) {
+    closeApiProviderInlineEditor();
+  }
+
+  for (const provider of displayProviders) {
+    const isActive = provider.id === activeApiProviderId;
+    const isEditing = provider.id === activeApiProviderInlineEditId;
+    const item = document.createElement("article");
+    item.className = "api-provider-list-item";
+    item.classList.toggle("is-active", isActive);
+    item.classList.toggle("is-editing", isEditing);
+    item.dataset.providerId = provider.id;
+
+    const header = document.createElement("div");
+    header.className = "api-provider-list-item-header";
+
+    const title = document.createElement("div");
+    title.className = "api-provider-list-item-title";
+    title.textContent = provider.name;
+    header.appendChild(title);
+
+    const actions = document.createElement("div");
+    actions.className = "api-provider-list-item-actions";
+
+    const enableBtn = createApiProviderActionButton(
+      isActive ? "✓ 已启用" : "✓ 启用",
+      isActive ? "当前配置正在使用中" : "切换为当前使用的配置",
+      "enable",
+      () => {
+        void enableApiProvider(provider);
+      },
+      isActive
+    );
+
+    const editBtn = createApiProviderActionButton(
+      isEditing ? "▴ 收起" : "✎ 编辑",
+      isEditing ? "收起当前编辑区域" : "在当前列表中展开编辑内容",
+      "edit",
+      () => {
+        toggleApiProviderInlineEditor(provider);
+      }
+    );
+
+    const testBtn = createApiProviderActionButton(
+      "🧪 测试",
+      "使用该配置发起一次大模型连通性测试",
+      "test",
+      () => {
+        void testApiProvider(provider);
+      }
+    );
+
+    const deleteBtn = createApiProviderActionButton(
+      "🗑 删除",
+      `删除「${provider.name}」配置`,
+      "delete",
+      () => {
+        void deleteApiProvider(provider);
+      }
+    );
+
+    actions.appendChild(enableBtn);
+    actions.appendChild(editBtn);
+    actions.appendChild(testBtn);
+    actions.appendChild(deleteBtn);
+
+    const meta = document.createElement("div");
+    meta.className = "api-provider-list-item-meta";
+    meta.innerHTML = `
+      <div><strong>Base URL：</strong>${provider.baseUrl || "未设置"}</div>
+      <div><strong>API Key：</strong>${maskApiKey(provider.apiKey)}</div>
+      <div><strong>Model：</strong>${provider.model || "未设置"}</div>
+      <div><strong>模型数量：</strong>${provider.models.length}</div>
+    `;
+
+    item.appendChild(header);
+    item.appendChild(meta);
+    if (isEditing) {
+      item.appendChild(renderApiProviderInlineEditor(provider));
+    }
+    item.appendChild(actions);
+    fragment.appendChild(item);
+  }
+
+  apiProviderListEl.appendChild(fragment);
+
+  const focusProviderId = activeApiProviderInlineEditId ?? activeApiProviderId;
+  if (focusProviderId) {
+    requestAnimationFrame(() => {
+      const focusedItem = apiProviderListEl.querySelector<HTMLElement>(`[data-provider-id="${CSS.escape(focusProviderId)}"]`);
+      focusedItem?.scrollIntoView({ block: "nearest" });
+    });
+  }
+}
+
+function refreshApiProviderListIfVisible(): void {
+  if (activeApiConfigSubtabId === "apiConfigListPanel") {
+    renderApiProviderList();
+  }
+}
+
+function syncFormProviderFromForm(): ApiProvider | undefined {
+  const provider = getFormApiProvider();
+  if (!provider) {
+    return undefined;
+  }
+
+  if (provider.builtIn !== true) {
+    provider.baseUrl = normalizeBaseUrl(baseUrlInput.value.trim());
+  }
+
+  provider.apiKey = apiKeyInput.value;
+  provider.model = modelInput.value.replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, "") || provider.model || DEFAULT_CONFIG.model;
+  provider.models = normalizeModelList(currentModels, provider.model);
+  refreshApiProviderListIfVisible();
+  return provider;
+}
+
+function applyApiProviderToForm(provider: ApiProvider | undefined, options: { setEnabled?: boolean } = {}): void {
+  const nextProvider = provider ?? apiProviders[0];
+  if (!nextProvider) {
+    return;
+  }
+
+  formApiProviderId = nextProvider.id;
+  if (options.setEnabled) {
+    activeApiProviderId = nextProvider.id;
+  }
+  apiKeyInput.value = nextProvider.apiKey ?? "";
+  baseUrlInput.value = nextProvider.baseUrl ?? "";
+  baseUrlInput.readOnly = nextProvider.builtIn === true;
+  baseUrlInput.title = nextProvider.builtIn === true
+    ? `${nextProvider.name} 是预设供应商，Base URL 已固定`
+    : "可编辑当前供应商的 Base URL";
+
+  currentModels = normalizeModelList([...nextProvider.models], nextProvider.model);
+  renderModelSelect(nextProvider.model, nextProvider.model, nextProvider.model);
+  renderApiProviderTabs();
+  renderApiProviderList();
+}
+
+function generateApiProviderId(name: string): string {
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fa5]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return `provider-${slug || "custom"}-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
+}
+
+function renderApiProviderTabs(): void {
+  apiProviderTabsEl.innerHTML = "";
+  const fragment = document.createDocumentFragment();
+
+  for (const provider of apiProviders.filter((item) => isApiProviderTemplate(item))) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "api-provider-tab";
+    if (provider.id === formApiProviderId) {
+      button.classList.add("active");
+    }
+    button.textContent = provider.name;
+    button.title = provider.baseUrl || provider.name;
+    button.addEventListener("click", () => {
+      selectApiProviderForForm(provider.id);
+    });
+    fragment.appendChild(button);
+  }
+
+  const addButton = document.createElement("button");
+  addButton.type = "button";
+  addButton.className = "api-provider-add-btn";
+  addButton.textContent = "+";
+  addButton.title = "新增供应商";
+  addButton.setAttribute("aria-label", "新增供应商");
+  addButton.addEventListener("click", () => {
+    void promptAndAddApiProvider();
+  });
+  fragment.appendChild(addButton);
+
+  apiProviderTabsEl.appendChild(fragment);
+}
+
+function selectApiProviderForForm(providerId: string): void {
+  closeApiProviderInlineEditor();
+  const provider = apiProviders.find((item) => item.id === providerId)
+    ?? apiProviders.find((item) => item.id === CUSTOM_API_PROVIDER_ID)
+    ?? apiProviders[0];
+  applyApiProviderToForm(provider);
+}
+
+function setActiveApiProvider(providerId: string): void {
+  closeApiProviderInlineEditor();
+  const provider = apiProviders.find((item) => item.id === providerId)
+    ?? apiProviders.find((item) => item.id === CUSTOM_API_PROVIDER_ID)
+    ?? apiProviders[0];
+  applyApiProviderToForm(provider, { setEnabled: true });
+}
+
+function syncActiveApiProviderBaseUrl(value: string): void {
+  const provider = getFormApiProvider();
+  if (!provider || provider.builtIn === true) {
+    return;
+  }
+  provider.baseUrl = normalizeBaseUrl(value);
+  refreshApiProviderListIfVisible();
+}
+
+function syncActiveApiProviderModels(selectedModel = modelInput.value): void {
+  const provider = getFormApiProvider();
+  if (!provider) {
+    return;
+  }
+
+  provider.model = selectedModel.replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, "") || DEFAULT_CONFIG.model;
+  provider.models = normalizeModelList(currentModels, provider.model);
+  refreshApiProviderListIfVisible();
+}
+
+async function promptAndAddApiProvider(): Promise<void> {
+  const name = window.prompt("请输入供应商名称", "新供应商")?.trim();
+  if (!name) {
+    return;
+  }
+
+  const baseUrl = window.prompt("请输入 Base URL", "https://api.example.com");
+  if (baseUrl === null) {
+    return;
+  }
+  if (!baseUrl.trim()) {
+    setStatus("Base URL 不能为空", true);
+    return;
+  }
+
+  const provider: ApiProvider = {
+    id: generateApiProviderId(name),
+    name,
+    baseUrl: baseUrl.trim(),
+    apiKey: "",
+    model: DEFAULT_CONFIG.model,
+    models: [DEFAULT_CONFIG.model],
+    builtIn: false
+  };
+
+  apiProviders = [
+    ...apiProviders.filter((item) => item.id !== provider.id),
+    provider
+  ];
+  renderApiProviderTabs();
+  activateApiConfigSubtab("apiConfigListPanel");
+  openApiProviderInlineEditor(provider);
+  setApiProviderListStatus(`已新增「${provider.name}」，请补充 API Key 后保存。`);
+}
+
+function setApiProvidersFromConfig(config: LLMConfig): void {
+  closeApiProviderInlineEditor();
+  const loadedProviders = Array.isArray(config.apiProviders) && config.apiProviders.length > 0
+    ? config.apiProviders
+    : createDefaultApiProviders({
+        baseUrl: config.baseUrl,
+        apiKey: config.apiKey,
+        model: config.model,
+        models: config.models
+      });
+  apiProviders = normalizeLoadedApiProvidersForUi(
+    loadedProviders.map((provider, index) => sanitizeApiProviderForUi(provider, `provider-${index + 1}`))
+  );
+
+  const normalizedBaseUrl = normalizeBaseUrl(config.baseUrl);
+  const requestedProviderId = typeof config.activeApiProviderId === "string"
+    ? config.activeApiProviderId.trim()
+    : "";
+  const requestedProvider = apiProviders.find((provider) => provider.id === requestedProviderId);
+  const selectedProvider = resolveConfiguredProviderFromTemplate(requestedProvider)
+    ?? requestedProvider
+    ?? findProviderByBaseUrlForUi(normalizedBaseUrl)
+    ?? apiProviders.find((provider) => provider.id === CUSTOM_API_PROVIDER_ID)
+    ?? apiProviders[0];
+
+  activeApiProviderId = selectedProvider.id;
+  const editTemplate = findTemplateProviderForEdit(selectedProvider);
+  applyApiProviderToForm(editTemplate ?? selectedProvider);
+  syncFormProviderFromForm();
+}
 
 // ── Agent State ──
 interface AgentToolCallEntry {
@@ -111,6 +995,8 @@ let activeAgentRequestId: string | null = null;
 let agentPending = false;
 let agentSessions: AgentSession[] = [];
 let activeAgentSessionId: string | null = null;
+let activeAgentPanel: "memories" | "skills" | "tasks" | null = null;
+let agentIterInfoText = "";
 const inFlightAutoSolveSignatures = new Set<string>();
 const completedAutoSolveSignatures = new Set<string>();
 
@@ -161,6 +1047,19 @@ async function sendTabMessageWithAutoInject(
 function setStatus(text: string, error = false): void {
   statusEl.textContent = text;
   statusEl.style.color = error ? "#b91c1c" : "#047857";
+}
+
+function setApiProviderListStatus(text: string, error = false): void {
+  apiProviderListStatusEl.textContent = text;
+  apiProviderListStatusEl.style.color = error ? "#b91c1c" : "#475569";
+}
+
+function updateApiKeyVisibilityButton(): void {
+  apiKeyInput.type = apiKeyVisible ? "text" : "password";
+  apiKeyVisibilityBtn.textContent = apiKeyVisible ? "🙈" : "👁";
+  apiKeyVisibilityBtn.title = apiKeyVisible ? "隐藏 API Key" : "显示 API Key";
+  apiKeyVisibilityBtn.setAttribute("aria-label", apiKeyVisible ? "隐藏 API Key" : "显示 API Key");
+  apiKeyVisibilityBtn.classList.toggle("active", apiKeyVisible);
 }
 
 function setTranslationStatus(text: string, error = false): void {
@@ -264,6 +1163,17 @@ let chatStreamingThinkingPre: HTMLPreElement | null = null;
 let chatStreamingThinkingDetails: HTMLElement | null = null;
 let chatStreamingBodyEl: HTMLDivElement | null = null;
 
+function updateChatActionButton(): void {
+  const isPending = chatState.pending || !!activeStreamRequestId;
+  chatActionBtn.textContent = isPending ? "■" : "↑";
+  chatActionBtn.title = isPending ? "停止" : "发送";
+  chatActionBtn.setAttribute("aria-label", isPending ? "停止" : "发送");
+}
+
+function finalizeChatStreamUi(): void {
+  updateChatActionButton();
+}
+
 function renderChatFull(): void {
   chatMessagesEl.innerHTML = "";
   chatRenderedCount = 0;
@@ -278,6 +1188,7 @@ function renderChatFull(): void {
 
   chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
   chatStatusEl.textContent = chatState.pending ? "AI 思考中..." : "";
+  updateChatActionButton();
 }
 
 function appendChatMessageDOM(msg: { role: string; content: string; reasoning_content?: string }, isLast: boolean): void {
@@ -319,6 +1230,14 @@ function appendChatMessageDOM(msg: { role: string; content: string; reasoning_co
 
   if (isLast && msg.role === "assistant") {
     chatStreamingBodyEl = body;
+    if (!thinking) {
+      chatStreamingThinkingPre = null;
+      chatStreamingThinkingDetails = null;
+    }
+  } else if (isLast) {
+    chatStreamingBodyEl = null;
+    chatStreamingThinkingPre = null;
+    chatStreamingThinkingDetails = null;
   }
 }
 
@@ -381,6 +1300,7 @@ function renderChat(): void {
 
   chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
   chatStatusEl.textContent = chatState.pending ? "AI 思考中..." : "";
+  updateChatActionButton();
 }
 
 function setExamStatus(text: string): void {
@@ -510,11 +1430,15 @@ function dispatchChat(action: ChatStateAction): void {
 }
 
 function toConfig(): LLMConfig {
+  syncFormProviderFromForm();
+  const activeProvider = getActiveApiProvider() ?? getFormApiProvider();
+  const nextProviders = cloneApiProviders(apiProviders);
+
   return {
-    baseUrl: normalizeBaseUrl(baseUrlInput.value.trim()),
-    apiKey: apiKeyInput.value.trim(),
-    model: modelInput.value.replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, ""),
-    models: currentModels.map(m => m.replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, "")).filter(Boolean),
+    baseUrl: normalizeBaseUrl(activeProvider?.baseUrl ?? baseUrlInput.value.trim()),
+    apiKey: (activeProvider?.apiKey ?? apiKeyInput.value).trim(),
+    model: (activeProvider?.model ?? modelInput.value).replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, ""),
+    models: normalizeModelList(activeProvider?.models ?? currentModels, activeProvider?.model ?? modelInput.value),
     temperature: DEFAULT_CONFIG.temperature,
     maxTokens: DEFAULT_CONFIG.maxTokens,
     agentMaxTokens: parseInt(agentMaxTokensInput.value, 10) || DEFAULT_CONFIG.agentMaxTokens,
@@ -539,22 +1463,69 @@ function toConfig(): LLMConfig {
     localCommandEnabled: localCommandEnabledInput.checked,
     localCommandWsUrl: localCommandWsUrlInput.value.trim() || DEFAULT_CONFIG.localCommandWsUrl,
     localCommandToken: localCommandTokenInput.value,
-    thinkingFormat: (thinkingFormatInput.value as "none" | "field" | "blocks") ?? DEFAULT_CONFIG.thinkingFormat
+    thinkingFormat: (thinkingFormatInput.value as "none" | "field" | "blocks") ?? DEFAULT_CONFIG.thinkingFormat,
+    apiProviders: nextProviders,
+    activeApiProviderId: activeProvider?.id ?? activeApiProviderId
   };
 }
 
-function renderModelSelect(selected?: string): void {
+function toChatConfig(): LLMConfig {
+  return {
+    ...toConfig(),
+    model: chatModelInput.value.replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, "") || DEFAULT_CONFIG.model
+  };
+}
+
+function toAgentConfig(): LLMConfig {
+  return {
+    ...toConfig(),
+    model: agentModelInput.value.replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, "") || DEFAULT_CONFIG.model
+  };
+}
+
+function renderModelSelect(selectedSettings?: string, selectedChat?: string, selectedAgent?: string): void {
+  const previousChat = selectedChat ?? chatModelInput.value;
+  const previousAgent = selectedAgent ?? agentModelInput.value;
   modelInput.innerHTML = "";
+  chatModelInput.innerHTML = "";
+  agentModelInput.innerHTML = "";
   for (const m of currentModels) {
-    const opt = document.createElement("option");
-    opt.value = m;
-    opt.textContent = m;
-    modelInput.appendChild(opt);
+    const settingsOpt = document.createElement("option");
+    settingsOpt.value = m;
+    settingsOpt.textContent = m;
+    modelInput.appendChild(settingsOpt);
+
+    const chatOpt = document.createElement("option");
+    chatOpt.value = m;
+    chatOpt.textContent = m;
+    chatModelInput.appendChild(chatOpt);
+
+    const agentOpt = document.createElement("option");
+    agentOpt.value = m;
+    agentOpt.textContent = m;
+    agentModelInput.appendChild(agentOpt);
   }
-  if (selected && currentModels.includes(selected)) {
-    modelInput.value = selected;
+
+  if (selectedSettings && currentModels.includes(selectedSettings)) {
+    modelInput.value = selectedSettings;
   } else if (currentModels.length > 0) {
     modelInput.value = currentModels[0];
+  }
+
+  if (previousChat && currentModels.includes(previousChat)) {
+    chatModelInput.value = previousChat;
+  } else if (selectedSettings && currentModels.includes(selectedSettings)) {
+    chatModelInput.value = selectedSettings;
+  } else if (currentModels.length > 0) {
+    chatModelInput.value = currentModels[0];
+  }
+
+  if (previousAgent && currentModels.includes(previousAgent)) {
+    agentModelInput.value = previousAgent;
+  } else if (selectedSettings && currentModels.includes(selectedSettings)) {
+    agentModelInput.value = selectedSettings;
+  } else if (currentModels.length > 0) {
+    agentModelInput.value = currentModels[0];
   }
 }
 
@@ -576,12 +1547,7 @@ async function loadConfig(): Promise<void> {
   }
 
   const config = response.data as LLMConfig;
-  baseUrlInput.value = config.baseUrl;
-  apiKeyInput.value = config.apiKey;
-  currentModels = Array.isArray(config.models) && config.models.length > 0
-    ? config.models
-    : [config.model || DEFAULT_CONFIG.model];
-  renderModelSelect(config.model);
+  setApiProvidersFromConfig(config);
   agentMaxTokensInput.value = String(config.agentMaxTokens ?? DEFAULT_CONFIG.agentMaxTokens);
   translationEnabledInput.checked = !!config.translationEnabled;
   selectionTranslationEnabledInput.checked = !!config.selectionTranslationEnabled;
@@ -729,11 +1695,34 @@ async function translateCurrentPage(): Promise<void> {
     return;
   }
 
-  setTranslationStatus("正在翻译当前页面...");
   const config = {
     ...toConfig(),
     translationEnabled: true
   };
+
+  const statusResponse = await sendTabMessageWithAutoInject(tabId, {
+    type: "CHECK_CURRENT_PAGE_TRANSLATION_STATUS",
+    payload: toTranslationPayload(config)
+  });
+
+  if (!statusResponse.response) {
+    setInjectionNotice(
+      statusResponse.diagnosis
+        ? formatInjectionDiagnosisNotice(statusResponse.diagnosis)
+        : "当前页面不支持应用翻译设置。"
+    );
+    setTranslationStatus("当前页面不支持翻译", true);
+    return;
+  }
+
+  const statusData = statusResponse.response.data as { translated?: boolean; count?: number } | undefined;
+  if (statusData?.translated) {
+    setInjectionNotice(null);
+    setTranslationStatus(`当前页面已翻译，不重复请求${typeof statusData.count === "number" ? `（${statusData.count} 段）` : ""}`);
+    return;
+  }
+
+  setTranslationStatus("正在翻译当前页面...");
 
   const response = await sendTabMessageWithAutoInject(tabId, {
     type: "TRANSLATE_CURRENT_PAGE_ONCE",
@@ -784,7 +1773,11 @@ async function clearTranslationsFromActiveTab(): Promise<void> {
   setTranslationStatus("当前页译文已清除");
 }
 
-async function saveConfig(): Promise<void> {
+async function saveConfig(successMessage = "Config saved", showApiProviderListAfterSave = false): Promise<boolean> {
+  if (!commitOpenApiProviderInlineDraft()) {
+    return false;
+  }
+
   const config = toConfig();
   const response = await chrome.runtime.sendMessage({
     type: "SAVE_CONFIG",
@@ -795,8 +1788,12 @@ async function saveConfig(): Promise<void> {
     const message = Array.isArray(response?.errors)
       ? response.errors.join(", ")
       : "Save config failed";
+    if (showApiProviderListAfterSave) {
+      activateApiConfigSubtab("apiConfigListPanel");
+      renderApiProviderList();
+    }
     setStatus(message, true);
-    return;
+    return false;
   }
 
   try {
@@ -805,15 +1802,36 @@ async function saveConfig(): Promise<void> {
     // ignored
   }
 
-  setStatus("Config saved");
+  if (showApiProviderListAfterSave) {
+    activateApiConfigSubtab("apiConfigListPanel");
+  } else {
+    refreshApiProviderListIfVisible();
+  }
+
+  setStatus(successMessage);
   setTimeout(() => {
     void refreshLocalCommandStatus();
   }, 300);
+  return true;
 }
 
-async function testLlmConfig(): Promise<void> {
-  const config = toConfig();
-  setStatus("正在测试大模型配置...");
+async function handleFeatureSwitchChange(options: { refreshAutoSolve?: boolean } = {}): Promise<void> {
+  const saved = await saveConfig("功能开关已生效");
+  if (!saved) {
+    return;
+  }
+
+  if (options.refreshAutoSolve) {
+    await refreshAutoSolveDetectionStatus({ solveWhenDetected: true });
+  }
+}
+
+async function testConfig(
+  config: LLMConfig,
+  label = "大模型配置",
+  statusSetter: (text: string, error?: boolean) => void = setStatus
+): Promise<boolean> {
+  statusSetter(`正在测试${label}...`);
 
   const response = await chrome.runtime.sendMessage({
     type: "TEST_LLM_CONFIG",
@@ -823,14 +1841,70 @@ async function testLlmConfig(): Promise<void> {
   if (!response?.ok) {
     const message = Array.isArray(response?.errors)
       ? response.errors.join(", ")
-      : "大模型配置测试失败";
-    setStatus(message, true);
-    return;
+      : `${label}测试失败`;
+    statusSetter(message, true);
+    return false;
   }
 
   const data = response.data as { model?: string; latencyMs?: number; content?: string };
   const latency = typeof data.latencyMs === "number" ? `，耗时 ${data.latencyMs}ms` : "";
-  setStatus(`大模型可用：${data.model ?? config.model}${latency}`);
+  statusSetter(`${label}可用：${data.model ?? config.model}${latency}`);
+  return true;
+}
+
+async function testLlmConfig(): Promise<void> {
+  await testConfig(toConfig(), "当前大模型配置");
+}
+
+async function testApiProvider(provider: ApiProvider): Promise<void> {
+  await testConfig(buildConfigForProvider(provider), `${provider.name} 配置`, setApiProviderListStatus);
+}
+
+async function enableApiProvider(provider: ApiProvider): Promise<void> {
+  setActiveApiProvider(provider.id);
+  const saved = await saveConfig(`${provider.name} 已启用`);
+  if (!saved) {
+    await loadConfig();
+  }
+}
+
+async function deleteApiProvider(provider: ApiProvider): Promise<void> {
+  if (provider.builtIn === true) {
+    setStatus("预设供应商不能从已添加列表中删除", true);
+    return;
+  }
+
+  const confirmed = window.confirm(`确定删除「${provider.name}」配置吗？删除后无法恢复。`);
+  if (!confirmed) {
+    return;
+  }
+
+  const previousConfig = toConfig();
+  const wasActive = provider.id === activeApiProviderId;
+  const wasEditing = provider.id === activeApiProviderInlineEditId;
+  if (wasEditing) {
+    closeApiProviderInlineEditor();
+  }
+  apiProviders = apiProviders.filter((item) => item.id !== provider.id);
+
+  if (wasActive) {
+    const fallbackId = findFallbackActiveProviderId(provider.id, previousConfig);
+    if (fallbackId) {
+      setActiveApiProvider(fallbackId);
+    } else {
+      renderApiProviderTabs();
+      renderApiProviderList();
+    }
+  } else {
+    renderApiProviderTabs();
+    renderApiProviderList();
+  }
+
+  const saved = await saveConfig(`${provider.name} 已删除`);
+  if (!saved) {
+    await loadConfig();
+    return;
+  }
 }
 
 async function exportConfig(): Promise<void> {
@@ -896,10 +1970,7 @@ configImportFileEl.addEventListener("change", () => {
       }
 
       // Reload UI with imported config
-      baseUrlInput.value = config.baseUrl;
-      apiKeyInput.value = config.apiKey;
-      currentModels = [...config.models];
-      renderModelSelect(config.model);
+      setApiProvidersFromConfig(config);
       agentMaxTokensInput.value = String(config.agentMaxTokens ?? DEFAULT_CONFIG.agentMaxTokens);
       translationEnabledInput.checked = !!config.translationEnabled;
       selectionTranslationEnabledInput.checked = !!config.selectionTranslationEnabled;
@@ -958,6 +2029,10 @@ const loadPageContext = createLoadPageContextAction(
     setContext: (text) => {
       contextEl.textContent = text;
     },
+    setPageTabActive: () => {
+      activateTab("tabSettings");
+      activateSettingsSubtab("settingsPagePanel");
+    },
     setInjectionNotice
   }
 );
@@ -994,7 +2069,7 @@ async function sendChatMessageWithContent(
     const response = await chrome.runtime.sendMessage(
       createLLMStreamRequestMessage({
         requestId,
-        config: toConfig(),
+        config: toChatConfig(),
         messages: outboundMessages,
         pageContext: includePageContext ? (contextEl.textContent || undefined) : undefined
       })
@@ -1007,6 +2082,7 @@ async function sendChatMessageWithContent(
       dispatchChat({ type: "APPEND_ASSISTANT_DELTA", delta: `Error: ${message}` });
       dispatchChat({ type: "SET_PENDING", pending: false });
       activeStreamRequestId = null;
+      finalizeChatStreamUi();
       const resolve = streamCompletionResolvers.get(requestId);
       if (resolve) {
         resolve(false);
@@ -1021,6 +2097,7 @@ async function sendChatMessageWithContent(
     });
     dispatchChat({ type: "SET_PENDING", pending: false });
     activeStreamRequestId = null;
+    finalizeChatStreamUi();
     const resolve = streamCompletionResolvers.get(requestId);
     if (resolve) {
       resolve(false);
@@ -1044,6 +2121,7 @@ async function stopChatMessage(): Promise<void> {
     await chrome.runtime.sendMessage(createLLMStreamCancelMessage({ requestId }));
   } finally {
     dispatchChat({ type: "SET_PENDING", pending: false });
+    finalizeChatStreamUi();
     const resolve = streamCompletionResolvers.get(requestId);
     if (resolve) {
       resolve(false);
@@ -1354,6 +2432,7 @@ function handleStreamEvent(event: RuntimeStreamEvent): void {
       streamCompletionResolvers.delete(event.payload.requestId);
     }
     activeStreamRequestId = null;
+    finalizeChatStreamUi();
     return;
   }
 
@@ -1365,6 +2444,7 @@ function handleStreamEvent(event: RuntimeStreamEvent): void {
       streamCompletionResolvers.delete(event.payload.requestId);
     }
     activeStreamRequestId = null;
+    finalizeChatStreamUi();
   }
 }
 
@@ -1374,7 +2454,31 @@ function setAgentStatus(text: string): void {
   agentStatusEl.textContent = text;
 }
 
+function setAgentIterationInfo(text: string): void {
+  agentIterInfoText = text;
+  agentIterInfoEl.textContent = text;
+}
+
+function showAgentPanel(panel: "memories" | "skills" | "tasks" | null): void {
+  activeAgentPanel = panel;
+  memoriesPanelEl.hidden = panel !== "memories";
+  skillsPanelEl.hidden = panel !== "skills";
+  tasksPanelEl.hidden = panel !== "tasks";
+
+  toggleMemoriesBtn.classList.toggle("active", panel === "memories");
+  toggleSkillsBtn.classList.toggle("active", panel === "skills");
+  toggleTasksBtn.classList.toggle("active", panel === "tasks");
+}
+
+function updateAgentActionButton(): void {
+  const isPending = agentPending || !!activeAgentRequestId;
+  agentActionBtn.textContent = isPending ? "■" : "↑";
+  agentActionBtn.title = isPending ? "停止" : "发送";
+  agentActionBtn.setAttribute("aria-label", isPending ? "停止" : "发送");
+}
+
 function renderAgent(): void {
+  agentIterInfoEl.textContent = agentIterInfoText;
   agentMessagesEl.innerHTML = "";
 
   for (const entry of agentEntries) {
@@ -1472,6 +2576,7 @@ function renderAgent(): void {
 
   agentMessagesEl.scrollTop = agentMessagesEl.scrollHeight;
   setAgentStatus(agentPending ? "智能体执行中..." : "");
+  updateAgentActionButton();
 }
 
 function handleAgentEvent(event: AgentProgressEvent): void {
@@ -1540,14 +2645,14 @@ function handleAgentEvent(event: AgentProgressEvent): void {
   }
 
   if (event.type === "AGENT_ITERATION_START") {
-    agentIterInfoEl.textContent = `迭代 ${event.payload.iteration} / ${event.payload.maxIterations}`;
+    setAgentIterationInfo(`迭代 ${event.payload.iteration} / ${event.payload.maxIterations}`);
     return;
   }
 
   if (event.type === "AGENT_TURN_COMPLETE") {
     agentPending = false;
     activeAgentRequestId = null;
-    agentIterInfoEl.textContent = `完成 (${event.payload.iterations} 轮迭代)`;
+    setAgentIterationInfo(`完成 (${event.payload.iterations} 轮迭代)`);
     renderAgent();
     void persistActiveAgentSession();
     return;
@@ -1591,7 +2696,7 @@ function handleExternalAgentRunStarted(event: ExternalAgentRunStartedEvent): voi
 
   activeAgentRequestId = event.payload.requestId;
   agentPending = true;
-  agentIterInfoEl.textContent = "";
+  setAgentIterationInfo("");
   activateTab("tabAgent");
   renderAgentSessions();
   renderAgent();
@@ -1639,7 +2744,7 @@ async function sendAgentMessage(): Promise<void> {
 
   const requestId = `agent-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   activeAgentRequestId = requestId;
-  agentIterInfoEl.textContent = "";
+  setAgentIterationInfo("");
 
   try {
     const response = await chrome.runtime.sendMessage({
@@ -1647,7 +2752,7 @@ async function sendAgentMessage(): Promise<void> {
       payload: {
         requestId,
         tabId,
-        config: toConfig(),
+        config: toAgentConfig(),
         userMessage: input,
         history,
         maxIterations: 100
@@ -1696,7 +2801,7 @@ function clearAgent(): void {
   agentEntries = [];
   activeAgentRequestId = null;
   agentPending = false;
-  agentIterInfoEl.textContent = "";
+  setAgentIterationInfo("");
   renderAgent();
 }
 
@@ -1743,7 +2848,7 @@ function renderAgentSessions(): void {
       agentEntries = (session.entries ?? []).map((e) => ({ ...e }));
       activeAgentRequestId = null;
       agentPending = false;
-      agentIterInfoEl.textContent = "";
+      setAgentIterationInfo("");
       renderAgentSessions();
       renderAgent();
     });
@@ -1756,6 +2861,16 @@ function activateTab(targetId: string): void {
     btn.classList.toggle("active", (btn as HTMLButtonElement).dataset.tab === targetId);
   });
   document.querySelectorAll(".tab-content").forEach((panel) => {
+    panel.classList.toggle("active", panel.id === targetId);
+  });
+}
+
+function activateSettingsSubtab(targetId: string): void {
+  activeSettingsSubtabId = targetId;
+  settingsSubtabButtons.forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.settingsTab === targetId);
+  });
+  settingsSubtabPanels.forEach((panel) => {
     panel.classList.toggle("active", panel.id === targetId);
   });
 }
@@ -1823,7 +2938,7 @@ function newAgentSession(): void {
   agentEntries = [];
   activeAgentRequestId = null;
   agentPending = false;
-  agentIterInfoEl.textContent = "";
+  setAgentIterationInfo("");
   ensureActiveAgentSession();
   renderAgentSessions();
   renderAgent();
@@ -1844,7 +2959,7 @@ async function deleteAgentSession(): Promise<void> {
 
   activeAgentRequestId = null;
   agentPending = false;
-  agentIterInfoEl.textContent = "";
+  setAgentIterationInfo("");
   renderAgentSessions();
   renderAgent();
 
@@ -1860,7 +2975,7 @@ async function clearAgentSessions(): Promise<void> {
   agentEntries = [];
   activeAgentRequestId = null;
   agentPending = false;
-  agentIterInfoEl.textContent = "";
+  setAgentIterationInfo("");
   renderAgentSessions();
   renderAgent();
 
@@ -2439,11 +3554,50 @@ function maybeHandleRuntimeMessage(message: unknown): void {
 }
 
 byId<HTMLButtonElement>("saveConfig").addEventListener("click", () => {
-  void saveConfig();
+  const configuredProvider = materializeTemplateProvider(getFormApiProvider());
+  if (configuredProvider) {
+    activeApiProviderId = configuredProvider.id;
+    formApiProviderId = configuredProvider.id;
+    applyApiProviderToForm(configuredProvider);
+    renderApiProviderTabs();
+    renderApiProviderList();
+  }
+  void saveConfig("Config saved", true);
 });
 
 byId<HTMLButtonElement>("testLlmConfig").addEventListener("click", () => {
   void testLlmConfig();
+});
+
+apiKeyVisibilityBtn.addEventListener("click", () => {
+  apiKeyVisible = !apiKeyVisible;
+  updateApiKeyVisibilityButton();
+});
+
+apiConfigEditTabBtn.addEventListener("click", () => {
+  activateApiConfigSubtab("apiConfigEditPanel");
+});
+
+apiConfigListTabBtn.addEventListener("click", () => {
+  activateApiConfigSubtab("apiConfigListPanel");
+});
+
+baseUrlInput.addEventListener("input", () => {
+  syncActiveApiProviderBaseUrl(baseUrlInput.value);
+});
+
+apiKeyInput.addEventListener("input", () => {
+  const provider = getFormApiProvider();
+  if (provider) {
+    provider.apiKey = apiKeyInput.value;
+    refreshApiProviderListIfVisible();
+  }
+});
+
+modelInput.addEventListener("change", () => {
+  chatModelInput.value = modelInput.value;
+  agentModelInput.value = modelInput.value;
+  syncActiveApiProviderModels(modelInput.value);
 });
 
 refreshLocalCommandStatusBtn.addEventListener("click", () => {
@@ -2451,8 +3605,19 @@ refreshLocalCommandStatusBtn.addEventListener("click", () => {
 });
 
 autoSolveCurrentPageInput.addEventListener("change", () => {
-  void saveConfig();
-  void refreshAutoSolveDetectionStatus({ solveWhenDetected: true });
+  void handleFeatureSwitchChange({ refreshAutoSolve: true });
+});
+
+[
+  localCommandEnabledInput,
+  unlockContextMenuInput,
+  blockVisibilityDetectionInput,
+  aggressiveVisibilityBypassInput,
+  blockFullscreenRequestsInput
+].forEach((input) => {
+  input.addEventListener("change", () => {
+    void handleFeatureSwitchChange();
+  });
 });
 
 addModelBtn.addEventListener("click", () => {
@@ -2464,7 +3629,8 @@ addModelBtn.addEventListener("click", () => {
   }
   currentModels.push(name);
   newModelInput.value = "";
-  renderModelSelect(name);
+  renderModelSelect(name, name, name);
+  syncActiveApiProviderModels(name);
 });
 
 removeModelBtn.addEventListener("click", () => {
@@ -2474,8 +3640,15 @@ removeModelBtn.addEventListener("click", () => {
     setStatus("至少保留一个模型", true);
     return;
   }
+  const selectedChatModel = chatModelInput.value;
+  const selectedAgentModel = agentModelInput.value;
   currentModels = currentModels.filter((m) => m !== selected);
-  renderModelSelect();
+  renderModelSelect(
+    undefined,
+    selectedChatModel === selected ? undefined : selectedChatModel,
+    selectedAgentModel === selected ? undefined : selectedAgentModel
+  );
+  syncActiveApiProviderModels(modelInput.value);
 });
 
 byId<HTMLButtonElement>("exportConfig").addEventListener("click", () => {
@@ -2490,6 +3663,17 @@ byId<HTMLButtonElement>("applyTranslation").addEventListener("click", () => {
   void applyTranslationToActiveTab();
 });
 
+[
+  translationEnabledInput,
+  selectionTranslationEnabledInput,
+  translationStyleBoldInput,
+  translationStyleItalicInput
+].forEach((input) => {
+  input.addEventListener("change", () => {
+    void applyTranslationToActiveTab();
+  });
+});
+
 byId<HTMLButtonElement>("translateCurrentPage").addEventListener("click", () => {
   void translateCurrentPage();
 });
@@ -2502,12 +3686,12 @@ byId<HTMLButtonElement>("loadContext").addEventListener("click", () => {
   void loadPageContext();
 });
 
-byId<HTMLButtonElement>("sendChat").addEventListener("click", () => {
+chatActionBtn.addEventListener("click", () => {
+  if (chatState.pending || activeStreamRequestId) {
+    void stopChatMessage();
+    return;
+  }
   void sendChatMessage();
-});
-
-byId<HTMLButtonElement>("stopChat").addEventListener("click", () => {
-  void stopChatMessage();
 });
 
 byId<HTMLButtonElement>("askAndAutoFill").addEventListener("click", () => {
@@ -2534,17 +3718,12 @@ chatInput.addEventListener("keydown", (e) => {
 });
 
 // Agent event listeners
-byId<HTMLButtonElement>("sendAgent").addEventListener("click", () => {
+agentActionBtn.addEventListener("click", () => {
+  if (agentPending || activeAgentRequestId) {
+    void stopAgent();
+    return;
+  }
   void sendAgentMessage();
-});
-
-byId<HTMLButtonElement>("stopAgent").addEventListener("click", () => {
-  void stopAgent();
-});
-
-byId<HTMLButtonElement>("clearAgent").addEventListener("click", () => {
-  clearAgent();
-  scheduleAgentPersist();
 });
 
 byId<HTMLButtonElement>("newAgent").addEventListener("click", () => {
@@ -2559,10 +3738,10 @@ byId<HTMLButtonElement>("clearAgentSessions").addEventListener("click", () => {
   void clearAgentSessions();
 });
 
-byId<HTMLButtonElement>("toggleMemories").addEventListener("click", () => {
-  const isHidden = memoriesPanelEl.hidden;
-  memoriesPanelEl.hidden = !isHidden;
-  if (isHidden) void loadMemoriesList();
+toggleMemoriesBtn.addEventListener("click", () => {
+  const next = activeAgentPanel === "memories" ? null : "memories";
+  showAgentPanel(next);
+  if (next === "memories") void loadMemoriesList();
 });
 
 byId<HTMLButtonElement>("refreshMemories").addEventListener("click", () => {
@@ -2581,10 +3760,10 @@ byId<HTMLButtonElement>("compressMemories").addEventListener("click", () => {
   void compressMemoriesAction();
 });
 
-byId<HTMLButtonElement>("toggleSkills").addEventListener("click", () => {
-  const isHidden = skillsPanelEl.hidden;
-  skillsPanelEl.hidden = !isHidden;
-  if (isHidden) void loadSkillsList();
+toggleSkillsBtn.addEventListener("click", () => {
+  const next = activeAgentPanel === "skills" ? null : "skills";
+  showAgentPanel(next);
+  if (next === "skills") void loadSkillsList();
 });
 
 byId<HTMLButtonElement>("refreshSkills").addEventListener("click", () => {
@@ -2599,10 +3778,10 @@ byId<HTMLButtonElement>("exportSkills").addEventListener("click", () => {
   void exportSkillsToFile();
 });
 
-byId<HTMLButtonElement>("toggleTasks").addEventListener("click", () => {
-  const isHidden = tasksPanelEl.hidden;
-  tasksPanelEl.hidden = !isHidden;
-  if (isHidden) void loadTasksList();
+toggleTasksBtn.addEventListener("click", () => {
+  const next = activeAgentPanel === "tasks" ? null : "tasks";
+  showAgentPanel(next);
+  if (next === "tasks") void loadTasksList();
 });
 
 byId<HTMLButtonElement>("refreshTasks").addEventListener("click", () => {
@@ -2627,7 +3806,20 @@ document.querySelectorAll<HTMLButtonElement>(".tab-btn").forEach((btn) => {
     activateTab(targetId);
     if (targetId === "tabChat") {
       void refreshAutoSolveDetectionStatus({ solveWhenDetected: true });
+    } else if (targetId === "tabSettings") {
+      activateSettingsSubtab(activeSettingsSubtabId);
     }
+  });
+});
+
+settingsSubtabButtons.forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const targetId = btn.dataset.settingsTab;
+    if (!targetId) {
+      return;
+    }
+
+    activateSettingsSubtab(targetId);
   });
 });
 
@@ -2635,7 +3827,10 @@ chrome.runtime.onMessage.addListener((message) => {
   maybeHandleRuntimeMessage(message);
 });
 
+activateApiConfigSubtab("apiConfigListPanel");
+setActiveApiProvider(activeApiProviderId);
 void loadConfig();
+updateApiKeyVisibilityButton();
 void loadChatSessions();
 void loadAgentSessions();
 setTimeout(() => {

@@ -1,16 +1,132 @@
-import type { LLMConfig, ValidationResult } from "./types.js";
+import type { ApiProvider, LLMConfig, ValidationResult } from "./types.js";
 
-/**
- * Normalize a baseUrl: if the user only entered a host/IP (path is "/" or empty),
- * automatically append "/v1/chat/completions".
- */
+const DEFAULT_MODEL = "gpt-4o-mini";
+const CONTROL_CHARS = /^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g;
+
+interface ApiProviderMeta {
+  id: string;
+  name: string;
+  baseUrl: string;
+  defaultModel: string;
+  defaultModels: string[];
+}
+
+const BUILT_IN_API_PROVIDER_META: ApiProviderMeta[] = [
+  {
+    id: "kimi",
+    name: "Kimi",
+    baseUrl: "https://api.moonshot.cn/v1",
+    defaultModel: "kimi-k2.5",
+    defaultModels: ["kimi-k2.5", "kimi-k2-thinking", "moonshot-v1-128k", "moonshot-v1-32k", "moonshot-v1-8k"]
+  },
+  {
+    id: "minimax",
+    name: "MiniMax",
+    baseUrl: "https://api.minimaxi.com/v1",
+    defaultModel: "MiniMax-M3",
+    defaultModels: ["MiniMax-M3", "MiniMax-M2.7"]
+  },
+  {
+    id: "deepseek",
+    name: "DeepSeek",
+    baseUrl: "https://api.deepseek.com/v1",
+    defaultModel: "deepseek-v4-flash",
+    defaultModels: ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"]
+  }
+];
+
+function sanitizeText(value: string): string {
+  return value.replace(CONTROL_CHARS, "");
+}
+
+function sanitizeModel(model: string, fallback = DEFAULT_MODEL): string {
+  const cleaned = sanitizeText(model);
+  return cleaned || fallback;
+}
+
+function normalizeModelList(models: unknown, fallbackModel: string): string[] {
+  const sanitize = (value: string) => sanitizeText(value);
+
+  if (!Array.isArray(models)) {
+    return [fallbackModel];
+  }
+
+  const unique: string[] = [];
+  for (const model of models) {
+    if (typeof model !== "string") {
+      continue;
+    }
+    const cleaned = sanitize(model);
+    if (!cleaned) {
+      continue;
+    }
+    if (!unique.includes(cleaned)) {
+      unique.push(cleaned);
+    }
+  }
+
+  if (unique.length === 0) {
+    unique.push(fallbackModel);
+  }
+
+  if (!unique.includes(fallbackModel)) {
+    unique.unshift(fallbackModel);
+  }
+
+  return unique;
+}
+
+function createProvider(meta: ApiProviderMeta, fallback: Partial<Pick<ApiProvider, "apiKey">> = {}, builtIn = false): ApiProvider {
+  const model = sanitizeModel(meta.defaultModel, meta.defaultModel);
+  const models = normalizeModelList(meta.defaultModels, model);
+  return {
+    id: meta.id,
+    name: meta.name,
+    baseUrl: normalizeBaseUrl(meta.baseUrl),
+    apiKey: sanitizeText(typeof fallback.apiKey === "string" ? fallback.apiKey : ""),
+    model,
+    models,
+    builtIn
+  };
+}
+
+function createCustomProvider(fallback: Partial<Pick<LLMConfig, "baseUrl" | "apiKey" | "model" | "models">> = {}): ApiProvider {
+  const model = sanitizeModel(typeof fallback.model === "string" ? fallback.model : DEFAULT_MODEL);
+  const models = normalizeModelList(fallback.models, model);
+  return {
+    id: CUSTOM_API_PROVIDER_ID,
+    name: "自定义",
+    baseUrl: normalizeBaseUrl(typeof fallback.baseUrl === "string" ? fallback.baseUrl : ""),
+    apiKey: sanitizeText(typeof fallback.apiKey === "string" ? fallback.apiKey : ""),
+    model,
+    models,
+    builtIn: false
+  };
+}
+
+function cloneProvider(provider: ApiProvider): ApiProvider {
+  return {
+    ...provider,
+    models: [...provider.models]
+  };
+}
+
 export function normalizeBaseUrl(url: string): string {
   const trimmed = url.trim();
   if (!trimmed) return trimmed;
   try {
     const parsed = new URL(trimmed);
-    if (parsed.pathname === "/" || parsed.pathname === "") {
-      return trimmed.replace(/\/$/, "") + "/v1/chat/completions";
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    if (pathname === "" || pathname === "/") {
+      parsed.pathname = "/v1/chat/completions";
+      return parsed.toString();
+    }
+    if (pathname === "/v1") {
+      parsed.pathname = "/v1/chat/completions";
+      return parsed.toString();
+    }
+    if (pathname.endsWith("/chat/completions")) {
+      return parsed.toString();
     }
   } catch {
     // Not a valid full URL — return as-is for validation to catch
@@ -18,35 +134,236 @@ export function normalizeBaseUrl(url: string): string {
   return trimmed;
 }
 
-/** Ensure a loaded config has the `models` array, migrating from old single-model format */
-export function migrateConfig(config: LLMConfig): LLMConfig {
+export const BUILT_IN_API_PROVIDERS: ApiProvider[] = BUILT_IN_API_PROVIDER_META.map((meta) =>
+  createProvider(meta, { apiKey: "" }, true)
+);
+
+export const CUSTOM_API_PROVIDER_ID = "custom";
+
+export function createDefaultApiProviders(fallback: Partial<Pick<LLMConfig, "baseUrl" | "apiKey" | "model" | "models">> = {}): ApiProvider[] {
+  const normalizedBaseUrl = normalizeBaseUrl(typeof fallback.baseUrl === "string" ? fallback.baseUrl : "");
+  const model = sanitizeModel(typeof fallback.model === "string" ? fallback.model : DEFAULT_MODEL);
+  const models = normalizeModelList(fallback.models, model);
+  const apiKey = sanitizeText(typeof fallback.apiKey === "string" ? fallback.apiKey : "");
+  const matchesBuiltIn = BUILT_IN_API_PROVIDER_META.some(
+    (provider) => normalizeBaseUrl(provider.baseUrl) === normalizedBaseUrl
+  );
+
+  return [
+    ...BUILT_IN_API_PROVIDER_META.map((meta) =>
+    createProvider(meta, { apiKey }, true)
+  ),
+    {
+      id: CUSTOM_API_PROVIDER_ID,
+      name: "自定义",
+      baseUrl: matchesBuiltIn ? "" : normalizedBaseUrl,
+      apiKey,
+      model,
+      models: [...models],
+      builtIn: false
+    }
+  ];
+}
+
+function sanitizeProviderId(id: string): string {
+  return sanitizeText(id) || CUSTOM_API_PROVIDER_ID;
+}
+
+function sanitizeProviderName(name: string, fallbackId: string): string {
+  return sanitizeText(name) || fallbackId;
+}
+
+function sanitizeApiProvider(provider: Partial<ApiProvider>, fallbackId: string, fallback: Partial<Pick<LLMConfig, "apiKey" | "model" | "models">> = {}): ApiProvider | null {
+  const id = sanitizeProviderId(typeof provider.id === "string" ? provider.id : fallbackId);
+  const name = sanitizeProviderName(typeof provider.name === "string" ? provider.name : "", id);
+  const baseUrl = normalizeBaseUrl(typeof provider.baseUrl === "string" ? provider.baseUrl : "");
+  const apiKey = sanitizeText(typeof provider.apiKey === "string" ? provider.apiKey : (typeof fallback.apiKey === "string" ? fallback.apiKey : ""));
+  const model = sanitizeModel(
+    typeof provider.model === "string" ? provider.model : (typeof fallback.model === "string" ? fallback.model : DEFAULT_MODEL),
+    typeof fallback.model === "string" ? fallback.model : DEFAULT_MODEL
+  );
+  const models = normalizeModelList(
+    provider.models ?? fallback.models,
+    model
+  );
+
+  if (!id) {
+    return null;
+  }
+
+  return {
+    id,
+    name,
+    baseUrl,
+    apiKey,
+    model,
+    models,
+    builtIn: provider.builtIn === true
+  };
+}
+
+function mergeApiProviders(incomingProviders: unknown, fallback: Partial<Pick<LLMConfig, "baseUrl" | "apiKey" | "model" | "models">> = {}): ApiProvider[] {
+  const list = Array.isArray(incomingProviders) ? incomingProviders : [];
+  const incomingById = new Map<string, ApiProvider>();
+  const customProviders = new Map<string, ApiProvider>();
+  const fallbackBuiltIn = {
+    apiKey: typeof fallback.apiKey === "string" ? fallback.apiKey : "",
+    model: typeof fallback.model === "string" ? fallback.model : DEFAULT_MODEL,
+    models: Array.isArray(fallback.models) && fallback.models.length > 0 ? fallback.models : [typeof fallback.model === "string" ? sanitizeModel(fallback.model) : DEFAULT_MODEL]
+  };
+  const fallbackCustom = {
+    apiKey: fallbackBuiltIn.apiKey,
+    model: fallbackBuiltIn.model,
+    models: fallbackBuiltIn.models
+  };
+
+  list.forEach((provider, index) => {
+    const sanitized = sanitizeApiProvider(provider as Partial<ApiProvider>, `provider-${index + 1}`, fallbackBuiltIn);
+    if (!sanitized) {
+      return;
+    }
+
+    if (BUILT_IN_API_PROVIDER_META.some((meta) => meta.id === sanitized.id)) {
+      incomingById.set(sanitized.id, sanitized);
+      return;
+    }
+
+    if (sanitized.id === CUSTOM_API_PROVIDER_ID) {
+      incomingById.set(sanitized.id, sanitized);
+      return;
+    }
+
+    customProviders.set(sanitized.id, sanitized);
+  });
+
+  const nextProviders = BUILT_IN_API_PROVIDER_META.map((meta) => {
+    const incoming = incomingById.get(meta.id);
+    if (incoming) {
+      incoming.builtIn = true;
+      incoming.baseUrl = normalizeBaseUrl(meta.baseUrl);
+      return incoming;
+    }
+    return createProvider(meta, fallbackBuiltIn, true);
+  });
+
+  for (const provider of customProviders.values()) {
+    nextProviders.push({ ...provider, builtIn: false });
+  }
+
+  const customProvider = incomingById.get(CUSTOM_API_PROVIDER_ID) ?? createCustomProvider({
+    baseUrl: typeof fallback.baseUrl === "string" ? fallback.baseUrl : "",
+    ...fallbackCustom
+  });
+  customProvider.builtIn = false;
+  if (!nextProviders.some((provider) => provider.id === CUSTOM_API_PROVIDER_ID)) {
+    nextProviders.push(customProvider);
+  }
+
+  return nextProviders.map(cloneProvider);
+}
+
+function findProviderByBaseUrl(providers: ApiProvider[], baseUrl: string): ApiProvider | undefined {
+  const normalized = normalizeBaseUrl(baseUrl);
+  if (!normalized) return undefined;
+  return providers.find((provider) => normalizeBaseUrl(provider.baseUrl) === normalized);
+}
+
+function findBuiltInProviderByBaseUrl(providers: ApiProvider[], baseUrl: string): ApiProvider | undefined {
+  const normalized = normalizeBaseUrl(baseUrl);
+  if (!normalized) return undefined;
+  return providers.find((provider) => provider.builtIn === true && normalizeBaseUrl(provider.baseUrl) === normalized);
+}
+
+function sanitizeConfigModels(config: Pick<LLMConfig, "model"> & { models?: string[] }): { model: string; models: string[] } {
   const incomingModels = Array.isArray(config.models) ? config.models : undefined;
   const incomingModel = typeof config.model === "string" ? config.model.trim() : "";
+
+  if (!incomingModels || incomingModels.length === 0) {
+    const model = sanitizeModel(incomingModel, DEFAULT_MODEL);
+    return { model, models: [model] };
+  }
+
+  const models = incomingModels.map((model) => sanitizeText(model)).filter(Boolean);
+  if (models.length === 0) {
+    const model = sanitizeModel(incomingModel, DEFAULT_MODEL);
+    return { model, models: [model] };
+  }
+
+  const model = models.includes(sanitizeText(incomingModel))
+    ? sanitizeModel(incomingModel, models[0])
+    : models[0];
+  return { model, models };
+}
+
+function isWebSocketUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "ws:" || parsed.protocol === "wss:";
+  } catch {
+    return false;
+  }
+}
+
+/** Ensure a loaded config has the `models` array, migrating from old single-model format */
+export function migrateConfig(config: LLMConfig): LLMConfig {
+  const incomingActiveProviderId = typeof config.activeApiProviderId === "string"
+    ? sanitizeText(config.activeApiProviderId)
+    : "";
   const next: LLMConfig = {
     ...DEFAULT_CONFIG,
     ...config
   };
 
-  // Normalize models: strip surrounding whitespace and non-printable/special characters
-  const sanitizeModel = (m: string) => m.replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, "");
+  const modelState = sanitizeConfigModels({
+    model: typeof config.model === "string" ? config.model : DEFAULT_CONFIG.model,
+    models: Array.isArray(config.models) ? config.models : undefined
+  });
+  next.model = modelState.model;
+  next.models = modelState.models;
 
-  if (!incomingModels || incomingModels.length === 0) {
-    const model = sanitizeModel(incomingModel) || DEFAULT_CONFIG.model;
-    next.model = model;
-    next.models = [model];
-  } else {
-    next.models = incomingModels.map(sanitizeModel).filter(Boolean);
-    if (next.models.length === 0) next.models = [DEFAULT_CONFIG.model];
-  }
-
-  next.model = sanitizeModel(next.model) || DEFAULT_CONFIG.model;
-
-  if (!next.models.includes(next.model)) {
-    next.model = next.models[0];
-  }
-
-  // Normalize baseUrl
   next.baseUrl = normalizeBaseUrl(next.baseUrl);
+
+  const providers = mergeApiProviders(next.apiProviders, {
+    baseUrl: next.baseUrl,
+    apiKey: next.apiKey,
+    model: next.model,
+    models: next.models
+  });
+
+  const activeProvider = providers.find((provider) => provider.id === incomingActiveProviderId)
+    ?? findBuiltInProviderByBaseUrl(providers, next.baseUrl)
+    ?? findProviderByBaseUrl(providers, next.baseUrl)
+    ?? providers.find((provider) => provider.id === CUSTOM_API_PROVIDER_ID)
+    ?? providers[0];
+
+  if (activeProvider) {
+    if (activeProvider.id === CUSTOM_API_PROVIDER_ID) {
+      activeProvider.baseUrl = normalizeBaseUrl(next.baseUrl || activeProvider.baseUrl);
+      activeProvider.apiKey = sanitizeText(next.apiKey || activeProvider.apiKey);
+    } else {
+      activeProvider.apiKey = sanitizeText(activeProvider.apiKey || next.apiKey);
+    }
+
+    const providerModelState = sanitizeConfigModels(activeProvider.id === CUSTOM_API_PROVIDER_ID
+      ? {
+          model: next.model,
+          models: next.models
+        }
+      : {
+          model: activeProvider.model,
+          models: activeProvider.models
+        });
+    activeProvider.model = providerModelState.model;
+    activeProvider.models = providerModelState.models;
+
+    next.activeApiProviderId = activeProvider.id;
+    next.baseUrl = normalizeBaseUrl(activeProvider.baseUrl);
+    next.apiKey = activeProvider.apiKey;
+    next.model = activeProvider.model;
+    next.models = [...activeProvider.models];
+  }
+
+  next.apiProviders = providers;
 
   // Migrate thinkingFormat: old stored "none" was the previous default before we understood
   // that APIs returning reasoning_content need it sent back as a field
@@ -108,8 +425,8 @@ export function migrateConfig(config: LLMConfig): LLMConfig {
 export const DEFAULT_CONFIG: LLMConfig = {
   baseUrl: "",
   apiKey: "",
-  model: "gpt-4o-mini",
-  models: ["gpt-4o-mini"],
+  model: DEFAULT_MODEL,
+  models: [DEFAULT_MODEL],
   temperature: 0.2,
   maxTokens: 1024,
   agentMaxTokens: 102400,
@@ -134,6 +451,8 @@ export const DEFAULT_CONFIG: LLMConfig = {
   localCommandEnabled: false,
   localCommandWsUrl: "ws://127.0.0.1:8787/neonagent",
   localCommandToken: "",
+  apiProviders: createDefaultApiProviders(),
+  activeApiProviderId: CUSTOM_API_PROVIDER_ID,
   thinkingFormat: "field"
 };
 
@@ -240,19 +559,16 @@ export function validateConfig(input: LLMConfig): ValidationResult {
 
   if (typeof input.localCommandWsUrl !== "string" || !input.localCommandWsUrl.trim()) {
     errors.push("localCommandWsUrl is required");
-  } else {
-    try {
-      const parsed = new URL(input.localCommandWsUrl);
-      if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {
-        errors.push("localCommandWsUrl must use ws:// or wss://");
-      }
-    } catch {
-      errors.push("localCommandWsUrl must be a valid WebSocket URL");
-    }
+  } else if (!isWebSocketUrl(input.localCommandWsUrl.trim())) {
+    errors.push("localCommandWsUrl must use ws:// or wss://");
   }
 
   if (typeof input.localCommandToken !== "string") {
     errors.push("localCommandToken must be string");
+  }
+
+  if (input.thinkingFormat !== "none" && input.thinkingFormat !== "field" && input.thinkingFormat !== "blocks") {
+    errors.push("thinkingFormat must be 'none', 'field', or 'blocks'");
   }
 
   return {
