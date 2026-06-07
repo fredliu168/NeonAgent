@@ -25,7 +25,20 @@ jobs:
         run: npm ci
 
       - name: Run tests
-        run: npm run test:ci
+        id: tests
+        continue-on-error: true
+        run: npm run test:ci 2>&1 | tee vitest.log
+
+      - name: Fail with test summary
+        if: steps.tests.outcome == 'failure'
+        run: |
+          {
+            echo "## Test output"
+            echo '```text'
+            tail -n 200 vitest.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
 
       - name: Build extension
         run: npm run build
