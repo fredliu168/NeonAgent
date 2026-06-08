@@ -404,6 +404,24 @@ const TRANSLATION_SOURCE_ATTR = "data-neonagent-translation-source";
 const TRANSLATION_HOST_ATTR = "data-neonagent-translation-host";
 const TRANSLATION_TEXT_ATTR = "data-neonagent-translation-text";
 const SELECTION_TRANSLATION_POPUP_ATTR = "data-neonagent-selection-translation";
+const TRANSLATABLE_TEXT_SELECTOR = "p, h1, h2, h3, h4, h5, h6, li, blockquote, figcaption, td, th, header";
+const NESTED_TRANSLATABLE_TEXT_SELECTOR = "p, h1, h2, h3, h4, h5, h6, li, blockquote, figcaption, td, th";
+const SKIPPED_TRANSLATION_ANCESTOR_SELECTOR = "pre, code, nav, footer, aside, script, style, noscript, textarea, button, input, select";
+const MEDIA_DESCENDANT_SELECTOR = "img, picture, figure, video, audio, canvas, iframe, svg, source, track, object, embed";
+const AD_CONTAINER_SELECTOR = [
+  "[id^='google_ads_iframe_']",
+  "[id^='div-gpt-ad']",
+  "[id*='google_ads_iframe']",
+  "[data-google-query-id]",
+  "[data-google-container-id]",
+  "[data-ad]",
+  "[data-ad-slot]",
+  "[data-ad-unit]",
+  "[aria-label*='advertisement' i]",
+  "[aria-label*='advert' i]",
+  "[class*='advert' i]",
+  "[id*='advert' i]"
+].join(", ");
 
 type TranslationSettings = {
   enabled: boolean;
@@ -428,12 +446,18 @@ type TranslationRecord = {
   translatedText: string;
   overlay: boolean;
   displayMode?: "below" | "hover";
+  retryable?: boolean;
+  retrying?: boolean;
+  retrySourceText?: string;
+  translationRequestId?: number;
   onMouseEnter?: () => void;
   onMouseLeave?: () => void;
   lastRenderedSourceText?: string;
   lastRenderedTranslatedText?: string;
   lastRenderedDisplayMode?: TranslationSettings["displayMode"];
   lastRenderedStyleSignature?: string;
+  lastRenderedRetryable?: boolean;
+  lastRenderedRetrying?: boolean;
 };
 
 const defaultFeatureFlags: FeatureFlags = {
@@ -480,6 +504,7 @@ let autoSolveTimer: ReturnType<typeof setTimeout> | null = null;
 let autoSolveAttachTimer: ReturnType<typeof setTimeout> | null = null;
 let lastAutoSolveQuestionSignature = "";
 const sentAutoSolveSignatures = new Set<string>();
+const PAGE_TRANSLATION_MAX_ATTEMPTS = 3;
 
 function buildPageContext(): string {
   const title = document.title || "Untitled";
@@ -1248,14 +1273,50 @@ function hasTranslationBlockDescendant(node: HTMLElement): boolean {
   return node.querySelector(`[${TRANSLATION_HOST_ATTR}]`) !== null;
 }
 
+function hasMediaDescendant(node: HTMLElement): boolean {
+  if (typeof node.querySelector !== "function") {
+    return false;
+  }
+  return node.querySelector(MEDIA_DESCENDANT_SELECTOR) !== null;
+}
+
+function isInsideAdContainer(node: HTMLElement): boolean {
+  if (typeof node.closest !== "function") {
+    return false;
+  }
+  return node.closest(AD_CONTAINER_SELECTOR) !== null;
+}
+
+function hasAdDescendant(node: HTMLElement): boolean {
+  if (typeof node.querySelector !== "function") {
+    return false;
+  }
+  return node.querySelector(AD_CONTAINER_SELECTOR) !== null;
+}
+
+function hasNestedTranslatableTextDescendant(node: HTMLElement): boolean {
+  if (typeof node.querySelector !== "function") {
+    return false;
+  }
+  return node.querySelector(NESTED_TRANSLATABLE_TEXT_SELECTOR) !== null;
+}
+
 function isTranslatableElement(node: HTMLElement): boolean {
   const tag = node.tagName.toLowerCase();
-  const allowedTags = new Set(["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "figcaption", "td", "th"]);
+  const allowedTags = new Set(["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "figcaption", "td", "th", "header"]);
   if (!allowedTags.has(tag)) {
     return false;
   }
 
-  if (node.closest("pre, code, nav, header, footer, aside, script, style, noscript, textarea, button, input, select")) {
+  if (node.closest(SKIPPED_TRANSLATION_ANCESTOR_SELECTOR)) {
+    return false;
+  }
+
+  if (tag === "header" && hasNestedTranslatableTextDescendant(node)) {
+    return false;
+  }
+
+  if (isInsideAdContainer(node) || hasAdDescendant(node)) {
     return false;
   }
 
@@ -1267,13 +1328,17 @@ function isTranslatableElement(node: HTMLElement): boolean {
     return false;
   }
 
+  if (hasMediaDescendant(node)) {
+    return false;
+  }
+
   const text = normalizeText(node.innerText || node.textContent || "");
   return text.length >= 2;
 }
 
 function collectTranslatableElements(): HTMLElement[] {
   const candidates = Array.from(
-    document.querySelectorAll<HTMLElement>("p, h1, h2, h3, h4, h5, h6, li, blockquote, figcaption, td, th")
+    document.querySelectorAll<HTMLElement>(TRANSLATABLE_TEXT_SELECTOR)
   ).filter((node) => isTranslatableElement(node));
   const candidateSet = new Set(candidates);
 
@@ -1344,7 +1409,7 @@ function clearAllTranslations(): void {
 
   document.querySelectorAll(`[${TRANSLATION_SOURCE_ATTR}]`).forEach((node) => {
     const originalText = node.getAttribute(TRANSLATION_TEXT_ATTR);
-    if (originalText !== null) {
+    if (originalText !== null && !hasMediaDescendant(node as HTMLElement)) {
       withSuppressedTranslationObserver(() => {
         node.textContent = originalText;
       });
@@ -1461,6 +1526,8 @@ function markAutoTranslationRendered(record: TranslationRecord): void {
   record.lastRenderedTranslatedText = record.translatedText;
   record.lastRenderedDisplayMode = translationSettings.displayMode;
   record.lastRenderedStyleSignature = buildAutoTranslationRenderStyleSignature(translationSettings);
+  record.lastRenderedRetryable = !!record.retryable;
+  record.lastRenderedRetrying = !!record.retrying;
 }
 
 function shouldRerenderAutoTranslation(record: TranslationRecord, sourceText: string): boolean {
@@ -1472,7 +1539,9 @@ function shouldRerenderAutoTranslation(record: TranslationRecord, sourceText: st
     record.lastRenderedSourceText !== sourceText ||
     record.lastRenderedTranslatedText !== record.translatedText ||
     record.lastRenderedDisplayMode !== translationSettings.displayMode ||
-    record.lastRenderedStyleSignature !== buildAutoTranslationRenderStyleSignature(translationSettings)
+    record.lastRenderedStyleSignature !== buildAutoTranslationRenderStyleSignature(translationSettings) ||
+    record.lastRenderedRetryable !== !!record.retryable ||
+    record.lastRenderedRetrying !== !!record.retrying
   );
 }
 
@@ -1480,6 +1549,8 @@ function renderTranslationRecord(record: TranslationRecord): void {
   if (record.overlay) {
     positionTranslationOverlay(record);
   }
+  record.retryable = false;
+  record.retrying = false;
   record.body.textContent = record.translatedText;
   record.body.style.color = translationSettings.styleColor;
   record.body.style.background = translationSettings.styleBackground;
@@ -1507,7 +1578,54 @@ function renderTranslationRecord(record: TranslationRecord): void {
   record.host.style.display = (record.displayMode ?? "below") === "hover" ? "none" : "block";
 }
 
-function createBilingualColumn(label: string, text: string, muted: boolean): HTMLDivElement {
+function retryAutoTranslationRecord(recordId: string): void {
+  const record = translationRecords.get(recordId);
+  if (!record || !record.source.isConnected) {
+    return;
+  }
+
+  const text = record.retrySourceText
+    || record.sourceText
+    || record.source.getAttribute(TRANSLATION_TEXT_ATTR)
+    || normalizeText(record.source.innerText || record.source.textContent || "");
+  if (!text) {
+    return;
+  }
+
+  void translateParagraphIntoRecord({ id: record.id, node: record.source, text }, translationRunId);
+}
+
+function createTranslationRetryButton(record: TranslationRecord): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = "↻";
+  button.title = record.retrying ? "重新开始翻译" : "重试翻译";
+  button.setAttribute("aria-label", record.retrying ? "重新开始翻译" : "重试翻译");
+  button.style.marginLeft = "8px";
+  button.style.width = "22px";
+  button.style.height = "22px";
+  button.style.padding = "0";
+  button.style.border = "1px solid rgba(20, 184, 166, 0.35)";
+  button.style.borderRadius = "50%";
+  button.style.background = "rgba(20, 184, 166, 0.12)";
+  button.style.color = "#0f766e";
+  button.style.font = "inherit";
+  button.style.fontSize = "14px";
+  button.style.fontWeight = "700";
+  button.style.lineHeight = "20px";
+  button.style.textAlign = "center";
+  button.style.cursor = "pointer";
+  button.style.pointerEvents = "auto";
+  button.style.verticalAlign = "middle";
+  button.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    retryAutoTranslationRecord(record.id);
+  });
+  return button;
+}
+
+function createBilingualColumn(label: string, text: string, muted: boolean, retryRecord?: TranslationRecord): HTMLDivElement {
   const column = document.createElement("div");
   column.style.minWidth = "0";
 
@@ -1526,6 +1644,9 @@ function createBilingualColumn(label: string, text: string, muted: boolean): HTM
   textEl.style.whiteSpace = "pre-wrap";
   textEl.style.wordBreak = "break-word";
   textEl.style.opacity = muted ? "0.78" : "1";
+  if (retryRecord?.retryable || retryRecord?.retrying) {
+    textEl.appendChild(createTranslationRetryButton(retryRecord));
+  }
 
   column.appendChild(textEl);
   return column;
@@ -1555,7 +1676,7 @@ function renderBilingualTranslationRecord(
   if (options.sourceText) {
     record.body.appendChild(createBilingualColumn(options.sourceLabel, options.sourceText, true));
   }
-  record.body.appendChild(createBilingualColumn(options.targetLabel, options.translatedText, false));
+  record.body.appendChild(createBilingualColumn(options.targetLabel, options.translatedText, false, record));
 
   if (!record.onMouseEnter) {
     record.onMouseEnter = () => {
@@ -1573,6 +1694,7 @@ function renderBilingualTranslationRecord(
   }
 
   record.host.style.display = (record.displayMode ?? "below") === "hover" ? "none" : "block";
+  record.host.style.pointerEvents = record.retryable || record.retrying ? "auto" : "none";
 }
 
 function renderAutoTranslationRecord(record: TranslationRecord): void {
@@ -2218,6 +2340,40 @@ function syncSelectionTranslation(): void {
   enableSelectionTranslation();
 }
 
+function getTranslationErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function makePageTranslationLoadingText(attempt: number): string {
+  return attempt <= 1 ? "翻译中..." : `翻译中...（重试 ${attempt - 1}/${PAGE_TRANSLATION_MAX_ATTEMPTS - 1}）`;
+}
+
+async function requestParagraphTranslationWithFallback(
+  text: string,
+  onStreamText: (text: string) => void
+): Promise<string> {
+  let streamedText = "";
+
+  try {
+    const finalText = await requestTranslationStream(text, (delta) => {
+      streamedText += delta;
+      onStreamText(streamedText);
+    });
+    const cleaned = cleanTranslationOutput(finalText || streamedText || "");
+    if (cleaned) {
+      return cleaned;
+    }
+    throw new Error("翻译结果为空");
+  } catch (streamError) {
+    const [fallback] = await requestTranslationsBatch([text]);
+    const cleanedFallback = cleanTranslationOutput(fallback || "");
+    if (cleanedFallback) {
+      return cleanedFallback;
+    }
+    throw streamError instanceof Error ? streamError : new Error(String(streamError));
+  }
+}
+
 async function translateParagraphIntoRecord(
   item: { id: string; node: HTMLElement; text: string },
   runId: number
@@ -2226,47 +2382,61 @@ async function translateParagraphIntoRecord(
   const record = ensureTranslationRecord(item.node, item.id, undefined, false, !isReplacementMode);
   record.source = item.node;
   record.sourceText = item.text;
-  record.translatedText = "翻译中...";
+  record.retrySourceText = item.text;
+  record.retryable = false;
+  record.retrying = true;
+  const requestId = (record.translationRequestId ?? 0) + 1;
+  record.translationRequestId = requestId;
   if (!item.node.hasAttribute(TRANSLATION_TEXT_ATTR)) {
     item.node.setAttribute(TRANSLATION_TEXT_ATTR, item.text);
   }
-  renderAutoTranslationRecord(record);
 
-  try {
-    let streamedText = "";
-    const finalText = await requestTranslationStream(item.text, (delta) => {
-      if (runId !== translationRunId || !translationSettings.enabled) {
+  let lastError: unknown = null;
+  const isCurrentRequest = () => runId === translationRunId &&
+    translationSettings.enabled &&
+    record.translationRequestId === requestId;
+
+  for (let attempt = 1; attempt <= PAGE_TRANSLATION_MAX_ATTEMPTS; attempt += 1) {
+    if (!isCurrentRequest()) {
+      return;
+    }
+
+    record.translatedText = makePageTranslationLoadingText(attempt);
+    renderAutoTranslationRecord(record);
+
+    try {
+      const translatedText = await requestParagraphTranslationWithFallback(item.text, (streamedText) => {
+        if (!isCurrentRequest()) {
+          return;
+        }
+        record.translatedText = cleanTranslationOutput(streamedText) || makePageTranslationLoadingText(attempt);
+        renderAutoTranslationRecord(record);
+      });
+
+      if (!isCurrentRequest()) {
         return;
       }
-      streamedText += delta;
-      record.translatedText = cleanTranslationOutput(streamedText);
+
+      record.retryable = false;
+      record.retrying = false;
+      record.translatedText = translatedText;
       renderAutoTranslationRecord(record);
-    });
-
-    if (runId !== translationRunId || !translationSettings.enabled) {
+      item.node.setAttribute(TRANSLATION_TEXT_ATTR, item.text);
       return;
+    } catch (error) {
+      lastError = error;
     }
-
-    record.translatedText = cleanTranslationOutput(finalText || streamedText || "");
-    if (!record.translatedText) {
-      removeTranslationRecord(item.id);
-      return;
-    }
-    renderAutoTranslationRecord(record);
-    item.node.setAttribute(TRANSLATION_TEXT_ATTR, item.text);
-  } catch {
-    const [fallback] = await requestTranslationsBatch([item.text]);
-    if (runId !== translationRunId || !translationSettings.enabled) {
-      return;
-    }
-    record.translatedText = cleanTranslationOutput(fallback || "");
-    if (!record.translatedText) {
-      removeTranslationRecord(item.id);
-      return;
-    }
-    renderAutoTranslationRecord(record);
-    item.node.setAttribute(TRANSLATION_TEXT_ATTR, item.text);
   }
+
+  if (!isCurrentRequest()) {
+    return;
+  }
+
+  record.retryable = true;
+  record.retrying = false;
+  record.translatedText = `翻译失败：${getTranslationErrorMessage(lastError || "Translation failed")}`;
+  renderAutoTranslationRecord(record);
+  item.node.setAttribute(TRANSLATION_TEXT_ATTR, item.text);
 }
 
 async function runTranslationScan(): Promise<void> {
@@ -2643,6 +2813,8 @@ function agentWriteBilingualTranslationToPage(args: Record<string, unknown>): st
   record.source = resolved.element;
   record.sourceText = sourceText;
   record.translatedText = translatedText.trim();
+  record.retryable = false;
+  record.retrying = false;
   renderBilingualTranslationRecord(record, {
     sourceText,
     translatedText: translatedText.trim(),
@@ -2682,6 +2854,8 @@ function agentUpdateBilingualTranslationOnPage(args: Record<string, unknown>): s
   record.source = resolved.element;
   record.sourceText = sourceText;
   record.translatedText = translatedText.trim();
+  record.retryable = false;
+  record.retrying = false;
   renderBilingualTranslationRecord(record, {
     sourceText,
     translatedText: translatedText.trim(),

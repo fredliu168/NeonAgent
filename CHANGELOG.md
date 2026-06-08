@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is loosely based on Keep a Changelog, with versions tracked alongside Git tags such as `v0.1.2`.
 
+## [0.1.7] - 2026-06-08
+
+### Added
+- Added a `↻` retry icon next to in-progress and failed page translation blocks so users can manually retry a single paragraph.
+- Added request-version guards for page translation retries so stale responses cannot overwrite newer retry results.
+
+### Changed
+- Updated page translation candidate selection to include article `header` text while still skipping navigation, footer, and sidebar regions.
+- Updated README with the v0.1.7 translation stability and news-page compatibility notes.
+
+### Fixed
+- Fixed page translations that could remain stuck on `翻译中...` after repeated request failures by surfacing an error state and continuing later paragraphs.
+- Fixed full-page translation on news pages so media containers such as `img`, `picture`, `figure`, `video`, and `iframe` are skipped instead of being replaced.
+- Fixed BBC-style ad slot interference by skipping common Google ad and advertisement containers during translation scans.
+
 ## [0.1.6] - 2026-06-08
 
 ### Added
