@@ -5,6 +5,7 @@ interface RequestChatCompletionInput {
   messages: ChatMessage[];
   pageContext?: string;
   signal?: AbortSignal;
+  bodyExtras?: Record<string, unknown>;
 }
 
 type TokenParamName = "max_tokens" | "max_completion_tokens";
@@ -15,6 +16,7 @@ function buildRequestBody(
   tokenParamName: TokenParamName
 ): string {
   return JSON.stringify({
+    ...(input.bodyExtras ?? {}),
     model: input.config.model,
     stream,
     temperature: input.config.temperature,

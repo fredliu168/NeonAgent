@@ -42,10 +42,21 @@ interface BackgroundDependencies {
 }
 
 const TRANSLATION_CACHE_KEY = "neonagent.translationCache";
+const WORD_LOOKUP_CACHE_KEY = "neonagent.wordLookupCache";
 const AUTO_SOLVE_HANDLED_KEY = "neonagent.autoSolveHandled";
 
 type TranslationCache = Record<string, {
   translatedText: string;
+  updatedAt: number;
+}>;
+
+type WordLookupDetails = {
+  translation: string;
+  pronunciation: string;
+  partOfSpeech: string;
+};
+
+type WordLookupCache = Record<string, WordLookupDetails & {
   updatedAt: number;
 }>;
 
@@ -158,6 +169,10 @@ function buildTranslationCacheKey(targetLanguage: string, text: string): string 
   return `${targetLanguage.trim()}::${text}`;
 }
 
+function buildWordLookupCacheKey(targetLanguage: string, text: string): string {
+  return `${targetLanguage.trim()}::${text.trim().toLowerCase()}`;
+}
+
 async function getTranslationCache(storage: StorageLike): Promise<TranslationCache> {
   const cache = await storage.get<TranslationCache>(TRANSLATION_CACHE_KEY);
   return cache && typeof cache === "object" ? cache : {};
@@ -165,6 +180,15 @@ async function getTranslationCache(storage: StorageLike): Promise<TranslationCac
 
 async function saveTranslationCache(storage: StorageLike, cache: TranslationCache): Promise<void> {
   await storage.set(TRANSLATION_CACHE_KEY, cache);
+}
+
+async function getWordLookupCache(storage: StorageLike): Promise<WordLookupCache> {
+  const cache = await storage.get<WordLookupCache>(WORD_LOOKUP_CACHE_KEY);
+  return cache && typeof cache === "object" ? cache : {};
+}
+
+async function saveWordLookupCache(storage: StorageLike, cache: WordLookupCache): Promise<void> {
+  await storage.set(WORD_LOOKUP_CACHE_KEY, cache);
 }
 
 function buildTranslationPrompt(targetLanguage: string, segments: string[]): string {
@@ -190,6 +214,140 @@ function buildStreamingTranslationPrompt(targetLanguage: string, text: string): 
     "```",
     "Translate the exact SOURCE_TEXT above."
   ].join("\n\n");
+}
+
+function isThinkingModelName(model: string): boolean {
+  return /\b(?:thinking|reasoner|reasoning)\b/i.test(model.trim());
+}
+
+function getModelFamilyToken(model: string): string {
+  const normalized = model.trim().toLowerCase();
+  if (!normalized) return "";
+  const slashPart = normalized.split("/").find(Boolean);
+  const firstPart = (slashPart ?? normalized).split(/[-_]/).find(Boolean);
+  return firstPart ?? "";
+}
+
+function resolveTranslationModelName(config: LLMConfig): string {
+  const requestedModel = typeof config.translationModel === "string" && config.translationModel.trim()
+    ? config.translationModel.trim()
+    : config.model.trim();
+
+  if (!requestedModel || !isThinkingModelName(requestedModel)) {
+    return requestedModel;
+  }
+
+  const models = Array.isArray(config.models)
+    ? config.models
+      .map((model) => (typeof model === "string" ? model.trim() : ""))
+      .filter(Boolean)
+    : [];
+  const familyToken = getModelFamilyToken(requestedModel);
+
+  const sameFamilyCandidate = models.find((model) => (
+    !isThinkingModelName(model) &&
+    familyToken &&
+    getModelFamilyToken(model) === familyToken
+  ));
+  if (sameFamilyCandidate) {
+    return sameFamilyCandidate;
+  }
+
+  const fallbackCandidate = models.find((model) => !isThinkingModelName(model));
+  return fallbackCandidate ?? requestedModel;
+}
+
+function getTranslationRequestConfig(config: LLMConfig): LLMConfig {
+  const resolvedModel = resolveTranslationModelName(config);
+  if (!resolvedModel) return config;
+
+  const models = Array.isArray(config.models) && config.models.length > 0
+    ? config.models
+    : [config.model];
+
+  return {
+    ...config,
+    model: resolvedModel,
+    models: models.includes(resolvedModel) ? models : [resolvedModel, ...models]
+  };
+}
+
+function getTranslationRequestBodyExtras(config: LLMConfig): Record<string, unknown> | undefined {
+  const model = config.model.trim();
+  if (/qwen/i.test(model)) {
+    return { enable_thinking: false };
+  }
+  if (/deepseek/i.test(model) || /^ds-v4-(?:flash|pro)$/i.test(model)) {
+    return { thinking: { type: "disabled" } };
+  }
+  return undefined;
+}
+
+function buildWordLookupPrompt(targetLanguage: string, text: string): string {
+  return [
+    `Analyze SOURCE_WORD and explain it for a learner in ${targetLanguage}.`,
+    "SOURCE_WORD is usually a single English word selected from a webpage.",
+    "Return strict JSON only with this shape:",
+    '{"translation":"简洁释义","pronunciation":"音标或读音","partOfSpeech":"词性"}',
+    "Keep translation concise and natural.",
+    "Use pronunciation as IPA when possible.",
+    "Use partOfSpeech such as n., v., adj., adv., prep., pron., etc.",
+    "If a field is unavailable, return an empty string for that field.",
+    "Do not include markdown fences, comments, or explanations.",
+    "SOURCE_WORD:",
+    "```text",
+    text,
+    "```"
+  ].join("\n\n");
+}
+
+function stripJsonFences(content: string): string {
+  return content
+    .trim()
+    .replace(/^```(?:json|text)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+}
+
+function parseWordLookupResponse(content: string): WordLookupDetails {
+  const trimmed = stripJsonFences(content);
+  let parsed: unknown;
+
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    throw new Error("Word lookup response is not valid JSON");
+  }
+
+  const record = typeof parsed === "object" && parsed !== null
+    ? parsed as Record<string, unknown>
+    : null;
+
+  const translation = typeof record?.translation === "string"
+    ? record.translation.trim()
+    : typeof record?.meaning === "string"
+      ? String(record.meaning).trim()
+      : "";
+  const pronunciation = typeof record?.pronunciation === "string"
+    ? record.pronunciation.trim()
+    : typeof record?.phonetic === "string"
+      ? String(record.phonetic).trim()
+      : "";
+  const partOfSpeech = typeof record?.partOfSpeech === "string"
+    ? record.partOfSpeech.trim()
+    : typeof record?.pos === "string"
+      ? String(record.pos).trim()
+      : "";
+
+  if (!translation) {
+    throw new Error("Word lookup response missing translation");
+  }
+
+  return {
+    translation,
+    pronunciation,
+    partOfSpeech
+  };
 }
 
 function parseTranslationResponse(content: string, expectedCount: number): string[] {
@@ -253,16 +411,18 @@ async function translateSegmentsWithCache(
 
   for (let start = 0; start < missingTexts.length; start += batchSize) {
     const batch = missingTexts.slice(start, start + batchSize);
+    const translationConfig = getTranslationRequestConfig({
+      ...config,
+      systemPrompt: [
+        "You are a professional translation engine for bilingual reading.",
+        "Translate accurately and naturally.",
+        "Preserve original meaning and paragraph boundaries.",
+        "Output strict JSON only."
+      ].join(" ")
+    });
     const translated = await invokeLLM({
-      config: {
-        ...config,
-        systemPrompt: [
-          "You are a professional translation engine for bilingual reading.",
-          "Translate accurately and naturally.",
-          "Preserve original meaning and paragraph boundaries.",
-          "Output strict JSON only."
-        ].join(" ")
-      },
+      config: translationConfig,
+      bodyExtras: getTranslationRequestBodyExtras(translationConfig),
       messages: [{ role: "user", content: buildTranslationPrompt(targetLanguage, batch) }]
     });
 
@@ -343,16 +503,18 @@ export function createBackgroundConnectHandler(storage: StorageLike, deps: Backg
           }
 
           let translatedText = "";
+          const translationConfig = getTranslationRequestConfig({
+            ...config,
+            systemPrompt: [
+              "You are a professional streaming translation engine for bilingual reading.",
+              "Translate accurately and naturally.",
+              "The user message always contains SOURCE_TEXT; translate it even when it is a single word or short phrase.",
+              "Output only the translation text itself, with no labels, source text, comments, or explanations."
+            ].join(" ")
+          });
           for await (const delta of invokeLLMStream({
-            config: {
-              ...config,
-              systemPrompt: [
-                "You are a professional streaming translation engine for bilingual reading.",
-                "Translate accurately and naturally.",
-                "The user message always contains SOURCE_TEXT; translate it even when it is a single word or short phrase.",
-                "Output only the translation text itself, with no labels, source text, comments, or explanations."
-              ].join(" ")
-            },
+            config: translationConfig,
+            bodyExtras: getTranslationRequestBodyExtras(translationConfig),
             messages: [{ role: "user", content: buildStreamingTranslationPrompt(targetLanguage, text) }]
           })) {
             if (disconnected) return;
@@ -2077,6 +2239,80 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
           sendResponse({ ok: true, data: { translations, targetLanguage } });
         } catch (error) {
           sendResponse({ ok: false, errors: [error instanceof Error ? error.message : "Translation failed"] });
+        }
+        return;
+      }
+
+      if (message.type === "LOOKUP_WORD_DETAILS") {
+        const payload = message.payload as { text?: unknown; targetLanguage?: unknown } | undefined;
+        const text = typeof payload?.text === "string" ? payload.text.trim() : "";
+        if (!text) {
+          sendResponse({ ok: false, errors: ["text is required"] });
+          return;
+        }
+
+        try {
+          const config = await repo.getConfig();
+          if (!config.baseUrl.trim() || !config.apiKey.trim()) {
+            sendResponse({ ok: false, errors: ["Word lookup requires a configured Base URL and API Key"] });
+            return;
+          }
+
+          const targetLanguage = typeof payload?.targetLanguage === "string" && payload.targetLanguage.trim()
+            ? payload.targetLanguage.trim()
+            : config.translationTargetLanguage.trim();
+          if (!targetLanguage) {
+            sendResponse({ ok: false, errors: ["targetLanguage is required"] });
+            return;
+          }
+
+          const cache = await getWordLookupCache(storage);
+          const cacheKey = buildWordLookupCacheKey(targetLanguage, text);
+          const cached = cache[cacheKey];
+          if (cached) {
+            sendResponse({
+              ok: true,
+              data: {
+                translation: cached.translation,
+                pronunciation: cached.pronunciation,
+                partOfSpeech: cached.partOfSpeech,
+                targetLanguage,
+                cached: true
+              }
+            });
+            return;
+          }
+
+          const translationConfig = getTranslationRequestConfig({
+            ...config,
+            systemPrompt: [
+              "You are a concise bilingual dictionary assistant.",
+              "For a single word, provide only the requested structured fields.",
+              "Output strict JSON only."
+            ].join(" ")
+          });
+          const raw = await invokeLLM({
+            config: translationConfig,
+            bodyExtras: getTranslationRequestBodyExtras(translationConfig),
+            messages: [{ role: "user", content: buildWordLookupPrompt(targetLanguage, text) }]
+          });
+
+          const details = parseWordLookupResponse(raw);
+          cache[cacheKey] = {
+            ...details,
+            updatedAt: Date.now()
+          };
+          await saveWordLookupCache(storage, cache);
+
+          sendResponse({
+            ok: true,
+            data: {
+              ...details,
+              targetLanguage
+            }
+          });
+        } catch (error) {
+          sendResponse({ ok: false, errors: [error instanceof Error ? error.message : "Word lookup failed"] });
         }
         return;
       }

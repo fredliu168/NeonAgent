@@ -85,20 +85,26 @@ function createProvider(meta: ApiProviderMeta, fallback: Partial<Pick<ApiProvide
     baseUrl: normalizeBaseUrl(meta.baseUrl),
     apiKey: sanitizeText(typeof fallback.apiKey === "string" ? fallback.apiKey : ""),
     model,
+    translationModel: "",
     models,
     builtIn
   };
 }
 
-function createCustomProvider(fallback: Partial<Pick<LLMConfig, "baseUrl" | "apiKey" | "model" | "models">> = {}): ApiProvider {
+function createCustomProvider(fallback: Partial<Pick<LLMConfig, "baseUrl" | "apiKey" | "model" | "translationModel" | "models">> = {}): ApiProvider {
   const model = sanitizeModel(typeof fallback.model === "string" ? fallback.model : DEFAULT_MODEL);
   const models = normalizeModelList(fallback.models, model);
+  const translationModel = typeof fallback.translationModel === "string" ? sanitizeText(fallback.translationModel) : "";
+  if (translationModel && !models.includes(translationModel)) {
+    models.push(translationModel);
+  }
   return {
     id: CUSTOM_API_PROVIDER_ID,
     name: "自定义",
     baseUrl: normalizeBaseUrl(typeof fallback.baseUrl === "string" ? fallback.baseUrl : ""),
     apiKey: sanitizeText(typeof fallback.apiKey === "string" ? fallback.apiKey : ""),
     model,
+    translationModel,
     models,
     builtIn: false
   };
@@ -140,11 +146,12 @@ export const BUILT_IN_API_PROVIDERS: ApiProvider[] = BUILT_IN_API_PROVIDER_META.
 
 export const CUSTOM_API_PROVIDER_ID = "custom";
 
-export function createDefaultApiProviders(fallback: Partial<Pick<LLMConfig, "baseUrl" | "apiKey" | "model" | "models">> = {}): ApiProvider[] {
+export function createDefaultApiProviders(fallback: Partial<Pick<LLMConfig, "baseUrl" | "apiKey" | "model" | "translationModel" | "models">> = {}): ApiProvider[] {
   const normalizedBaseUrl = normalizeBaseUrl(typeof fallback.baseUrl === "string" ? fallback.baseUrl : "");
   const model = sanitizeModel(typeof fallback.model === "string" ? fallback.model : DEFAULT_MODEL);
   const models = normalizeModelList(fallback.models, model);
   const apiKey = sanitizeText(typeof fallback.apiKey === "string" ? fallback.apiKey : "");
+  const translationModel = typeof fallback.translationModel === "string" ? sanitizeText(fallback.translationModel) : "";
   const matchesBuiltIn = BUILT_IN_API_PROVIDER_META.some(
     (provider) => normalizeBaseUrl(provider.baseUrl) === normalizedBaseUrl
   );
@@ -159,7 +166,10 @@ export function createDefaultApiProviders(fallback: Partial<Pick<LLMConfig, "bas
       baseUrl: matchesBuiltIn ? "" : normalizedBaseUrl,
       apiKey,
       model,
-      models: [...models],
+      translationModel,
+      models: translationModel && !models.includes(translationModel)
+        ? [...models, translationModel]
+        : [...models],
       builtIn: false
     }
   ];
@@ -186,6 +196,12 @@ function sanitizeApiProvider(provider: Partial<ApiProvider>, fallbackId: string,
     provider.models ?? fallback.models,
     model
   );
+  const translationModel = typeof provider.translationModel === "string"
+    ? sanitizeText(provider.translationModel)
+    : "";
+  if (translationModel && !models.includes(translationModel)) {
+    models.push(translationModel);
+  }
 
   if (!id) {
     return null;
@@ -197,12 +213,13 @@ function sanitizeApiProvider(provider: Partial<ApiProvider>, fallbackId: string,
     baseUrl,
     apiKey,
     model,
+    translationModel,
     models,
     builtIn: provider.builtIn === true
   };
 }
 
-function mergeApiProviders(incomingProviders: unknown, fallback: Partial<Pick<LLMConfig, "baseUrl" | "apiKey" | "model" | "models">> = {}): ApiProvider[] {
+function mergeApiProviders(incomingProviders: unknown, fallback: Partial<Pick<LLMConfig, "baseUrl" | "apiKey" | "model" | "translationModel" | "models">> = {}): ApiProvider[] {
   const list = Array.isArray(incomingProviders) ? incomingProviders : [];
   const incomingById = new Map<string, ApiProvider>();
   const customProviders = new Map<string, ApiProvider>();
@@ -214,6 +231,7 @@ function mergeApiProviders(incomingProviders: unknown, fallback: Partial<Pick<LL
   const fallbackCustom = {
     apiKey: fallbackBuiltIn.apiKey,
     model: fallbackBuiltIn.model,
+    translationModel: typeof fallback.translationModel === "string" ? sanitizeText(fallback.translationModel) : "",
     models: fallbackBuiltIn.models
   };
 
@@ -295,6 +313,10 @@ function sanitizeConfigModels(config: Pick<LLMConfig, "model"> & { models?: stri
   return { model, models };
 }
 
+function sanitizeOptionalModel(model: string | undefined): string {
+  return typeof model === "string" ? sanitizeText(model) : "";
+}
+
 function isWebSocketUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
@@ -320,6 +342,7 @@ export function migrateConfig(config: LLMConfig): LLMConfig {
   });
   next.model = modelState.model;
   next.models = modelState.models;
+  next.translationModel = sanitizeOptionalModel(config.translationModel);
 
   next.baseUrl = normalizeBaseUrl(next.baseUrl);
 
@@ -327,6 +350,7 @@ export function migrateConfig(config: LLMConfig): LLMConfig {
     baseUrl: next.baseUrl,
     apiKey: next.apiKey,
     model: next.model,
+    translationModel: next.translationModel,
     models: next.models
   });
 
@@ -340,8 +364,10 @@ export function migrateConfig(config: LLMConfig): LLMConfig {
     if (activeProvider.id === CUSTOM_API_PROVIDER_ID) {
       activeProvider.baseUrl = normalizeBaseUrl(next.baseUrl || activeProvider.baseUrl);
       activeProvider.apiKey = sanitizeText(next.apiKey || activeProvider.apiKey);
+      activeProvider.translationModel = sanitizeOptionalModel(next.translationModel || activeProvider.translationModel);
     } else {
       activeProvider.apiKey = sanitizeText(activeProvider.apiKey || next.apiKey);
+      activeProvider.translationModel = sanitizeOptionalModel(activeProvider.translationModel || next.translationModel);
     }
 
     const providerModelState = sanitizeConfigModels(activeProvider.id === CUSTOM_API_PROVIDER_ID
@@ -360,6 +386,7 @@ export function migrateConfig(config: LLMConfig): LLMConfig {
     next.baseUrl = normalizeBaseUrl(activeProvider.baseUrl);
     next.apiKey = activeProvider.apiKey;
     next.model = activeProvider.model;
+    next.translationModel = sanitizeOptionalModel(activeProvider.translationModel);
     next.models = [...activeProvider.models];
   }
 
@@ -433,6 +460,7 @@ export const DEFAULT_CONFIG: LLMConfig = {
   systemPrompt: "You are a helpful assistant.",
   translationEnabled: false,
   selectionTranslationEnabled: false,
+  translationModel: "",
   translationTargetLanguage: "中文",
   translationDisplayMode: "replace",
   translationStyleColor: "#0f172a",
@@ -491,6 +519,10 @@ export function validateConfig(input: LLMConfig): ValidationResult {
 
   if (typeof input.selectionTranslationEnabled !== "boolean") {
     errors.push("selectionTranslationEnabled must be boolean");
+  }
+
+  if (typeof input.translationModel !== "string") {
+    errors.push("translationModel must be string");
   }
 
   if (!input.translationTargetLanguage.trim()) {

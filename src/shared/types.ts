@@ -4,6 +4,7 @@ export interface ApiProvider {
   baseUrl: string;
   apiKey: string;
   model: string;
+  translationModel?: string;
   models: string[];
   builtIn?: boolean;
 }
@@ -19,6 +20,7 @@ export interface LLMConfig {
   systemPrompt: string;
   translationEnabled: boolean;
   selectionTranslationEnabled: boolean;
+  translationModel: string;
   translationTargetLanguage: string;
   translationDisplayMode: "replace" | "bilingual";
   translationStyleColor: string;

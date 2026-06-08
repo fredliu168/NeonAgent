@@ -39,6 +39,12 @@ type ExamAnswerMatch = {
   answerLabels?: string[];
 };
 
+type WordLookupDetails = {
+  translation: string;
+  pronunciation: string;
+  partOfSpeech: string;
+};
+
 type EventTargetLike = {
   addEventListener: (
     type: string,
@@ -388,6 +394,7 @@ let translationCounter = 0;
 let suppressTranslationObserver = false;
 let lastPageTranslationSignature = "";
 let pageTranslationInProgressSignature = "";
+let pendingOneOffTranslationRestore: TranslationSettings | null = null;
 let selectionTranslationCleanup: (() => void) | null = null;
 let selectionTranslationPopup: HTMLDivElement | null = null;
 let selectionTranslationRunId = 0;
@@ -1229,6 +1236,7 @@ function withSuppressedTranslationObserver(fn: () => void): void {
 
 function clearAllTranslations(): void {
   translationRunId += 1;
+  pendingOneOffTranslationRestore = null;
   if (translationTimer) {
     clearTimeout(translationTimer);
     translationTimer = null;
@@ -1251,6 +1259,17 @@ function clearAllTranslations(): void {
     node.removeAttribute(TRANSLATION_TEXT_ATTR);
   });
   lastPageTranslationSignature = "";
+  pageTranslationInProgressSignature = "";
+}
+
+function stopAutoPageTranslation(): void {
+  translationRunId += 1;
+  if (translationTimer) {
+    clearTimeout(translationTimer);
+    translationTimer = null;
+  }
+  translationObserver?.disconnect();
+  translationObserver = null;
   pageTranslationInProgressSignature = "";
 }
 
@@ -1582,6 +1601,88 @@ function finishSelectionTranslationPopup(popup: HTMLDivElement, text: string, re
   positionSelectionTranslationPopup(popup, rect, fallback);
 }
 
+function isSingleWordLookupCandidate(text: string): boolean {
+  const normalized = text.trim();
+  if (!normalized || normalized.length > 64 || /\s/.test(normalized)) {
+    return false;
+  }
+  return /^[\p{Script=Latin}][\p{Script=Latin}\d'-]*$/u.test(normalized);
+}
+
+async function requestWordLookupDetails(text: string): Promise<WordLookupDetails> {
+  const runtime = getChromeRuntime();
+  if (!runtime?.sendMessage) {
+    throw new Error("扩展运行时不可用，请刷新页面后重试");
+  }
+
+  const response = await runtime.sendMessage({
+    type: "LOOKUP_WORD_DETAILS",
+    payload: {
+      text,
+      targetLanguage: translationSettings.targetLanguage
+    }
+  }) as { ok?: boolean; data?: Partial<WordLookupDetails>; errors?: string[] };
+
+  if (!response?.ok || !response.data) {
+    const message = Array.isArray(response?.errors) ? response.errors.join(", ") : "Word lookup failed";
+    throw new Error(message);
+  }
+
+  return {
+    translation: typeof response.data.translation === "string" ? response.data.translation.trim() : "",
+    pronunciation: typeof response.data.pronunciation === "string" ? response.data.pronunciation.trim() : "",
+    partOfSpeech: typeof response.data.partOfSpeech === "string" ? response.data.partOfSpeech.trim() : ""
+  };
+}
+
+function createSelectionPopupLine(text: string, styles?: Partial<CSSStyleDeclaration>): HTMLDivElement {
+  const line = document.createElement("div");
+  line.textContent = text;
+  if (styles) {
+    Object.assign(line.style, styles);
+  }
+  return line;
+}
+
+function renderWordLookupPopup(
+  popup: HTMLDivElement,
+  sourceWord: string,
+  details: WordLookupDetails,
+  rect: DOMRect | null,
+  fallback?: { x: number; y: number }
+): void {
+  popup.textContent = "";
+
+  const meta = [details.pronunciation, details.partOfSpeech].filter(Boolean).join("  ");
+  const titleLine = document.createElement("div");
+  titleLine.style.fontWeight = "700";
+  titleLine.style.fontSize = `${Math.max(13, translationSettings.styleFontSize)}px`;
+  titleLine.style.lineHeight = "1.35";
+
+  const wordSpan = document.createElement("span");
+  wordSpan.textContent = sourceWord;
+  titleLine.appendChild(wordSpan);
+
+  if (meta) {
+    const metaSpan = document.createElement("span");
+    metaSpan.textContent = `  ${meta}`;
+    metaSpan.style.marginLeft = "6px";
+    metaSpan.style.opacity = "0.78";
+    metaSpan.style.fontWeight = "500";
+    metaSpan.style.fontSize = `${Math.max(11, translationSettings.styleFontSize - 1)}px`;
+    titleLine.appendChild(metaSpan);
+  }
+
+  popup.appendChild(titleLine);
+
+  popup.appendChild(createSelectionPopupLine(details.translation, {
+    marginTop: "8px",
+    fontWeight: translationSettings.styleBold ? "700" : "500"
+  }));
+
+  positionSelectionTranslationPopup(popup, rect, fallback);
+}
+
 function getChromeRuntime(): typeof chrome.runtime | null {
   if (typeof chrome === "undefined" || !chrome.runtime) {
     return null;
@@ -1844,23 +1945,77 @@ function getCurrentSelectionText(): { text: string; rect: DOMRect | null } {
   return { text, rect: rect.width || rect.height ? rect : null };
 }
 
-function shouldTranslateSelectionText(text: string): boolean {
-  return text.length > 0 && text.length <= 800;
+function isTextAlreadyInTargetLanguage(text: string, targetLanguage: string): boolean {
+  const normalizedTarget = targetLanguage.trim().toLowerCase();
+  if (!normalizedTarget) {
+    return false;
+  }
+
+  const hasHan = /[\p{Script=Han}]/u.test(text);
+  const hasKana = /[\p{Script=Hiragana}\p{Script=Katakana}]/u.test(text);
+  const hasHangul = /[\p{Script=Hangul}]/u.test(text);
+  const hasLatin = /[\p{Script=Latin}]/u.test(text);
+
+  if (/(?:中文|汉语|漢語|汉文|chinese|mandarin)/i.test(normalizedTarget)) {
+    return hasHan && !hasKana && !hasHangul && !hasLatin;
+  }
+  if (/(?:英文|英语|英語|english)/i.test(normalizedTarget)) {
+    return hasLatin && !hasHan && !hasKana && !hasHangul;
+  }
+  if (/(?:日文|日语|日語|日本語|japanese)/i.test(normalizedTarget)) {
+    return hasKana && !hasHangul && !hasLatin;
+  }
+  if (/(?:韩文|韓文|韩语|韓語|한국어|korean)/i.test(normalizedTarget)) {
+    return hasHangul && !hasHan && !hasKana && !hasLatin;
+  }
+
+  return false;
 }
 
-async function translateSelectionText(text: string, rect: DOMRect | null, fallback?: { x: number; y: number }): Promise<void> {
+function shouldTranslateSelectionText(text: string): boolean {
+  return text.length > 0 &&
+    text.length <= 800 &&
+    !isTextAlreadyInTargetLanguage(text, translationSettings.targetLanguage);
+}
+
+async function translateSelectionText(
+  text: string,
+  rect: DOMRect | null,
+  fallback?: { x: number; y: number },
+  options: { preferWordDetails?: boolean } = {}
+): Promise<void> {
   if (!translationSettings.selectionEnabled || !shouldTranslateSelectionText(text)) {
     return;
   }
 
-  const key = `${translationSettings.targetLanguage}::${text}`;
+  const useWordDetails = !!options.preferWordDetails && isSingleWordLookupCandidate(text);
+  const key = `${useWordDetails ? "word" : "text"}::${translationSettings.targetLanguage}::${text}`;
   if (key === lastSelectionTranslationKey && selectionTranslationPopup) {
     return;
   }
   lastSelectionTranslationKey = key;
 
   const runId = ++selectionTranslationRunId;
-  const popup = createSelectionTranslationPopup("翻译中...", rect, fallback);
+  const popup = createSelectionTranslationPopup(useWordDetails ? "查询中..." : "翻译中...", rect, fallback);
+
+  if (useWordDetails) {
+    try {
+      const details = await requestWordLookupDetails(text);
+      if (runId !== selectionTranslationRunId || !translationSettings.selectionEnabled) {
+        return;
+      }
+      if (details.translation) {
+        renderWordLookupPopup(popup, text, details, rect, fallback);
+        return;
+      }
+    } catch (wordLookupError) {
+      if (isExtensionContextInvalidated(wordLookupError)) {
+        stopSelectionTranslationSilently();
+        return;
+      }
+    }
+    popup.textContent = "翻译中...";
+  }
 
   try {
     let streamedText = "";
@@ -1905,11 +2060,14 @@ function enableSelectionTranslation(): void {
     return;
   }
 
-  const translateCurrentSelection = (event?: MouseEvent): void => {
+  const translateCurrentSelection = (
+    event?: MouseEvent,
+    options: { preferWordDetails?: boolean } = {}
+  ): void => {
     window.setTimeout(() => {
       const { text, rect } = getCurrentSelectionText();
       const fallback = event ? { x: event.pageX + 8, y: event.pageY + 8 } : undefined;
-      void translateSelectionText(text, rect, fallback);
+      void translateSelectionText(text, rect, fallback, options);
     }, 0);
   };
 
@@ -1917,7 +2075,7 @@ function enableSelectionTranslation(): void {
     if ((event.target as Element | null)?.closest?.(`[${SELECTION_TRANSLATION_POPUP_ATTR}]`)) {
       return;
     }
-    translateCurrentSelection(event);
+    translateCurrentSelection(event, { preferWordDetails: true });
   };
 
   const onMouseUp = (event: MouseEvent): void => {
@@ -2029,8 +2187,10 @@ async function runTranslationScan(): Promise<void> {
   const pending: Array<{ id: string; node: HTMLElement; text: string }> = [];
 
   for (const node of nodes) {
-    const id = ensureTranslationId(node);
-    activeIds.add(id);
+    const existingId = node.getAttribute(TRANSLATION_SOURCE_ATTR);
+    if (existingId) {
+      activeIds.add(existingId);
+    }
 
     const existingSourceText = node.getAttribute(TRANSLATION_TEXT_ATTR);
     if (existingSourceText && translationSettings.displayMode === "bilingual" && node.textContent !== existingSourceText) {
@@ -2043,6 +2203,18 @@ async function runTranslationScan(): Promise<void> {
     if (!text) {
       continue;
     }
+    if (!existingSourceText && isTextAlreadyInTargetLanguage(text, translationSettings.targetLanguage)) {
+      if (existingId) {
+        removeTranslationRecord(existingId);
+        node.removeAttribute(TRANSLATION_SOURCE_ATTR);
+        node.removeAttribute(TRANSLATION_TEXT_ATTR);
+        activeIds.delete(existingId);
+      }
+      continue;
+    }
+
+    const id = existingId || ensureTranslationId(node);
+    activeIds.add(id);
 
     const record = ensureTranslationRecord(
       node,
@@ -2069,13 +2241,12 @@ async function runTranslationScan(): Promise<void> {
     }
   }
 
-  for (let start = 0; start < pending.length; start += translationSettings.batchSize) {
+  for (const item of pending) {
     if (runId !== translationRunId || !translationSettings.enabled) {
       return;
     }
 
-    const batch = pending.slice(start, start + translationSettings.batchSize);
-    await Promise.all(batch.map((item) => translateParagraphIntoRecord(item, runId)));
+    await translateParagraphIntoRecord(item, runId);
     if (runId !== translationRunId || !translationSettings.enabled) {
       return;
     }
@@ -2084,6 +2255,12 @@ async function runTranslationScan(): Promise<void> {
   if (runSignature && runId === translationRunId && translationSettings.enabled) {
     lastPageTranslationSignature = runSignature;
     pageTranslationInProgressSignature = "";
+  }
+
+  if (runId === translationRunId && pendingOneOffTranslationRestore) {
+    const restoreSettings = pendingOneOffTranslationRestore;
+    pendingOneOffTranslationRestore = null;
+    applyTranslationSettings(restoreSettings, { clearExistingWhenDisabled: false });
   }
 }
 
@@ -2136,12 +2313,19 @@ function ensureTranslationObserver(): void {
   });
 }
 
-function applyTranslationSettings(next: TranslationSettings): void {
+function applyTranslationSettings(
+  next: TranslationSettings,
+  options: { clearExistingWhenDisabled?: boolean } = {}
+): void {
   translationSettings = next;
   syncSelectionTranslation();
 
   if (!translationSettings.enabled) {
-    clearAllTranslations();
+    if (options.clearExistingWhenDisabled ?? true) {
+      clearAllTranslations();
+    } else {
+      stopAutoPageTranslation();
+    }
     return;
   }
 
@@ -2188,6 +2372,7 @@ function isPageAlreadyTranslated(settings: TranslationSettings): boolean {
 }
 
 function translateCurrentPageOnce(next: TranslationSettings): { skipped: boolean; count: number } {
+  const restoreSettings = translationSettings.enabled ? null : { ...translationSettings };
   const settings = {
     ...next,
     enabled: true
@@ -2196,6 +2381,7 @@ function translateCurrentPageOnce(next: TranslationSettings): { skipped: boolean
     return { skipped: true, count: translationRecords.size };
   }
 
+  pendingOneOffTranslationRestore = restoreSettings;
   pageTranslationInProgressSignature = buildPageTranslationSignature(settings);
   applyTranslationSettings(settings);
   return { skipped: false, count: translationRecords.size };

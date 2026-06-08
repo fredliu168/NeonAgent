@@ -40,6 +40,7 @@ const thinkingFormatInput = byId<HTMLSelectElement>("thinkingFormat");
 const apiKeyInput = byId<HTMLInputElement>("apiKey");
 const apiKeyVisibilityBtn = byId<HTMLButtonElement>("toggleApiKeyVisibility");
 const modelInput = byId<HTMLSelectElement>("model");
+const translationModelInput = byId<HTMLSelectElement>("translationModel");
 const newModelInput = byId<HTMLInputElement>("newModel");
 const addModelBtn = byId<HTMLButtonElement>("addModel");
 const removeModelBtn = byId<HTMLButtonElement>("removeModel");
@@ -125,6 +126,7 @@ interface ApiProviderInlineDraft {
   baseUrl: string;
   apiKey: string;
   model: string;
+  translationModel: string;
   modelsText: string;
 }
 
@@ -140,6 +142,9 @@ function sanitizeApiProviderForUi(provider: ApiProvider, fallbackId: string): Ap
   const rawApiKey = typeof provider.apiKey === "string" ? provider.apiKey : "";
   const rawModel = typeof provider.model === "string" ? provider.model : "";
   const fallbackModel = sanitizeModel(rawModel) || DEFAULT_CONFIG.model;
+  const translationModel = typeof provider.translationModel === "string"
+    ? sanitizeModel(provider.translationModel)
+    : "";
   const models = Array.isArray(provider.models) && provider.models.length > 0
     ? provider.models
       .filter((item): item is string => typeof item === "string")
@@ -147,6 +152,9 @@ function sanitizeApiProviderForUi(provider: ApiProvider, fallbackId: string): Ap
       .filter(Boolean)
     : [fallbackModel];
   const normalizedModels = models.includes(fallbackModel) ? models : [fallbackModel, ...models];
+  if (translationModel && !normalizedModels.includes(translationModel)) {
+    normalizedModels.push(translationModel);
+  }
 
   return {
     id: rawId.trim() || fallbackId,
@@ -154,6 +162,7 @@ function sanitizeApiProviderForUi(provider: ApiProvider, fallbackId: string): Ap
     baseUrl: rawBaseUrl.trim(),
     apiKey: rawApiKey,
     model: fallbackModel,
+    translationModel,
     models: normalizedModels,
     builtIn: provider.builtIn === true
   };
@@ -292,6 +301,7 @@ function findTemplateProviderForEdit(sourceProvider: ApiProvider | undefined): A
   if (matchingBuiltIn) {
     matchingBuiltIn.apiKey = sourceProvider.apiKey;
     matchingBuiltIn.model = sourceProvider.model;
+    matchingBuiltIn.translationModel = sourceProvider.translationModel ?? "";
     matchingBuiltIn.models = [...sourceProvider.models];
     return matchingBuiltIn;
   }
@@ -301,6 +311,7 @@ function findTemplateProviderForEdit(sourceProvider: ApiProvider | undefined): A
     customTemplate.baseUrl = sourceProvider.baseUrl;
     customTemplate.apiKey = sourceProvider.apiKey;
     customTemplate.model = sourceProvider.model;
+    customTemplate.translationModel = sourceProvider.translationModel ?? "";
     customTemplate.models = [...sourceProvider.models];
     return customTemplate;
   }
@@ -352,6 +363,7 @@ function createApiProviderInlineDraft(provider: ApiProvider): ApiProviderInlineD
     baseUrl: provider.baseUrl,
     apiKey: provider.apiKey,
     model: provider.model,
+    translationModel: provider.translationModel ?? "",
     modelsText: provider.models.join("\n")
   };
 }
@@ -401,6 +413,7 @@ function buildApiProviderFromInlineDraft(provider: ApiProvider, draft: ApiProvid
   const name = draft.name.trim();
   const baseUrl = draft.baseUrl.trim();
   const model = draft.model.trim() || DEFAULT_CONFIG.model;
+  const translationModel = draft.translationModel.trim();
 
   if (!name) {
     errors.push("供应商名称不能为空");
@@ -416,7 +429,11 @@ function buildApiProviderFromInlineDraft(provider: ApiProvider, draft: ApiProvid
       baseUrl: normalizeBaseUrl(baseUrl || provider.baseUrl),
       apiKey: draft.apiKey,
       model,
-      models: parseApiProviderModelsDraft(draft.modelsText, model)
+      translationModel,
+      models: parseApiProviderModelsDraft(
+        `${draft.modelsText}${translationModel ? `\n${translationModel}` : ""}`,
+        model
+      )
     },
     errors
   };
@@ -485,6 +502,14 @@ function renderApiProviderInlineEditor(provider: ApiProvider): HTMLElement {
     updateApiProviderInlineDraft({ model: modelInput.value });
   });
 
+  const translationModelInput = document.createElement("input");
+  translationModelInput.type = "text";
+  translationModelInput.value = draft.translationModel;
+  translationModelInput.placeholder = "留空则跟随主模型";
+  translationModelInput.addEventListener("input", () => {
+    updateApiProviderInlineDraft({ translationModel: translationModelInput.value });
+  });
+
   const modelsTextarea = document.createElement("textarea");
   modelsTextarea.value = draft.modelsText;
   modelsTextarea.placeholder = "一行一个模型，或用逗号分隔";
@@ -496,6 +521,7 @@ function renderApiProviderInlineEditor(provider: ApiProvider): HTMLElement {
   editor.appendChild(createApiProviderInlineField("Base URL", baseUrlInput, "保留完整根地址即可，保存时会自动规范化。"));
   editor.appendChild(createApiProviderInlineField("API Key", apiKeyInput));
   editor.appendChild(createApiProviderInlineField("默认 Model", modelInput));
+  editor.appendChild(createApiProviderInlineField("翻译 Model", translationModelInput, "留空时默认跟随主模型。"));
   editor.appendChild(createApiProviderInlineField("可用模型", modelsTextarea, "一行一个模型名，或用逗号分隔。保存时会自动去重并保留默认模型。"));
 
   const footer = document.createElement("div");
@@ -643,12 +669,17 @@ function createApiProviderActionButton(
 
 function buildConfigForProvider(provider: ApiProvider, baseConfig = toConfig()): LLMConfig {
   const model = provider.model.replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, "") || DEFAULT_CONFIG.model;
+  const translationModel = (provider.translationModel ?? "").replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, "");
   return {
     ...baseConfig,
     baseUrl: normalizeBaseUrl(provider.baseUrl),
     apiKey: provider.apiKey.trim(),
     model,
-    models: normalizeModelList(provider.models, model),
+    translationModel,
+    models: normalizeModelList(
+      [...provider.models, ...(translationModel ? [translationModel] : [])],
+      model
+    ),
     activeApiProviderId: provider.id,
     apiProviders: cloneApiProviders(apiProviders)
   };
@@ -762,6 +793,7 @@ function renderApiProviderList(): void {
       <div><strong>Base URL：</strong>${provider.baseUrl || "未设置"}</div>
       <div><strong>API Key：</strong>${maskApiKey(provider.apiKey)}</div>
       <div><strong>Model：</strong>${provider.model || "未设置"}</div>
+      <div><strong>翻译 Model：</strong>${provider.translationModel?.trim() || "跟随主模型"}</div>
       <div><strong>模型数量：</strong>${provider.models.length}</div>
     `;
 
@@ -803,7 +835,11 @@ function syncFormProviderFromForm(): ApiProvider | undefined {
 
   provider.apiKey = apiKeyInput.value;
   provider.model = modelInput.value.replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, "") || provider.model || DEFAULT_CONFIG.model;
+  provider.translationModel = translationModelInput.value.replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, "");
   provider.models = normalizeModelList(currentModels, provider.model);
+  if (provider.translationModel && !provider.models.includes(provider.translationModel)) {
+    provider.models.push(provider.translationModel);
+  }
   refreshApiProviderListIfVisible();
   return provider;
 }
@@ -825,8 +861,14 @@ function applyApiProviderToForm(provider: ApiProvider | undefined, options: { se
     ? `${nextProvider.name} 是预设供应商，Base URL 已固定`
     : "可编辑当前供应商的 Base URL";
 
-  currentModels = normalizeModelList([...nextProvider.models], nextProvider.model);
-  renderModelSelect(nextProvider.model, nextProvider.model, nextProvider.model);
+  currentModels = normalizeModelList(
+    [
+      ...nextProvider.models,
+      ...(nextProvider.translationModel ? [nextProvider.translationModel] : [])
+    ],
+    nextProvider.model
+  );
+  renderModelSelect(nextProvider.model, nextProvider.model, nextProvider.model, nextProvider.translationModel ?? "");
   renderApiProviderTabs();
   renderApiProviderList();
 }
@@ -905,6 +947,28 @@ function syncActiveApiProviderModels(selectedModel = modelInput.value): void {
 
   provider.model = selectedModel.replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, "") || DEFAULT_CONFIG.model;
   provider.models = normalizeModelList(currentModels, provider.model);
+  if (provider.translationModel && !provider.models.includes(provider.translationModel)) {
+    provider.translationModel = "";
+    translationModelInput.value = "";
+  }
+  refreshApiProviderListIfVisible();
+}
+
+function syncActiveApiProviderTranslationModel(selectedTranslationModel = translationModelInput.value): void {
+  const provider = getFormApiProvider();
+  if (!provider) {
+    return;
+  }
+
+  provider.translationModel = selectedTranslationModel.replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, "");
+  if (provider.translationModel) {
+    if (!currentModels.includes(provider.translationModel)) {
+      currentModels.push(provider.translationModel);
+    }
+    if (!provider.models.includes(provider.translationModel)) {
+      provider.models.push(provider.translationModel);
+    }
+  }
   refreshApiProviderListIfVisible();
 }
 
@@ -929,6 +993,7 @@ async function promptAndAddApiProvider(): Promise<void> {
     baseUrl: baseUrl.trim(),
     apiKey: "",
     model: DEFAULT_CONFIG.model,
+    translationModel: "",
     models: [DEFAULT_CONFIG.model],
     builtIn: false
   };
@@ -951,6 +1016,7 @@ function setApiProvidersFromConfig(config: LLMConfig): void {
         baseUrl: config.baseUrl,
         apiKey: config.apiKey,
         model: config.model,
+        translationModel: config.translationModel,
         models: config.models
       });
   apiProviders = normalizeLoadedApiProvidersForUi(
@@ -1433,12 +1499,21 @@ function toConfig(): LLMConfig {
   syncFormProviderFromForm();
   const activeProvider = getActiveApiProvider() ?? getFormApiProvider();
   const nextProviders = cloneApiProviders(apiProviders);
+  const resolvedModel = (activeProvider?.model ?? modelInput.value).replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, "");
+  const resolvedTranslationModel = (activeProvider?.translationModel ?? translationModelInput.value).replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, "");
 
   return {
     baseUrl: normalizeBaseUrl(activeProvider?.baseUrl ?? baseUrlInput.value.trim()),
     apiKey: (activeProvider?.apiKey ?? apiKeyInput.value).trim(),
-    model: (activeProvider?.model ?? modelInput.value).replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, ""),
-    models: normalizeModelList(activeProvider?.models ?? currentModels, activeProvider?.model ?? modelInput.value),
+    model: resolvedModel || DEFAULT_CONFIG.model,
+    translationModel: resolvedTranslationModel,
+    models: normalizeModelList(
+      [
+        ...(activeProvider?.models ?? currentModels),
+        ...(resolvedTranslationModel ? [resolvedTranslationModel] : [])
+      ],
+      activeProvider?.model ?? modelInput.value
+    ),
     temperature: DEFAULT_CONFIG.temperature,
     maxTokens: DEFAULT_CONFIG.maxTokens,
     agentMaxTokens: parseInt(agentMaxTokensInput.value, 10) || DEFAULT_CONFIG.agentMaxTokens,
@@ -1483,12 +1558,25 @@ function toAgentConfig(): LLMConfig {
   };
 }
 
-function renderModelSelect(selectedSettings?: string, selectedChat?: string, selectedAgent?: string): void {
+function renderModelSelect(
+  selectedSettings?: string,
+  selectedChat?: string,
+  selectedAgent?: string,
+  selectedTranslation?: string
+): void {
   const previousChat = selectedChat ?? chatModelInput.value;
   const previousAgent = selectedAgent ?? agentModelInput.value;
+  const previousTranslation = selectedTranslation ?? translationModelInput.value;
   modelInput.innerHTML = "";
   chatModelInput.innerHTML = "";
   agentModelInput.innerHTML = "";
+  translationModelInput.innerHTML = "";
+
+  const followMainOpt = document.createElement("option");
+  followMainOpt.value = "";
+  followMainOpt.textContent = "跟随主模型（默认）";
+  translationModelInput.appendChild(followMainOpt);
+
   for (const m of currentModels) {
     const settingsOpt = document.createElement("option");
     settingsOpt.value = m;
@@ -1504,6 +1592,11 @@ function renderModelSelect(selectedSettings?: string, selectedChat?: string, sel
     agentOpt.value = m;
     agentOpt.textContent = m;
     agentModelInput.appendChild(agentOpt);
+
+    const translationOpt = document.createElement("option");
+    translationOpt.value = m;
+    translationOpt.textContent = m;
+    translationModelInput.appendChild(translationOpt);
   }
 
   if (selectedSettings && currentModels.includes(selectedSettings)) {
@@ -1526,6 +1619,12 @@ function renderModelSelect(selectedSettings?: string, selectedChat?: string, sel
     agentModelInput.value = selectedSettings;
   } else if (currentModels.length > 0) {
     agentModelInput.value = currentModels[0];
+  }
+
+  if (previousTranslation && currentModels.includes(previousTranslation)) {
+    translationModelInput.value = previousTranslation;
+  } else {
+    translationModelInput.value = "";
   }
 }
 
@@ -3600,6 +3699,10 @@ modelInput.addEventListener("change", () => {
   syncActiveApiProviderModels(modelInput.value);
 });
 
+translationModelInput.addEventListener("change", () => {
+  syncActiveApiProviderTranslationModel(translationModelInput.value);
+});
+
 refreshLocalCommandStatusBtn.addEventListener("click", () => {
   void refreshLocalCommandStatus();
 });
@@ -3629,7 +3732,7 @@ addModelBtn.addEventListener("click", () => {
   }
   currentModels.push(name);
   newModelInput.value = "";
-  renderModelSelect(name, name, name);
+  renderModelSelect(name, name, name, translationModelInput.value);
   syncActiveApiProviderModels(name);
 });
 
@@ -3646,7 +3749,8 @@ removeModelBtn.addEventListener("click", () => {
   renderModelSelect(
     undefined,
     selectedChatModel === selected ? undefined : selectedChatModel,
-    selectedAgentModel === selected ? undefined : selectedAgentModel
+    selectedAgentModel === selected ? undefined : selectedAgentModel,
+    translationModelInput.value === selected ? "" : translationModelInput.value
   );
   syncActiveApiProviderModels(modelInput.value);
 });
