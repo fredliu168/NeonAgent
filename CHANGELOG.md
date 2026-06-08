@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is loosely based on Keep a Changelog, with versions tracked alongside Git tags such as `v0.1.2`.
 
+## [0.1.8] - 2026-06-08
+
+### Added
+- Added a chat-side `Thinking` toggle in the conversation composer, with local persistence across side-panel sessions.
+- Added support for disabling thinking on `kimi-k2.5` and `kimi-k2.6` via `thinking: { "type": "disabled" }`.
+
+### Changed
+- Updated exam-answer requests so they no longer send prior chat history or page context.
+- Updated exam-answer prompting so the answer-format instructions are injected as a temporary `systemPrompt`, while the user message only contains the current questions.
+- Updated the exam quick-action button to use a compact lightning icon with gray default and highlighted hover states.
+- Updated README with the v0.1.8 chat thinking and exam-mode behavior summary.
+
 ## [0.1.7] - 2026-06-08
 
 ### Added

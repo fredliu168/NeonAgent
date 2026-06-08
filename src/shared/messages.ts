@@ -10,13 +10,15 @@ export function createLLMRequestMessage(input: {
   config: LLMConfig;
   messages: ChatMessage[];
   pageContext?: string;
+  thinkingEnabled?: boolean;
 }): LLMRequestPayload {
   return {
     type: "LLM_REQUEST",
     payload: {
       config: input.config,
       messages: input.messages,
-      pageContext: input.pageContext
+      pageContext: input.pageContext,
+      thinkingEnabled: input.thinkingEnabled
     }
   };
 }
@@ -26,6 +28,7 @@ export function createLLMStreamRequestMessage(input: {
   config: LLMConfig;
   messages: ChatMessage[];
   pageContext?: string;
+  thinkingEnabled?: boolean;
 }): LLMStreamRequestPayload {
   return {
     type: "LLM_STREAM_REQUEST",
@@ -33,7 +36,8 @@ export function createLLMStreamRequestMessage(input: {
       requestId: input.requestId,
       config: input.config,
       messages: input.messages,
-      pageContext: input.pageContext
+      pageContext: input.pageContext,
+      thinkingEnabled: input.thinkingEnabled
     }
   };
 }

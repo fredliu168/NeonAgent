@@ -277,10 +277,25 @@ function getTranslationRequestBodyExtras(config: LLMConfig): Record<string, unkn
   if (/qwen/i.test(model)) {
     return { enable_thinking: false };
   }
-  if (/deepseek/i.test(model) || /^ds-v4-(?:flash|pro)$/i.test(model)) {
+  if (
+    /deepseek/i.test(model) ||
+    /^ds-v4-(?:flash|pro)$/i.test(model) ||
+    /^kimi-k2\.(?:5|6)$/i.test(model)
+  ) {
     return { thinking: { type: "disabled" } };
   }
   return undefined;
+}
+
+function getChatThinkingRequestBodyExtras(
+  config: LLMConfig,
+  thinkingEnabled: boolean | undefined
+): Record<string, unknown> | undefined {
+  if (thinkingEnabled !== false) {
+    return undefined;
+  }
+
+  return getTranslationRequestBodyExtras(config);
 }
 
 function buildWordLookupPrompt(targetLanguage: string, text: string): string {
@@ -2346,6 +2361,10 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
             config: message.payload.config,
             messages: message.payload.messages,
             pageContext: message.payload.pageContext,
+            bodyExtras: getChatThinkingRequestBodyExtras(
+              message.payload.config,
+              message.payload.thinkingEnabled
+            ),
             signal: controller.signal
           })) {
             emitStreamEvent({

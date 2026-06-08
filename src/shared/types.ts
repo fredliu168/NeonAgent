@@ -103,6 +103,7 @@ export interface LLMRequestPayload {
     config: LLMConfig;
     messages: ChatMessage[];
     pageContext?: string;
+    thinkingEnabled?: boolean;
   };
 }
 
@@ -113,6 +114,7 @@ export interface LLMStreamRequestPayload {
     config: LLMConfig;
     messages: ChatMessage[];
     pageContext?: string;
+    thinkingEnabled?: boolean;
   };
 }
 

@@ -655,15 +655,31 @@
 
       .chat-composer .btn-accent {
         background: transparent;
-        color: #d4d4d4;
+        color: #6b7280;
         border: none;
         padding: 7px 12px;
         font-weight: 500;
+        font-size: 15px;
         box-shadow: none;
+        transition: color .15s ease, background .15s ease;
       }
 
       .chat-composer .btn-accent:hover {
+        color: #f8fafc;
         background: #353535;
+      }
+
+      #askAndAutoFill {
+        color: #6b7280;
+      }
+
+      #askAndAutoFill:hover {
+        color: #f8fafc;
+      }
+
+      .solve-icon {
+        color: inherit;
+        font-style: normal;
       }
 
       .chat-composer-model {
@@ -695,6 +711,61 @@
 
       .chat-composer .btn-secondary:hover {
         background: #f3f4f6;
+      }
+
+      .chat-thinking-toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        border: none;
+        background: transparent;
+        color: #94a3b8;
+        padding: 4px 2px;
+        font-size: 11px;
+        cursor: pointer;
+        transition: color .15s ease;
+      }
+
+      .chat-thinking-toggle:hover {
+        color: #e2e8f0;
+      }
+
+      .chat-thinking-toggle.is-on {
+        color: #d4d4d4;
+      }
+
+      .chat-thinking-toggle-track {
+        position: relative;
+        width: 26px;
+        height: 15px;
+        border-radius: 999px;
+        background: #475569;
+        transition: background .15s ease;
+        flex-shrink: 0;
+      }
+
+      .chat-thinking-toggle.is-on .chat-thinking-toggle-track {
+        background: #0f766e;
+      }
+
+      .chat-thinking-toggle-thumb {
+        position: absolute;
+        top: 2px;
+        left: 2px;
+        width: 11px;
+        height: 11px;
+        border-radius: 999px;
+        background: #ffffff;
+        transition: transform .15s ease;
+      }
+
+      .chat-thinking-toggle.is-on .chat-thinking-toggle-thumb {
+        transform: translateX(11px);
+      }
+
+      .chat-thinking-toggle-label {
+        line-height: 1;
+        white-space: nowrap;
       }
 
       .tool-icon-btn {
@@ -730,6 +801,30 @@
 
       .chat-send-btn:hover {
         background: #efefef;
+      }
+
+      .context-meter {
+        --progress: 0;
+        --meter-color: #94a3b8;
+        position: relative;
+        width: 16px;
+        height: 16px;
+        min-width: 16px;
+        min-height: 16px;
+        border-radius: 9999px;
+        background:
+          conic-gradient(var(--meter-color) calc(var(--progress) * 1turn), rgba(148, 163, 184, 0.18) 0),
+          radial-gradient(circle at center, #ffffff 62%, transparent 63%);
+        box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.18);
+        flex-shrink: 0;
+      }
+
+      .context-meter::after {
+        content: "";
+        position: absolute;
+        inset: 4px;
+        border-radius: 9999px;
+        background: #ffffff;
       }
 
       /* =========== Buttons =========== */
@@ -1403,10 +1498,17 @@
           <textarea id="chatInput" class="chat-composer-input" placeholder="输入消息..." rows="1"></textarea>
           <div class="chat-composer-footer">
             <div class="chat-composer-left">
-              <button id="askAndAutoFill" class="btn-accent">解题</button>
+              <button id="askAndAutoFill" class="btn-accent" title="解题" aria-label="解题"><span class="solve-icon" aria-hidden="true">⚡︎</span></button>
+              <button id="chatThinkingToggle" type="button" class="chat-thinking-toggle is-on" title="Thinking 已开启" aria-label="切换 Thinking 模式" aria-pressed="true">
+                <span class="chat-thinking-toggle-track" aria-hidden="true">
+                  <span class="chat-thinking-toggle-thumb"></span>
+                </span>
+                <span class="chat-thinking-toggle-label">Thinking</span>
+              </button>
             </div>
             <div class="chat-composer-right">
               <select id="chatModel" class="chat-composer-model" title="选择对话模型"></select>
+              <div id="chatContextMeter" class="context-meter" title="上下文占用约 0%"></div>
               <button id="chatAction" class="btn-primary chat-send-btn" title="发送">↑</button>
             </div>
           </div>
@@ -1439,6 +1541,7 @@
             </div>
             <div class="chat-composer-right">
               <select id="agentModel" class="chat-composer-model" title="选择智能体模型"></select>
+              <div id="agentContextMeter" class="context-meter" title="上下文占用约 0%"></div>
               <button id="agentAction" class="btn-primary chat-send-btn" title="发送">↑</button>
             </div>
           </div>

@@ -64,6 +64,13 @@ export function isRuntimeMessage(value: unknown): value is RuntimeMessage {
       return false;
     }
 
+    if (
+      typeof value.payload.thinkingEnabled !== "undefined" &&
+      typeof value.payload.thinkingEnabled !== "boolean"
+    ) {
+      return false;
+    }
+
     return true;
   }
 
@@ -91,6 +98,13 @@ export function isRuntimeMessage(value: unknown): value is RuntimeMessage {
     if (
       typeof value.payload.pageContext !== "undefined" &&
       typeof value.payload.pageContext !== "string"
+    ) {
+      return false;
+    }
+
+    if (
+      typeof value.payload.thinkingEnabled !== "undefined" &&
+      typeof value.payload.thinkingEnabled !== "boolean"
     ) {
       return false;
     }

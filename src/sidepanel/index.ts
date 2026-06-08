@@ -80,6 +80,8 @@ const injectionNoticeEl = byId<HTMLDivElement>("injectionNotice");
 const contextEl = byId<HTMLPreElement>("context");
 const chatModelInput = byId<HTMLSelectElement>("chatModel");
 const chatInput = byId<HTMLTextAreaElement>("chatInput");
+const chatThinkingToggleBtn = byId<HTMLButtonElement>("chatThinkingToggle");
+const chatContextMeterEl = byId<HTMLDivElement>("chatContextMeter");
 const chatActionBtn = byId<HTMLButtonElement>("chatAction");
 const chatStatusEl = byId<HTMLDivElement>("chatStatus");
 const chatMessagesEl = byId<HTMLDivElement>("chatMessages");
@@ -94,6 +96,7 @@ const agentMessagesEl = byId<HTMLDivElement>("agentMessages");
 const agentStatusEl = byId<HTMLDivElement>("agentStatus");
 const agentInput = byId<HTMLTextAreaElement>("agentInput");
 const agentModelInput = byId<HTMLSelectElement>("agentModel");
+const agentContextMeterEl = byId<HTMLDivElement>("agentContextMeter");
 const agentActionBtn = byId<HTMLButtonElement>("agentAction");
 const toggleMemoriesBtn = byId<HTMLButtonElement>("toggleMemories");
 const toggleSkillsBtn = byId<HTMLButtonElement>("toggleSkills");
@@ -112,6 +115,7 @@ const tasksListEl = byId<HTMLDivElement>("tasksList");
 let chatState = createInitialChatState();
 let activeStreamRequestId: string | null = null;
 const streamCompletionResolvers = new Map<string, (ok: boolean) => void>();
+const streamThinkingEnabledByRequestId = new Map<string, boolean>();
 let chatSessions: ChatSession[] = [];
 let activeSessionId: string | null = null;
 let latestExamQuestions: ExamQuestion[] = [];
@@ -134,6 +138,10 @@ interface ApiProviderInlineDraft {
 let activeApiProviderInlineEditId: string | null = null;
 let activeApiProviderInlineDraft: ApiProviderInlineDraft | null = null;
 const CONFIGURED_API_PROVIDER_ID_PREFIX = "configured:";
+const DEFAULT_CHAT_CONTEXT_BUDGET = 16000;
+const DEFAULT_AGENT_CONTEXT_BUDGET = 32000;
+const CHAT_THINKING_STORAGE_KEY = "neonagent.chatThinkingEnabled";
+let chatThinkingEnabled = true;
 
 function sanitizeApiProviderForUi(provider: ApiProvider, fallbackId: string): ApiProvider {
   const sanitizeModel = (value: string): string => value.replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, "");
@@ -1255,6 +1263,46 @@ function updateChatActionButton(): void {
   chatActionBtn.setAttribute("aria-label", isPending ? "停止" : "发送");
 }
 
+function loadStoredChatThinkingEnabled(): boolean {
+  try {
+    const value = window.localStorage.getItem(CHAT_THINKING_STORAGE_KEY);
+    if (value === "false") {
+      return false;
+    }
+    if (value === "true") {
+      return true;
+    }
+  } catch {
+    // ignored
+  }
+
+  return true;
+}
+
+function persistChatThinkingEnabled(): void {
+  try {
+    window.localStorage.setItem(CHAT_THINKING_STORAGE_KEY, String(chatThinkingEnabled));
+  } catch {
+    // ignored
+  }
+}
+
+function renderChatThinkingToggle(): void {
+  chatThinkingToggleBtn.classList.toggle("is-on", chatThinkingEnabled);
+  chatThinkingToggleBtn.setAttribute("aria-pressed", String(chatThinkingEnabled));
+  chatThinkingToggleBtn.title = chatThinkingEnabled ? "Thinking 已开启" : "Thinking 已关闭";
+  chatThinkingToggleBtn.setAttribute(
+    "aria-label",
+    chatThinkingEnabled ? "关闭 Thinking 模式" : "开启 Thinking 模式"
+  );
+}
+
+function setChatThinkingEnabled(enabled: boolean): void {
+  chatThinkingEnabled = enabled;
+  persistChatThinkingEnabled();
+  renderChatThinkingToggle();
+}
+
 function finalizeChatStreamUi(): void {
   updateChatActionButton();
 }
@@ -1274,6 +1322,7 @@ function renderChatFull(): void {
   chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
   chatStatusEl.textContent = chatState.pending ? "AI 思考中..." : "";
   updateChatActionButton();
+  updateChatContextMeter();
 }
 
 function appendChatMessageDOM(msg: { role: string; content: string; reasoning_content?: string }, isLast: boolean): void {
@@ -1386,10 +1435,91 @@ function renderChat(): void {
   chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
   chatStatusEl.textContent = chatState.pending ? "AI 思考中..." : "";
   updateChatActionButton();
+  updateChatContextMeter();
 }
 
 function setExamStatus(text: string): void {
   examStatusEl.textContent = text;
+}
+
+function isComposingEnter(event: KeyboardEvent): boolean {
+  return event.isComposing || event.keyCode === 229;
+}
+
+function estimateTokenUsage(text: string): number {
+  let tokens = 0;
+
+  for (const char of text) {
+    if (/\s/u.test(char)) {
+      tokens += 0.15;
+      continue;
+    }
+    if (/[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]/u.test(char)) {
+      tokens += 1;
+      continue;
+    }
+    if (/[A-Za-z]/u.test(char)) {
+      tokens += 0.25;
+      continue;
+    }
+    if (/[0-9]/u.test(char)) {
+      tokens += 0.3;
+      continue;
+    }
+    tokens += 0.4;
+  }
+
+  return Math.max(0, Math.round(tokens));
+}
+
+function getContextBudget(fallback: number): number {
+  const configured = parseInt(agentMaxTokensInput.value, 10);
+  return Number.isFinite(configured) && configured > 0 ? configured : fallback;
+}
+
+function setContextMeter(
+  meterEl: HTMLDivElement,
+  usedTokens: number,
+  budgetTokens: number
+): void {
+  const safeBudget = Math.max(1, budgetTokens);
+  const ratio = Math.min(1, usedTokens / safeBudget);
+  const percent = Math.round(ratio * 100);
+  const meterColor = ratio >= 0.9
+    ? "#dc2626"
+    : ratio >= 0.7
+      ? "#f59e0b"
+      : ratio >= 0.45
+        ? "#0f766e"
+        : "#94a3b8";
+
+  meterEl.style.setProperty("--progress", ratio.toFixed(4));
+  meterEl.style.setProperty("--meter-color", meterColor);
+  meterEl.title = `上下文占用约 ${usedTokens} / ${safeBudget} tokens (${percent}%)`;
+  meterEl.setAttribute("aria-label", meterEl.title);
+}
+
+function updateChatContextMeter(): void {
+  const config = toChatConfig();
+  const pageContext = contextEl.textContent?.trim() ?? "";
+  const messageText = chatState.messages
+    .map((message) => `${message.role}\n${message.content}\n${message.reasoning_content ?? ""}`)
+    .join("\n");
+  const draftText = chatInput.value.trim();
+  const systemPrompt = config.systemPrompt?.trim() ?? "";
+  const usedTokens = estimateTokenUsage([systemPrompt, pageContext, messageText, draftText].filter(Boolean).join("\n"));
+  setContextMeter(chatContextMeterEl, usedTokens, getContextBudget(DEFAULT_CHAT_CONTEXT_BUDGET));
+}
+
+function updateAgentContextMeter(): void {
+  const config = toAgentConfig();
+  const historyText = buildAgentHistoryMessages(agentEntries)
+    .map((message) => `${message.role}\n${message.content}`)
+    .join("\n");
+  const draftText = agentInput.value.trim();
+  const systemPrompt = config.systemPrompt?.trim() ?? "";
+  const usedTokens = estimateTokenUsage([systemPrompt, historyText, draftText].filter(Boolean).join("\n"));
+  setContextMeter(agentContextMeterEl, usedTokens, getContextBudget(DEFAULT_AGENT_CONTEXT_BUDGET));
 }
 
 function createSessionTitle(session: ChatSession): string {
@@ -1690,6 +1820,8 @@ async function loadConfig(): Promise<void> {
   localCommandWsUrlInput.value = config.localCommandWsUrl ?? DEFAULT_CONFIG.localCommandWsUrl;
   localCommandTokenInput.value = config.localCommandToken ?? DEFAULT_CONFIG.localCommandToken;
   thinkingFormatInput.value = config.thinkingFormat ?? DEFAULT_CONFIG.thinkingFormat;
+  updateChatContextMeter();
+  updateAgentContextMeter();
   await refreshLocalCommandStatus();
   if (config.autoSolveCurrentPage) {
     setTimeout(() => {
@@ -2166,6 +2298,8 @@ configImportFileEl.addEventListener("change", () => {
       localCommandEnabledInput.checked = !!config.localCommandEnabled;
       localCommandWsUrlInput.value = config.localCommandWsUrl ?? DEFAULT_CONFIG.localCommandWsUrl;
       localCommandTokenInput.value = config.localCommandToken ?? DEFAULT_CONFIG.localCommandToken;
+      updateChatContextMeter();
+      updateAgentContextMeter();
 
       try {
         await applyConfigToActiveTab(config);
@@ -2203,6 +2337,7 @@ const loadPageContext = createLoadPageContextAction(
   {
     setContext: (text) => {
       contextEl.textContent = text;
+      updateChatContextMeter();
     },
     setPageTabActive: () => {
       activateTab("tabSettings");
@@ -2224,17 +2359,22 @@ async function sendChatMessage(): Promise<void> {
 
 async function sendChatMessageWithContent(
   input: string,
-  options?: { includePageContext?: boolean }
+  options?: { includePageContext?: boolean; includeHistory?: boolean; systemPromptOverride?: string }
 ): Promise<boolean> {
   const includePageContext = options?.includePageContext ?? true;
+  const includeHistory = options?.includeHistory ?? true;
+  const baseConfig = toChatConfig();
   dispatchChat({ type: "SEND_USER_MESSAGE", content: input });
 
-  const outboundMessages = chatState.messages;
+  const outboundMessages = includeHistory
+    ? chatState.messages
+    : [{ role: "user", content: input } as const];
   dispatchChat({ type: "SET_PENDING", pending: true });
   dispatchChat({ type: "START_ASSISTANT_STREAM" });
 
   const requestId = `req-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   activeStreamRequestId = requestId;
+  streamThinkingEnabledByRequestId.set(requestId, chatThinkingEnabled);
 
   const donePromise = new Promise<boolean>((resolve) => {
     streamCompletionResolvers.set(requestId, resolve);
@@ -2244,9 +2384,12 @@ async function sendChatMessageWithContent(
     const response = await chrome.runtime.sendMessage(
       createLLMStreamRequestMessage({
         requestId,
-        config: toChatConfig(),
+        config: options?.systemPromptOverride
+          ? { ...baseConfig, systemPrompt: options.systemPromptOverride }
+          : baseConfig,
         messages: outboundMessages,
-        pageContext: includePageContext ? (contextEl.textContent || undefined) : undefined
+        pageContext: includePageContext ? (contextEl.textContent || undefined) : undefined,
+        thinkingEnabled: chatThinkingEnabled
       })
     );
 
@@ -2257,6 +2400,7 @@ async function sendChatMessageWithContent(
       dispatchChat({ type: "APPEND_ASSISTANT_DELTA", delta: `Error: ${message}` });
       dispatchChat({ type: "SET_PENDING", pending: false });
       activeStreamRequestId = null;
+      streamThinkingEnabledByRequestId.delete(requestId);
       finalizeChatStreamUi();
       const resolve = streamCompletionResolvers.get(requestId);
       if (resolve) {
@@ -2272,6 +2416,7 @@ async function sendChatMessageWithContent(
     });
     dispatchChat({ type: "SET_PENDING", pending: false });
     activeStreamRequestId = null;
+    streamThinkingEnabledByRequestId.delete(requestId);
     finalizeChatStreamUi();
     const resolve = streamCompletionResolvers.get(requestId);
     if (resolve) {
@@ -2291,6 +2436,7 @@ async function stopChatMessage(): Promise<void> {
 
   const requestId = activeStreamRequestId;
   activeStreamRequestId = null;
+  streamThinkingEnabledByRequestId.delete(requestId);
 
   try {
     await chrome.runtime.sendMessage(createLLMStreamCancelMessage({ requestId }));
@@ -2365,6 +2511,7 @@ async function detectExamQuestionsInternal(): Promise<ExamQuestion[]> {
 
   setExamStatus(`当前页面检测到 ${questions.length} 道题。`);
   contextEl.textContent = formatQuestionsForPrompt(questions);
+  updateChatContextMeter();
   return questions;
 }
 
@@ -2427,7 +2574,10 @@ async function refreshAutoSolveDetectionStatus(options?: { solveWhenDetected?: b
 }
 
 function buildExamPrompt(questions: ExamQuestion[]): string {
-  const body = formatQuestionsForPrompt(questions);
+  return `题目：\n${formatQuestionsForPrompt(questions)}`;
+}
+
+function buildExamSystemPrompt(): string {
   return [
     "你是考试答题助手。",
     "请基于下列题目给出最可能答案，只输出答案，不要解释。",
@@ -2436,10 +2586,7 @@ function buildExamPrompt(questions: ExamQuestion[]): string {
     "- 多选题: 2. A,C",
     "- 判断题: 3. A",
     "只输出每题答案行，不要输出其它内容。",
-    "如果不确定也要给出最可能选项。",
-    "",
-    "题目：",
-    body
+    "如果不确定也要给出最可能选项。"
   ].join("\n");
 }
 
@@ -2472,7 +2619,9 @@ async function askAndAutoFill(options?: { source?: "manual" | "auto" }): Promise
 
     setExamStatus("正在请求模型解题...");
     const success = await sendChatMessageWithContent(buildExamPrompt(questions), {
-      includePageContext: false
+      includePageContext: false,
+      includeHistory: false,
+      systemPromptOverride: buildExamSystemPrompt()
     });
     if (!success) {
       setExamStatus("模型解题请求失败。");
@@ -2589,7 +2738,8 @@ function handleStreamEvent(event: RuntimeStreamEvent): void {
   }
 
   if (event.type === "LLM_STREAM_CHUNK") {
-    if (event.payload.reasoning) {
+    const thinkingEnabledForRequest = streamThinkingEnabledByRequestId.get(event.payload.requestId) ?? true;
+    if (event.payload.reasoning && thinkingEnabledForRequest) {
       dispatchChat({ type: "APPEND_THINKING_DELTA", delta: event.payload.reasoning });
     }
     if (event.payload.delta) {
@@ -2607,6 +2757,7 @@ function handleStreamEvent(event: RuntimeStreamEvent): void {
       streamCompletionResolvers.delete(event.payload.requestId);
     }
     activeStreamRequestId = null;
+    streamThinkingEnabledByRequestId.delete(event.payload.requestId);
     finalizeChatStreamUi();
     return;
   }
@@ -2619,6 +2770,7 @@ function handleStreamEvent(event: RuntimeStreamEvent): void {
       streamCompletionResolvers.delete(event.payload.requestId);
     }
     activeStreamRequestId = null;
+    streamThinkingEnabledByRequestId.delete(event.payload.requestId);
     finalizeChatStreamUi();
   }
 }
@@ -2752,6 +2904,7 @@ function renderAgent(): void {
   agentMessagesEl.scrollTop = agentMessagesEl.scrollHeight;
   setAgentStatus(agentPending ? "智能体执行中..." : "");
   updateAgentActionButton();
+  updateAgentContextMeter();
 }
 
 function handleAgentEvent(event: AgentProgressEvent): void {
@@ -3876,6 +4029,10 @@ byId<HTMLButtonElement>("askAndAutoFill").addEventListener("click", () => {
   void askAndAutoFill();
 });
 
+chatThinkingToggleBtn.addEventListener("click", () => {
+  setChatThinkingEnabled(!chatThinkingEnabled);
+});
+
 byId<HTMLButtonElement>("newChat").addEventListener("click", () => {
   void createNewChat();
 });
@@ -3889,10 +4046,14 @@ byId<HTMLButtonElement>("clearChats").addEventListener("click", () => {
 });
 
 chatInput.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) {
+  if (e.key === "Enter" && !e.shiftKey && !isComposingEnter(e)) {
     e.preventDefault();
     void sendChatMessage();
   }
+});
+
+chatInput.addEventListener("input", () => {
+  updateChatContextMeter();
 });
 
 // Agent event listeners
@@ -3967,10 +4128,19 @@ byId<HTMLButtonElement>("refreshTasks").addEventListener("click", () => {
 });
 
 agentInput.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) {
+  if (e.key === "Enter" && !e.shiftKey && !isComposingEnter(e)) {
     e.preventDefault();
     void sendAgentMessage();
   }
+});
+
+agentInput.addEventListener("input", () => {
+  updateAgentContextMeter();
+});
+
+agentMaxTokensInput.addEventListener("input", () => {
+  updateChatContextMeter();
+  updateAgentContextMeter();
 });
 
 // Tab switching
@@ -4007,6 +4177,8 @@ chrome.runtime.onMessage.addListener((message) => {
 
 activateApiConfigSubtab("apiConfigListPanel");
 setActiveApiProvider(activeApiProviderId);
+chatThinkingEnabled = loadStoredChatThinkingEnabled();
+renderChatThinkingToggle();
 void loadConfig();
 updateApiKeyVisibilityButton();
 void loadChatSessions();
