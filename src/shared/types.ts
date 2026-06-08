@@ -34,6 +34,7 @@ export interface LLMConfig {
   blockVisibilityDetection: boolean;
   aggressiveVisibilityBypass: boolean;
   blockFullscreenRequests: boolean;
+  blockDevtoolsDetection: boolean;
   autoSolveCurrentPage: boolean;
   enableFloatingBall: boolean;
   /** Built-in local command WebSocket client for Codex/OpenClaw control. */
@@ -55,6 +56,7 @@ export interface FeatureFlags {
   blockVisibilityDetection: boolean;
   aggressiveVisibilityBypass: boolean;
   blockFullscreenRequests: boolean;
+  blockDevtoolsDetection: boolean;
   enableFloatingBall: boolean;
 }
 

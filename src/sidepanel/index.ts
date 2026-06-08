@@ -60,6 +60,7 @@ const unlockContextMenuInput = byId<HTMLInputElement>("unlockContextMenu");
 const blockVisibilityDetectionInput = byId<HTMLInputElement>("blockVisibilityDetection");
 const aggressiveVisibilityBypassInput = byId<HTMLInputElement>("aggressiveVisibilityBypass");
 const blockFullscreenRequestsInput = byId<HTMLInputElement>("blockFullscreenRequests");
+const blockDevtoolsDetectionInput = byId<HTMLInputElement>("blockDevtoolsDetection");
 const autoSolveCurrentPageInput = byId<HTMLInputElement>("autoSolveCurrentPage");
 const localCommandEnabledInput = byId<HTMLInputElement>("localCommandEnabled");
 const localCommandWsUrlInput = byId<HTMLInputElement>("localCommandWsUrl");
@@ -1551,6 +1552,7 @@ function toConfig(): LLMConfig {
     blockVisibilityDetection: blockVisibilityDetectionInput.checked,
     aggressiveVisibilityBypass: aggressiveVisibilityBypassInput.checked,
     blockFullscreenRequests: blockFullscreenRequestsInput.checked,
+    blockDevtoolsDetection: blockDevtoolsDetectionInput.checked,
     autoSolveCurrentPage: autoSolveCurrentPageInput.checked,
     enableFloatingBall: DEFAULT_CONFIG.enableFloatingBall,
     localCommandEnabled: localCommandEnabledInput.checked,
@@ -1652,6 +1654,7 @@ function toFeatureFlags(config: LLMConfig) {
     blockVisibilityDetection: config.blockVisibilityDetection,
     aggressiveVisibilityBypass: config.aggressiveVisibilityBypass,
     blockFullscreenRequests: config.blockFullscreenRequests,
+    blockDevtoolsDetection: config.blockDevtoolsDetection,
     enableFloatingBall: config.enableFloatingBall
   };
 }
@@ -1681,6 +1684,7 @@ async function loadConfig(): Promise<void> {
   blockVisibilityDetectionInput.checked = config.blockVisibilityDetection;
   aggressiveVisibilityBypassInput.checked = config.aggressiveVisibilityBypass;
   blockFullscreenRequestsInput.checked = !!config.blockFullscreenRequests;
+  blockDevtoolsDetectionInput.checked = !!config.blockDevtoolsDetection;
   autoSolveCurrentPageInput.checked = !!config.autoSolveCurrentPage;
   localCommandEnabledInput.checked = !!config.localCommandEnabled;
   localCommandWsUrlInput.value = config.localCommandWsUrl ?? DEFAULT_CONFIG.localCommandWsUrl;
@@ -2157,6 +2161,7 @@ configImportFileEl.addEventListener("change", () => {
       blockVisibilityDetectionInput.checked = config.blockVisibilityDetection;
       aggressiveVisibilityBypassInput.checked = config.aggressiveVisibilityBypass;
       blockFullscreenRequestsInput.checked = !!config.blockFullscreenRequests;
+      blockDevtoolsDetectionInput.checked = !!config.blockDevtoolsDetection;
       autoSolveCurrentPageInput.checked = !!config.autoSolveCurrentPage;
       localCommandEnabledInput.checked = !!config.localCommandEnabled;
       localCommandWsUrlInput.value = config.localCommandWsUrl ?? DEFAULT_CONFIG.localCommandWsUrl;
@@ -3786,7 +3791,7 @@ localCommandEnabledInput.addEventListener("change", (event) => {
   void handleFeatureSwitchChange(event.currentTarget as HTMLElement, { refreshLocalCommandStatus: true });
 });
 
-[unlockContextMenuInput, blockVisibilityDetectionInput, aggressiveVisibilityBypassInput, blockFullscreenRequestsInput].forEach((input) => {
+[unlockContextMenuInput, blockVisibilityDetectionInput, aggressiveVisibilityBypassInput, blockFullscreenRequestsInput, blockDevtoolsDetectionInput].forEach((input) => {
   input.addEventListener("change", (event) => {
     void handleFeatureSwitchChange(event.currentTarget as HTMLElement);
   });

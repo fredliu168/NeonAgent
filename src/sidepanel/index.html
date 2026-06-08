@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>NeonAgent v0.1.4</title>
+    <title>NeonAgent v0.1.5</title>
     <style>
       /* =========== Reset & Base =========== */
       *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -1582,6 +1582,11 @@
             <div class="setting-hint">拦截网页脚本调用全屏 API，并在页面进入全屏时自动退出</div>
 
             <div class="switch-row">
+              <label><input id="blockDevtoolsDetection" type="checkbox" /> 屏蔽浏览器开发者模式检测</label>
+            </div>
+            <div class="setting-hint">屏蔽常见 DevTools 检测信号和 clearLog/console.clear，可能影响网站调试日志，不用时请取消。</div>
+
+            <div class="switch-row">
               <label><input id="autoSolveCurrentPage" type="checkbox" /> 当前页面自动解题</label>
             </div>
             <div class="setting-hint">勾选后自动判断当前页面是否包含题目；检测到题目时调用一键解题，并在对话框显示过程与答案</div>
@@ -1658,12 +1663,12 @@
           <section class="card">
             <h2>🛡️ 环境破解</h2>
             <div style="font-size:12px;color:#475569;line-height:1.8;">
-              <p>解除右键限制、页面文字选择限制、切屏检测绕过、插件检测对抗。</p>
+              <p>解除右键限制、页面文字选择限制、切屏检测绕过、开发者模式检测屏蔽、插件检测对抗。</p>
             </div>
           </section>
 
           <section class="card" style="text-align:center;color:#94a3b8;font-size:11px;">
-            <p>NeonAgent v0.1.4</p>
+            <p>NeonAgent v0.1.5</p>
             <p style="margin-top:4px;">本工具仅供学习研究使用，严禁用于违反考试规则或非法用途。</p>
           </section>
         </div>

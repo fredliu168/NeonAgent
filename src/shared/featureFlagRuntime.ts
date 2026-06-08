@@ -69,13 +69,40 @@ function addAggressiveCaptureBlocker(target: EventTargetLike, event: string): ()
   return () => target.removeEventListener(event, handler, true);
 }
 
-function overrideProperty(target: object, key: "visibilityState" | "hidden", value: string | boolean): () => void {
+function overrideProperty(target: object, key: string, value: string | boolean | number): () => void {
   const ownDescriptor = Object.getOwnPropertyDescriptor(target, key);
 
   try {
     Object.defineProperty(target, key, {
       configurable: true,
       get: () => value
+    });
+  } catch {
+    return () => {
+      // ignored
+    };
+  }
+
+  return () => {
+    try {
+      if (ownDescriptor) {
+        Object.defineProperty(target, key, ownDescriptor);
+      } else {
+        delete (target as Record<string, unknown>)[key];
+      }
+    } catch {
+      // ignored
+    }
+  };
+}
+
+function overrideGetter(target: object, key: string, get: () => unknown): () => void {
+  const ownDescriptor = Object.getOwnPropertyDescriptor(target, key);
+
+  try {
+    Object.defineProperty(target, key, {
+      configurable: true,
+      get
     });
   } catch {
     return () => {
@@ -321,6 +348,54 @@ export function createFullscreenBlockRuntime(input: {
   }
 
   exitFullscreen();
+
+  return () => {
+    cleaners.forEach((fn) => fn());
+  };
+}
+
+function sanitizeDevtoolsConsoleArg(value: unknown): unknown {
+  if (value === null || typeof value !== "object") {
+    return value;
+  }
+
+  if (value instanceof Error) {
+    return `${value.name}: ${value.message}`;
+  }
+
+  return "[object]";
+}
+
+export function createDevtoolsDetectionBlockRuntime(input: {
+  windowTarget: EventTargetLike & Record<string, unknown>;
+  consoleTarget?: Record<string, unknown>;
+}): () => void {
+  const cleaners: Array<() => void> = [];
+  const windowRecord = input.windowTarget;
+
+  cleaners.push(addCaptureBlocker(input.windowTarget, "devtoolschange"));
+  cleaners.push(overrideGetter(windowRecord, "outerWidth", () => Number(windowRecord.innerWidth) || 0));
+  cleaners.push(overrideGetter(windowRecord, "outerHeight", () => Number(windowRecord.innerHeight) || 0));
+  cleaners.push(overrideProperty(windowRecord, "devtools", false));
+  cleaners.push(overrideFunction(windowRecord, "clearLog", () => undefined));
+
+  const consoleTarget = input.consoleTarget;
+  if (consoleTarget) {
+    cleaners.push(overrideFunction(consoleTarget, "clear", () => undefined));
+
+    const methods = ["log", "info", "debug", "warn", "error", "dir", "table", "trace"] as const;
+    for (const method of methods) {
+      const original = consoleTarget[method];
+      if (typeof original !== "function") {
+        continue;
+      }
+
+      const wrapped = function (this: unknown, ...args: unknown[]) {
+        return original.apply(this, args.map(sanitizeDevtoolsConsoleArg));
+      };
+      cleaners.push(overrideFunction(consoleTarget, method, wrapped));
+    }
+  }
 
   return () => {
     cleaners.forEach((fn) => fn());

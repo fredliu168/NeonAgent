@@ -2,7 +2,14 @@
 
 NeonAgent 是一个运行在 Chrome Side Panel 中的浏览器智能体插件，聚焦于网页交互、页面翻译、自动解题和多模型接入。
 
-## 最新更新（v0.1.4）
+## 最新更新（v0.1.5）
+
+- **开发者模式检测屏蔽：**
+  - 功能开关新增“屏蔽浏览器开发者模式检测”，勾选后自动生效。
+  - 开启后会屏蔽常见 DevTools 检测信号，包括 `devtoolschange`、`outerWidth/outerHeight` 尺寸差异和 `window.devtools` 标记。
+  - 同时屏蔽页面脚本常用的 `window.clearLog` 和 `console.clear`，避免页面清空调试日志或配合检测逻辑。
+
+## v0.1.4 更新回顾
 
 - **功能开关体验修复：**
   - 点击“功能开关”的勾选框后会停留在当前勾选位置，不再因为保存状态或设置重应用导致设置页跳动。
@@ -54,6 +61,7 @@ NeonAgent 是一款参考Claude code 和Hermes架构设计的Chrome浏览器智�
 * **插件检测对抗：** * 隐藏 `navigator.plugins` 和 `navigator.mimeTypes` 特征。
     * 处理 `Runtime` 相关特征，防止网站检测到特定扩展程序的注入。
 * **页面自动全屏限制：** 可拦截网页脚本调用 `requestFullscreen` 及常见浏览器前缀全屏 API，并在页面进入全屏时自动退出，避免站点未经用户期望强制全屏。
+* **浏览器开发者模式检测屏蔽：** 可屏蔽常见 DevTools 检测信号，并禁用页面脚本调用 `window.clearLog`、`console.clear` 清空日志。
 
 ### 2.2 大模型 (LLM) 接入配置
 * **多模型支持：** 允许用户配置不同的 API 端点（如 OpenAI, Anthropic, Gemini, 或本地 Ollama）。

@@ -6,6 +6,7 @@ const defaultFeatureFlags: FeatureFlags = {
   blockVisibilityDetection: false,
   aggressiveVisibilityBypass: false,
   blockFullscreenRequests: false,
+  blockDevtoolsDetection: false,
   enableFloatingBall: false
 };
 

@@ -3,6 +3,7 @@ type FeatureFlags = {
   blockVisibilityDetection: boolean;
   aggressiveVisibilityBypass: boolean;
   blockFullscreenRequests: boolean;
+  blockDevtoolsDetection: boolean;
   enableFloatingBall: boolean;
 };
 
@@ -22,6 +23,7 @@ type LLMConfig = {
   blockVisibilityDetection: boolean;
   aggressiveVisibilityBypass: boolean;
   blockFullscreenRequests: boolean;
+  blockDevtoolsDetection: boolean;
   autoSolveCurrentPage: boolean;
   enableFloatingBall: boolean;
 };
@@ -124,17 +126,40 @@ function addAggressiveCaptureBlocker(target: EventTargetLike, event: string): ()
   return () => target.removeEventListener(event, handler, true);
 }
 
-function overrideProperty(
-  target: object,
-  key: "visibilityState" | "hidden",
-  value: string | boolean
-): () => void {
+function overrideProperty(target: object, key: string, value: string | boolean | number): () => void {
   const ownDescriptor = Object.getOwnPropertyDescriptor(target, key);
 
   try {
     Object.defineProperty(target, key, {
       configurable: true,
       get: () => value
+    });
+  } catch {
+    return () => {
+      // ignored
+    };
+  }
+
+  return () => {
+    try {
+      if (ownDescriptor) {
+        Object.defineProperty(target, key, ownDescriptor);
+      } else {
+        delete (target as Record<string, unknown>)[key];
+      }
+    } catch {
+      // ignored
+    }
+  };
+}
+
+function overrideGetter(target: object, key: string, get: () => unknown): () => void {
+  const ownDescriptor = Object.getOwnPropertyDescriptor(target, key);
+
+  try {
+    Object.defineProperty(target, key, {
+      configurable: true,
+      get
     });
   } catch {
     return () => {
@@ -324,8 +349,57 @@ function createVisibilityBypassRuntime(input: {
   };
 }
 
+function sanitizeDevtoolsConsoleArg(value: unknown): unknown {
+  if (value === null || typeof value !== "object") {
+    return value;
+  }
+
+  if (value instanceof Error) {
+    return `${value.name}: ${value.message}`;
+  }
+
+  return "[object]";
+}
+
+function createDevtoolsDetectionBlockRuntime(input: {
+  windowTarget: EventTargetLike & Record<string, unknown>;
+  consoleTarget?: Record<string, unknown>;
+}): () => void {
+  const cleaners: Array<() => void> = [];
+  const windowRecord = input.windowTarget;
+
+  cleaners.push(addCaptureBlocker(input.windowTarget, "devtoolschange"));
+  cleaners.push(overrideGetter(windowRecord, "outerWidth", () => Number(windowRecord.innerWidth) || 0));
+  cleaners.push(overrideGetter(windowRecord, "outerHeight", () => Number(windowRecord.innerHeight) || 0));
+  cleaners.push(overrideProperty(windowRecord, "devtools", false));
+  cleaners.push(overrideFunction(windowRecord, "clearLog", () => undefined));
+
+  const consoleTarget = input.consoleTarget;
+  if (consoleTarget) {
+    cleaners.push(overrideFunction(consoleTarget, "clear", () => undefined));
+
+    const methods = ["log", "info", "debug", "warn", "error", "dir", "table", "trace"] as const;
+    for (const method of methods) {
+      const original = consoleTarget[method];
+      if (typeof original !== "function") {
+        continue;
+      }
+
+      const wrapped = function (this: unknown, ...args: unknown[]) {
+        return original.apply(this, args.map(sanitizeDevtoolsConsoleArg));
+      };
+      cleaners.push(overrideFunction(consoleTarget, method, wrapped));
+    }
+  }
+
+  return () => {
+    cleaners.forEach((fn) => fn());
+  };
+}
+
 const FLOATING_BALL_ID = "neonagent-floating-ball";
 const FULLSCREEN_BLOCK_EVENT = "neonagent:set-fullscreen-block";
+const DEVTOOLS_DETECTION_BLOCK_EVENT = "neonagent:set-devtools-detection-block";
 const TRANSLATION_SOURCE_ATTR = "data-neonagent-translation-source";
 const TRANSLATION_HOST_ATTR = "data-neonagent-translation-host";
 const TRANSLATION_TEXT_ATTR = "data-neonagent-translation-text";
@@ -367,6 +441,7 @@ const defaultFeatureFlags: FeatureFlags = {
   blockVisibilityDetection: false,
   aggressiveVisibilityBypass: false,
   blockFullscreenRequests: false,
+  blockDevtoolsDetection: false,
   enableFloatingBall: false
 };
 
@@ -1039,6 +1114,13 @@ function enableFullscreenBlock(): () => void {
   };
 }
 
+function enableDevtoolsDetectionBlock(): () => void {
+  return createDevtoolsDetectionBlockRuntime({
+    windowTarget: window as unknown as EventTargetLike & Record<string, unknown>,
+    consoleTarget: console as unknown as Record<string, unknown>
+  });
+}
+
 function setFloatingBall(enabled: boolean): void {
   const existing = document.getElementById(FLOATING_BALL_ID);
 
@@ -1075,6 +1157,12 @@ function syncMainWorldFullscreenBlock(enabled: boolean): void {
   }));
 }
 
+function syncMainWorldDevtoolsDetectionBlock(enabled: boolean): void {
+  window.dispatchEvent(new CustomEvent(DEVTOOLS_DETECTION_BLOCK_EVENT, {
+    detail: { enabled }
+  }));
+}
+
 function applyFeatureFlags(flags: FeatureFlags): void {
   while (cleanupFns.length > 0) {
     const fn = cleanupFns.pop();
@@ -1096,6 +1184,11 @@ function applyFeatureFlags(flags: FeatureFlags): void {
   }
   syncMainWorldFullscreenBlock(flags.blockFullscreenRequests);
 
+  if (flags.blockDevtoolsDetection) {
+    cleanupFns.push(enableDevtoolsDetectionBlock());
+  }
+  syncMainWorldDevtoolsDetectionBlock(flags.blockDevtoolsDetection);
+
   setFloatingBall(flags.enableFloatingBall);
 }
 
@@ -1105,6 +1198,7 @@ function flagsFromConfig(config: Partial<LLMConfig>): FeatureFlags {
     blockVisibilityDetection: !!config.blockVisibilityDetection,
     aggressiveVisibilityBypass: !!config.aggressiveVisibilityBypass,
     blockFullscreenRequests: !!config.blockFullscreenRequests,
+    blockDevtoolsDetection: !!config.blockDevtoolsDetection,
     enableFloatingBall: !!config.enableFloatingBall
   };
 }

@@ -422,6 +422,10 @@ export function migrateConfig(config: LLMConfig): LLMConfig {
     next.blockFullscreenRequests = DEFAULT_CONFIG.blockFullscreenRequests;
   }
 
+  if (typeof next.blockDevtoolsDetection !== "boolean") {
+    next.blockDevtoolsDetection = DEFAULT_CONFIG.blockDevtoolsDetection;
+  }
+
   if (typeof next.autoSolveCurrentPage !== "boolean") {
     next.autoSolveCurrentPage = DEFAULT_CONFIG.autoSolveCurrentPage;
   }
@@ -474,6 +478,7 @@ export const DEFAULT_CONFIG: LLMConfig = {
   blockVisibilityDetection: false,
   aggressiveVisibilityBypass: false,
   blockFullscreenRequests: false,
+  blockDevtoolsDetection: false,
   autoSolveCurrentPage: false,
   enableFloatingBall: false,
   localCommandEnabled: false,
@@ -575,6 +580,10 @@ export function validateConfig(input: LLMConfig): ValidationResult {
 
   if (typeof input.blockFullscreenRequests !== "boolean") {
     errors.push("blockFullscreenRequests must be boolean");
+  }
+
+  if (typeof input.blockDevtoolsDetection !== "boolean") {
+    errors.push("blockDevtoolsDetection must be boolean");
   }
 
   if (typeof input.autoSolveCurrentPage !== "boolean") {

@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is loosely based on Keep a Changelog, with versions tracked alongside Git tags such as `v0.1.2`.
 
+## [0.1.5] - 2026-06-08
+
+### Added
+- Added a feature switch for blocking common browser developer-mode / DevTools detection checks.
+- Added runtime masking for `devtoolschange`, `outerWidth` / `outerHeight` size-difference checks, and `window.devtools`.
+- Added blocking for page-level `window.clearLog` and `console.clear` when DevTools detection blocking is enabled.
+
+### Changed
+- Updated README and side-panel about text to document the new developer-mode detection blocking capability.
+
 ## [0.1.4] - 2026-06-08
 
 ### Changed
