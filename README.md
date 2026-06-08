@@ -294,6 +294,74 @@ NeonAgent 是一款参考Claude code 和Hermes架构设计的Chrome浏览器智�
         "stopOnError": true
       }
       ```
+    * **如何启动 `neonagent-local-server.mjs`：**
+      1. 先在 NeonAgent 设置页开启“本地命令 WebSocket”，确认 URL 与本地服务一致，默认是 `ws://127.0.0.1:8787/neonagent`。
+      2. 在项目根目录启动本地桥接服务：
+         ```bash
+         npm run local-server
+         ```
+      3. 启动后终端会输出：
+         ```text
+         HTTP: http://127.0.0.1:8787
+         WS:   ws://127.0.0.1:8787/neonagent
+         Endpoints: GET /status, POST /agent, POST /tool, POST /skill, POST /send, GET /result/:requestId
+         ```
+      4. 如果需要改地址或加简单令牌，可用环境变量：
+         ```bash
+         NEON_LOCAL_HOST=127.0.0.1 \
+         NEON_LOCAL_PORT=8787 \
+         NEON_LOCAL_PATH=/neonagent \
+         NEON_TOKEN=your-token \
+         npm run local-server
+         ```
+    * **如何使用本地 WebSocket / HTTP 命令通道：**
+      - 先检查本地桥接服务是否启动，且 NeonAgent 是否已经连上：
+        ```bash
+        curl http://127.0.0.1:8787/status
+        ```
+        返回的 `connected: true` 表示扩展已经连接到本地服务。
+      - 发送一条智能体任务：
+        ```bash
+        curl -X POST http://127.0.0.1:8787/agent \
+          -H 'Content-Type: application/json' \
+          -d '{
+            "type": "agent_run",
+            "requestId": "demo-agent-001",
+            "token": "optional-token",
+            "tabId": 123,
+            "userMessage": "读取当前页面正文并总结",
+            "waitForResult": true
+          }'
+        ```
+      - 直接调用页面工具：
+        ```bash
+        curl -X POST http://127.0.0.1:8787/tool \
+          -H 'Content-Type: application/json' \
+          -d '{
+            "requestId": "demo-tool-001",
+            "token": "optional-token",
+            "tabId": 123,
+            "toolName": "read_page_content",
+            "arguments": { "selector": "main", "maxLength": 3000 }
+          }'
+        ```
+      - 运行一个已保存的 Skill：
+        ```bash
+        curl -X POST http://127.0.0.1:8787/skill \
+          -H 'Content-Type: application/json' \
+          -d '{
+            "requestId": "demo-skill-001",
+            "token": "optional-token",
+            "tabId": 123,
+            "skillId": "skill-...",
+            "stopOnError": true
+          }'
+        ```
+      - 任务发出后，可通过 `requestId` 轮询结果：
+        ```bash
+        curl http://127.0.0.1:8787/result/demo-agent-001
+        ```
+      - 如果你的调用端已经自己维护 WebSocket 消息格式，也可以直接向 `ws://127.0.0.1:8787/neonagent` 发送同样的 JSON 消息；HTTP 端点只是一个更方便调试和集成的本地桥接层。
 * **安全守则：**
     * 不自动提交包含敏感信息的表单，除非用户明确授权。
     * 不自动导航到用户未提及的外部网站。
