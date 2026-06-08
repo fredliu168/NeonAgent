@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is loosely based on Keep a Changelog, with versions tracked alongside Git tags such as `v0.1.2`.
 
+## [0.1.4] - 2026-06-08
+
+### Changed
+- Updated feature-switch saves so they only apply the relevant page settings instead of reapplying translation settings.
+- Added a user-facing warning below “解除右键限制” that the setting may affect website behavior and should be disabled when not needed.
+
+### Fixed
+- Fixed the settings page jumping away from the current checkbox after toggling feature switches.
+- Reduced layout changes from feature-switch saves by avoiding unnecessary success-status and local-command refresh updates.
+
 ## [0.1.3] - 2026-06-08
 
 ### Added

@@ -1115,6 +1115,24 @@ function setStatus(text: string, error = false): void {
   statusEl.style.color = error ? "#b91c1c" : "#047857";
 }
 
+async function preserveSettingsElementPosition<T>(
+  element: HTMLElement | null,
+  action: () => Promise<T>
+): Promise<T> {
+  const scrollContainer = element?.closest<HTMLElement>(".settings-scroll") ?? null;
+  const beforeTop = element?.isConnected ? element.getBoundingClientRect().top : null;
+
+  const result = await action();
+
+  if (scrollContainer && element?.isConnected && beforeTop !== null) {
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    const afterTop = element.getBoundingClientRect().top;
+    scrollContainer.scrollTop += afterTop - beforeTop;
+  }
+
+  return result;
+}
+
 function setApiProviderListStatus(text: string, error = false): void {
   apiProviderListStatusEl.textContent = text;
   apiProviderListStatusEl.style.color = error ? "#b91c1c" : "#475569";
@@ -1692,60 +1710,86 @@ function toTranslationPayload(config: LLMConfig) {
   };
 }
 
-async function applyConfigToActiveTab(config: LLMConfig): Promise<void> {
+type ActiveTabApplyOptions = {
+  applyFeatureFlags?: boolean;
+  applyTranslationSettings?: boolean;
+  applyAutoSolveSettings?: boolean;
+};
+
+type SaveConfigOptions = {
+  showSuccessStatus?: boolean;
+  refreshLocalCommandStatus?: boolean;
+};
+
+function normalizeActiveTabApplyOptions(options: ActiveTabApplyOptions = {}): Required<ActiveTabApplyOptions> {
+  return {
+    applyFeatureFlags: options.applyFeatureFlags ?? true,
+    applyTranslationSettings: options.applyTranslationSettings ?? true,
+    applyAutoSolveSettings: options.applyAutoSolveSettings ?? true
+  };
+}
+
+async function applyConfigToActiveTab(config: LLMConfig, options: ActiveTabApplyOptions = {}): Promise<void> {
+  const normalizedOptions = normalizeActiveTabApplyOptions(options);
   const tabId = await getCurrentTabId();
   if (!tabId) {
     setInjectionNotice("当前没有可用标签页，无法应用页面开关。");
     return;
   }
 
-  const response = await sendTabMessageWithAutoInject(tabId, {
-    type: "APPLY_FEATURE_FLAGS",
-    payload: toFeatureFlags(config)
-  });
+  if (normalizedOptions.applyFeatureFlags) {
+    const response = await sendTabMessageWithAutoInject(tabId, {
+      type: "APPLY_FEATURE_FLAGS",
+      payload: toFeatureFlags(config)
+    });
 
-  if (!response.response) {
-    setInjectionNotice(
-      response.diagnosis
-        ? formatInjectionDiagnosisNotice(response.diagnosis)
-        : "当前页面不支持注入内容脚本，页面开关不会生效。"
-    );
-    return;
+    if (!response.response) {
+      setInjectionNotice(
+        response.diagnosis
+          ? formatInjectionDiagnosisNotice(response.diagnosis)
+          : "当前页面不支持注入内容脚本，页面开关不会生效。"
+      );
+      return;
+    }
+
+    setInjectionNotice(null);
   }
 
-  setInjectionNotice(null);
+  if (normalizedOptions.applyTranslationSettings) {
+    const translationResponse = await sendTabMessageWithAutoInject(tabId, {
+      type: "APPLY_TRANSLATION_SETTINGS",
+      payload: toTranslationPayload(config)
+    });
 
-  const translationResponse = await sendTabMessageWithAutoInject(tabId, {
-    type: "APPLY_TRANSLATION_SETTINGS",
-    payload: toTranslationPayload(config)
-  });
+    if (!translationResponse.response) {
+      setInjectionNotice(
+        translationResponse.diagnosis
+          ? formatInjectionDiagnosisNotice(translationResponse.diagnosis)
+          : "当前页面不支持应用翻译设置。"
+      );
+      return;
+    }
 
-  if (!translationResponse.response) {
-    setInjectionNotice(
-      translationResponse.diagnosis
-        ? formatInjectionDiagnosisNotice(translationResponse.diagnosis)
-        : "当前页面不支持应用翻译设置。"
-    );
-    return;
+    setInjectionNotice(null);
   }
 
-  setInjectionNotice(null);
+  if (normalizedOptions.applyAutoSolveSettings) {
+    const autoSolveResponse = await sendTabMessageWithAutoInject(tabId, {
+      type: "APPLY_AUTO_SOLVE_SETTINGS",
+      payload: { autoSolveCurrentPage: config.autoSolveCurrentPage }
+    });
 
-  const autoSolveResponse = await sendTabMessageWithAutoInject(tabId, {
-    type: "APPLY_AUTO_SOLVE_SETTINGS",
-    payload: { autoSolveCurrentPage: config.autoSolveCurrentPage }
-  });
+    if (!autoSolveResponse.response) {
+      setInjectionNotice(
+        autoSolveResponse.diagnosis
+          ? formatInjectionDiagnosisNotice(autoSolveResponse.diagnosis)
+          : "当前页面不支持应用自动解题设置。"
+      );
+      return;
+    }
 
-  if (!autoSolveResponse.response) {
-    setInjectionNotice(
-      autoSolveResponse.diagnosis
-        ? formatInjectionDiagnosisNotice(autoSolveResponse.diagnosis)
-        : "当前页面不支持应用自动解题设置。"
-    );
-    return;
+    setInjectionNotice(null);
   }
-
-  setInjectionNotice(null);
 }
 
 async function applyTranslationToActiveTab(): Promise<void> {
@@ -1872,7 +1916,12 @@ async function clearTranslationsFromActiveTab(): Promise<void> {
   setTranslationStatus("当前页译文已清除");
 }
 
-async function saveConfig(successMessage = "Config saved", showApiProviderListAfterSave = false): Promise<boolean> {
+async function saveConfig(
+  successMessage = "Config saved",
+  showApiProviderListAfterSave = false,
+  applyOptions: ActiveTabApplyOptions = {},
+  options: SaveConfigOptions = {}
+): Promise<boolean> {
   if (!commitOpenApiProviderInlineDraft()) {
     return false;
   }
@@ -1896,7 +1945,7 @@ async function saveConfig(successMessage = "Config saved", showApiProviderListAf
   }
 
   try {
-    await applyConfigToActiveTab(config);
+    await applyConfigToActiveTab(config, applyOptions);
   } catch {
     // ignored
   }
@@ -1907,22 +1956,44 @@ async function saveConfig(successMessage = "Config saved", showApiProviderListAf
     refreshApiProviderListIfVisible();
   }
 
-  setStatus(successMessage);
-  setTimeout(() => {
-    void refreshLocalCommandStatus();
-  }, 300);
+  if (options.showSuccessStatus ?? true) {
+    setStatus(successMessage);
+  }
+
+  if (options.refreshLocalCommandStatus ?? true) {
+    setTimeout(() => {
+      void refreshLocalCommandStatus();
+    }, 300);
+  }
   return true;
 }
 
-async function handleFeatureSwitchChange(options: { refreshAutoSolve?: boolean } = {}): Promise<void> {
-  const saved = await saveConfig("功能开关已生效");
-  if (!saved) {
-    return;
-  }
+async function handleFeatureSwitchChange(
+  triggerElement: HTMLElement | null,
+  options: { refreshAutoSolve?: boolean; refreshLocalCommandStatus?: boolean } = {}
+): Promise<void> {
+  await preserveSettingsElementPosition(triggerElement, async () => {
+    const saved = await saveConfig(
+      "功能开关已生效",
+      false,
+      {
+        applyFeatureFlags: true,
+        applyTranslationSettings: false,
+        applyAutoSolveSettings: !!options.refreshAutoSolve
+      },
+      {
+        showSuccessStatus: false,
+        refreshLocalCommandStatus: !!options.refreshLocalCommandStatus
+      }
+    );
+    if (!saved) {
+      return;
+    }
 
-  if (options.refreshAutoSolve) {
-    await refreshAutoSolveDetectionStatus({ solveWhenDetected: true });
-  }
+    if (options.refreshAutoSolve) {
+      await refreshAutoSolveDetectionStatus({ solveWhenDetected: true });
+    }
+  });
 }
 
 async function testConfig(
@@ -3707,19 +3778,17 @@ refreshLocalCommandStatusBtn.addEventListener("click", () => {
   void refreshLocalCommandStatus();
 });
 
-autoSolveCurrentPageInput.addEventListener("change", () => {
-  void handleFeatureSwitchChange({ refreshAutoSolve: true });
+autoSolveCurrentPageInput.addEventListener("change", (event) => {
+  void handleFeatureSwitchChange(event.currentTarget as HTMLElement, { refreshAutoSolve: true });
 });
 
-[
-  localCommandEnabledInput,
-  unlockContextMenuInput,
-  blockVisibilityDetectionInput,
-  aggressiveVisibilityBypassInput,
-  blockFullscreenRequestsInput
-].forEach((input) => {
-  input.addEventListener("change", () => {
-    void handleFeatureSwitchChange();
+localCommandEnabledInput.addEventListener("change", (event) => {
+  void handleFeatureSwitchChange(event.currentTarget as HTMLElement, { refreshLocalCommandStatus: true });
+});
+
+[unlockContextMenuInput, blockVisibilityDetectionInput, aggressiveVisibilityBypassInput, blockFullscreenRequestsInput].forEach((input) => {
+  input.addEventListener("change", (event) => {
+    void handleFeatureSwitchChange(event.currentTarget as HTMLElement);
   });
 });
 
