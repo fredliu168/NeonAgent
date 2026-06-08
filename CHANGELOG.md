@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is loosely based on Keep a Changelog, with versions tracked alongside Git tags such as `v0.1.2`.
 
+## [0.1.9] - 2026-06-09
+
+### Changed
+- Updated the agent context-usage meter to include in-flight thinking text, tool-call arguments, and tool results during execution.
+- Updated the agent-side token estimate so the context ring now changes continuously while the agent is running, instead of appearing static until the final answer.
+- Updated README with the v0.1.9 agent context-meter behavior summary.
+
 ## [0.1.8] - 2026-06-08
 
 ### Added

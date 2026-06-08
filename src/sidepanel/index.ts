@@ -1511,11 +1511,26 @@ function updateChatContextMeter(): void {
   setContextMeter(chatContextMeterEl, usedTokens, getContextBudget(DEFAULT_CHAT_CONTEXT_BUDGET));
 }
 
+function buildAgentContextText(entries: AgentEntry[]): string {
+  return entries
+    .map((entry) => {
+      if (entry.type === "tool" && entry.toolCall) {
+        return [
+          `tool:${entry.toolCall.name}`,
+          entry.toolCall.arguments,
+          entry.toolCall.result ?? ""
+        ].filter(Boolean).join("\n");
+      }
+
+      return `${entry.type}\n${entry.content}`;
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
 function updateAgentContextMeter(): void {
   const config = toAgentConfig();
-  const historyText = buildAgentHistoryMessages(agentEntries)
-    .map((message) => `${message.role}\n${message.content}`)
-    .join("\n");
+  const historyText = buildAgentContextText(agentEntries);
   const draftText = agentInput.value.trim();
   const systemPrompt = config.systemPrompt?.trim() ?? "";
   const usedTokens = estimateTokenUsage([systemPrompt, historyText, draftText].filter(Boolean).join("\n"));
