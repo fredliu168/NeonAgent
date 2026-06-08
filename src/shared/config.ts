@@ -32,6 +32,20 @@ const BUILT_IN_API_PROVIDER_META: ApiProviderMeta[] = [
     baseUrl: "https://api.deepseek.com/v1",
     defaultModel: "deepseek-v4-flash",
     defaultModels: ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"]
+  },
+  {
+    id: "volcengine",
+    name: "火山引擎",
+    baseUrl: "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+    defaultModel: "doubao-seed-2-0-lite-260215",
+    defaultModels: ["doubao-seed-2-0-lite-260215", "doubao-seed-1-6-251015"]
+  },
+  {
+    id: "siliconflow",
+    name: "硅基流动",
+    baseUrl: "https://api.siliconflow.cn/v1",
+    defaultModel: "Pro/zai-org/GLM-4.7",
+    defaultModels: ["Pro/zai-org/GLM-4.7", "deepseek-ai/DeepSeek-V3.2", "Qwen/Qwen3-32B", "Qwen/QwQ-32B"]
   }
 ];
 

@@ -2,7 +2,16 @@
 
 NeonAgent 是一个运行在 Chrome Side Panel 中的浏览器智能体插件，聚焦于网页交互、页面翻译、自动解题和多模型接入。
 
-## 最新更新（v0.1.5）
+## 最新更新（v0.1.6）
+
+- **API 预设供应商扩展：**
+  - API 配置新增默认供应商：`火山引擎` 和 `硅基流动`。
+  - 火山引擎默认接入火山方舟 OpenAI 兼容接口，硅基流动默认接入 SiliconFlow OpenAI 兼容接口。
+  - 新增供应商时可直接从预设中选择，保存后进入“配置列表”统一管理。
+- **仓库清理：**
+  - 删除旧的 `bridge/codex-bridge` 桥接扩展目录，外部控制推荐使用内置本地 WebSocket 命令通道。
+
+## v0.1.5 更新回顾
 
 - **开发者模式检测屏蔽：**
   - 功能开关新增“屏蔽浏览器开发者模式检测”，勾选后自动生效。
@@ -66,7 +75,7 @@ NeonAgent 是一款参考Claude code 和Hermes架构设计的Chrome浏览器智�
 ### 2.2 大模型 (LLM) 接入配置
 * **多模型支持：** 允许用户配置不同的 API 端点（如 OpenAI, Anthropic, Gemini, 或本地 Ollama）。
 * **供应商配置列表：** 设置页支持通过 `+` 新增供应商，并在“配置列表”中统一管理已保存的大模型供应商。
-* **预设供应商：** 内置 Kimi、MiniMax、DeepSeek 预设，自动带入推荐 Base URL。
+* **预设供应商：** 内置 Kimi、MiniMax、DeepSeek、火山引擎、硅基流动预设，自动带入推荐 Base URL。
 * **密钥管理：** 提供安全加密的输入框存储 API Key，并存储在 `chrome.storage.local` 中。
 * **参数调节：** 支持设置 Temperature, Max Tokens, 智能体单次回复最大 Token 数（Agent Max Tokens，默认 102400）, 以及自定义 System Prompt。
 * **翻译模型独立配置：** 支持为每个供应商单独设置“翻译 Model”；未设置时默认跟随主模型。
@@ -226,7 +235,7 @@ NeonAgent 是一款参考Claude code 和Hermes架构设计的Chrome浏览器智�
     * 新增 `AGENT_EXTERNAL_GET_RESULT`：按 `requestId` 查询外部命令执行状态与最终输出。
     * 出于安全考虑，仅接受具备 `sender.id` 的扩展来源消息（拒绝网页来源）。
     * **内置本地 WebSocket 命令通道：** 不想额外加载 bridge 扩展时，可在设置页启用“本地命令 WebSocket”。NeonAgent 会主动连接 `ws://127.0.0.1:8787/neonagent`（可配置），Codex/OpenClaw 侧只需提供本地 WebSocket 服务并发送 JSON 命令。
-    * 仓库内置最小桥接扩展：`bridge/codex-bridge`（可直接作为 Codex/OpenClaw 转发层使用）。
+    * 已移除旧的 `bridge/codex-bridge` 目录，外部控制推荐使用内置本地 WebSocket 命令通道。
     * 示例：
       ```json
       {

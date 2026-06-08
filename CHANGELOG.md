@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is loosely based on Keep a Changelog, with versions tracked alongside Git tags such as `v0.1.2`.
 
+## [0.1.6] - 2026-06-08
+
+### Added
+- Added built-in API provider presets for 火山引擎 and 硅基流动.
+- Added default model lists for the new 火山引擎 and 硅基流动 provider presets.
+
+### Removed
+- Removed the legacy `bridge/codex-bridge` helper extension directory; the built-in local WebSocket command channel remains the recommended bridge path.
+
 ## [0.1.5] - 2026-06-08
 
 ### Added
