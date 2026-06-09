@@ -87,6 +87,7 @@ const chatContextMeterEl = byId<HTMLDivElement>("chatContextMeter");
 const chatActionBtn = byId<HTMLButtonElement>("chatAction");
 const chatStatusEl = byId<HTMLDivElement>("chatStatus");
 const chatMessagesEl = byId<HTMLDivElement>("chatMessages");
+const chatScrollToBottomBtn = byId<HTMLButtonElement>("chatScrollToBottom");
 const examStatusEl = byId<HTMLDivElement>("examStatus");
 const chatSessionsEl = byId<HTMLDivElement>("chatSessions");
 const askAndAutoFillBtn = byId<HTMLButtonElement>("askAndAutoFill");
@@ -95,6 +96,7 @@ const settingsSubtabPanels = Array.from(document.querySelectorAll<HTMLElement>("
 
 // ── Agent DOM elements ──
 const agentMessagesEl = byId<HTMLDivElement>("agentMessages");
+const agentScrollToBottomBtn = byId<HTMLButtonElement>("agentScrollToBottom");
 const agentStatusEl = byId<HTMLDivElement>("agentStatus");
 const agentInput = byId<HTMLTextAreaElement>("agentInput");
 const agentComposerRootEl = byId<HTMLDivElement>("agentComposerRoot");
@@ -391,7 +393,7 @@ function closeApiProviderInlineEditor(): void {
 function openApiProviderInlineEditor(provider: ApiProvider): void {
   activeApiProviderInlineEditId = provider.id;
   activeApiProviderInlineDraft = createApiProviderInlineDraft(provider);
-  renderApiProviderList();
+  renderApiProviderList({ ensureVisibleId: provider.id });
 }
 
 function toggleApiProviderInlineEditor(provider: ApiProvider): void {
@@ -715,7 +717,9 @@ function findFallbackActiveProviderId(excludeProviderId: string, baseConfig = to
   return candidates[0]?.id;
 }
 
-function renderApiProviderList(): void {
+function renderApiProviderList(options: { ensureVisibleId?: string | null } = {}): void {
+  const scrollContainer = apiProviderListEl.closest<HTMLElement>(".settings-scroll");
+  const previousScrollTop = scrollContainer?.scrollTop ?? 0;
   apiProviderListEl.innerHTML = "";
   const fragment = document.createDocumentFragment();
   const displayProviders = apiProviders.filter((provider) => {
@@ -823,11 +827,15 @@ function renderApiProviderList(): void {
 
   apiProviderListEl.appendChild(fragment);
 
-  const focusProviderId = activeApiProviderInlineEditId ?? activeApiProviderId;
+  const focusProviderId = options.ensureVisibleId ?? null;
   if (focusProviderId) {
     requestAnimationFrame(() => {
       const focusedItem = apiProviderListEl.querySelector<HTMLElement>(`[data-provider-id="${CSS.escape(focusProviderId)}"]`);
       focusedItem?.scrollIntoView({ block: "nearest" });
+    });
+  } else if (scrollContainer) {
+    requestAnimationFrame(() => {
+      scrollContainer.scrollTop = previousScrollTop;
     });
   }
 }
@@ -1136,6 +1144,22 @@ function syncAgentToolTimer(): void {
     window.clearInterval(agentToolTimer);
     agentToolTimer = null;
   }
+}
+
+function isNearScrollBottom(container: HTMLElement, threshold = 48): boolean {
+  return container.scrollHeight - container.clientHeight - container.scrollTop <= threshold;
+}
+
+function scrollMessageContainerToBottom(container: HTMLElement): void {
+  container.scrollTop = container.scrollHeight;
+}
+
+function updateChatScrollToBottomButton(): void {
+  chatScrollToBottomBtn.hidden = isNearScrollBottom(chatMessagesEl);
+}
+
+function updateAgentScrollToBottomButton(): void {
+  agentScrollToBottomBtn.hidden = isNearScrollBottom(agentMessagesEl);
 }
 
 function appendInlineMarkdown(parent: HTMLElement, text: string): void {
@@ -1744,6 +1768,7 @@ function setChatThinkingEnabled(enabled: boolean): void {
 
 function finalizeChatStreamUi(): void {
   updateChatActionButton();
+  updateChatScrollToBottomButton();
 }
 
 function renderChatFull(): void {
@@ -1758,10 +1783,11 @@ function renderChatFull(): void {
     chatRenderedCount++;
   }
 
-  chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+  scrollMessageContainerToBottom(chatMessagesEl);
   chatStatusEl.textContent = chatState.pending ? "AI 思考中..." : "";
   updateChatActionButton();
   updateChatContextMeter();
+  updateChatScrollToBottomButton();
 }
 
 function appendChatMessageDOM(
@@ -1836,6 +1862,7 @@ function appendChatMessageDOM(
 }
 
 function renderChat(): void {
+  const shouldStickToBottom = isNearScrollBottom(chatMessagesEl);
   const msgs = chatState.messages;
 
   // If messages were deleted or reset, do a full render
@@ -1892,10 +1919,13 @@ function renderChat(): void {
     }
   }
 
-  chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+  if (shouldStickToBottom) {
+    scrollMessageContainerToBottom(chatMessagesEl);
+  }
   chatStatusEl.textContent = chatState.pending ? "AI 思考中..." : "";
   updateChatActionButton();
   updateChatContextMeter();
+  updateChatScrollToBottomButton();
 }
 
 function setExamStatus(text: string): void {
@@ -3460,6 +3490,7 @@ function updateAgentActionButton(): void {
 }
 
 function renderAgent(): void {
+  const shouldStickToBottom = isNearScrollBottom(agentMessagesEl);
   agentIterInfoEl.textContent = agentIterInfoText;
   agentMessagesEl.innerHTML = "";
 
@@ -3595,12 +3626,15 @@ function renderAgent(): void {
     }
   }
 
-  agentMessagesEl.scrollTop = agentMessagesEl.scrollHeight;
+  if (shouldStickToBottom) {
+    scrollMessageContainerToBottom(agentMessagesEl);
+  }
   setAgentStatus(getAgentPendingStatusText());
   updateAgentActionButton();
   updateAgentContextMeter();
   renderAgentComposerMode();
   syncAgentToolTimer();
+  updateAgentScrollToBottomButton();
 }
 
 function handleAgentEvent(event: AgentProgressEvent): void {
@@ -4968,6 +5002,15 @@ chatInput.addEventListener("input", () => {
   updateChatContextMeter();
 });
 
+chatMessagesEl.addEventListener("scroll", () => {
+  updateChatScrollToBottomButton();
+});
+
+chatScrollToBottomBtn.addEventListener("click", () => {
+  scrollMessageContainerToBottom(chatMessagesEl);
+  updateChatScrollToBottomButton();
+});
+
 // Agent event listeners
 agentActionBtn.addEventListener("click", () => {
   if (agentPending || activeAgentRequestId || activeAgentChatStreamRequestId) {
@@ -5058,6 +5101,15 @@ agentInput.addEventListener("keydown", (e) => {
 agentInput.addEventListener("input", () => {
   autoResizeTextarea(agentInput);
   updateAgentContextMeter();
+});
+
+agentMessagesEl.addEventListener("scroll", () => {
+  updateAgentScrollToBottomButton();
+});
+
+agentScrollToBottomBtn.addEventListener("click", () => {
+  scrollMessageContainerToBottom(agentMessagesEl);
+  updateAgentScrollToBottomButton();
 });
 
 agentMaxTokensInput.addEventListener("input", () => {

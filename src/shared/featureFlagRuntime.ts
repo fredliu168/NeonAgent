@@ -354,18 +354,6 @@ export function createFullscreenBlockRuntime(input: {
   };
 }
 
-function sanitizeDevtoolsConsoleArg(value: unknown): unknown {
-  if (value === null || typeof value !== "object") {
-    return value;
-  }
-
-  if (value instanceof Error) {
-    return `${value.name}: ${value.message}`;
-  }
-
-  return "[object]";
-}
-
 export function createDevtoolsDetectionBlockRuntime(input: {
   windowTarget: EventTargetLike & Record<string, unknown>;
   consoleTarget?: Record<string, unknown>;
@@ -382,19 +370,6 @@ export function createDevtoolsDetectionBlockRuntime(input: {
   const consoleTarget = input.consoleTarget;
   if (consoleTarget) {
     cleaners.push(overrideFunction(consoleTarget, "clear", () => undefined));
-
-    const methods = ["log", "info", "debug", "warn", "error", "dir", "table", "trace"] as const;
-    for (const method of methods) {
-      const original = consoleTarget[method];
-      if (typeof original !== "function") {
-        continue;
-      }
-
-      const wrapped = function (this: unknown, ...args: unknown[]) {
-        return original.apply(this, args.map(sanitizeDevtoolsConsoleArg));
-      };
-      cleaners.push(overrideFunction(consoleTarget, method, wrapped));
-    }
   }
 
   return () => {

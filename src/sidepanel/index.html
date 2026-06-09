@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>NeonAgent v0.1.12</title>
+    <title>NeonAgent v0.1.13</title>
     <style>
       /* =========== Reset & Base =========== */
       *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -130,6 +130,45 @@
         flex-direction: column;
         gap: 10px;
         background: #ffffff;
+      }
+
+      .message-flow-wrap {
+        position: relative;
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+      }
+
+      .scroll-bottom-btn {
+        position: absolute;
+        left: 50%;
+        bottom: 14px;
+        transform: translateX(-50%);
+        width: 34px;
+        height: 34px;
+        border: none;
+        border-radius: 999px;
+        background: rgba(100, 116, 139, .92);
+        color: #fff;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 18px;
+        line-height: 1;
+        cursor: pointer;
+        box-shadow: 0 8px 20px rgba(15, 23, 42, .16);
+        transition: opacity .15s ease, transform .15s ease;
+        z-index: 2;
+      }
+
+      .scroll-bottom-btn:hover {
+        transform: translateX(-50%) translateY(-1px);
+        background: #475569;
+      }
+
+      .scroll-bottom-btn[hidden] {
+        display: none;
       }
 
       .msg {
@@ -1862,7 +1901,10 @@
       </div>
 
       <!-- Message flow -->
-      <div id="chatMessages" class="message-flow"></div>
+      <div class="message-flow-wrap">
+        <div id="chatMessages" class="message-flow"></div>
+        <button id="chatScrollToBottom" class="scroll-bottom-btn" title="回到底部" aria-label="回到底部" hidden>↓</button>
+      </div>
 
       <!-- Status -->
       <div id="chatStatus" class="status-bar"></div>
@@ -1897,7 +1939,10 @@
         </div>
       </div>
       <div id="agentIterInfo" class="agent-iter-bar"></div>
-      <div id="agentMessages" class="message-flow"></div>
+      <div class="message-flow-wrap">
+        <div id="agentMessages" class="message-flow"></div>
+        <button id="agentScrollToBottom" class="scroll-bottom-btn" title="回到底部" aria-label="回到底部" hidden>↓</button>
+      </div>
       <div id="agentStatus" class="status-bar"></div>
       <div class="input-area">
         <div class="chat-composer">
@@ -2160,7 +2205,7 @@
           </section>
 
           <section class="card" style="text-align:center;color:#94a3b8;font-size:11px;">
-            <p>NeonAgent v0.1.12</p>
+            <p>NeonAgent v0.1.13</p>
             <p style="margin-top:4px;">本工具仅供学习研究使用，严禁用于违反考试规则或非法用途。</p>
           </section>
         </div>

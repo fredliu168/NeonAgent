@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is loosely based on Keep a Changelog, with versions tracked alongside Git tags such as `v0.1.2`.
 
+## [0.1.13] - 2026-06-09
+
+### Changed
+- Updated ask/agent message areas with a centered gray scroll-to-bottom button that appears whenever the user is not at the bottom.
+- Updated agent and settings scrolling behavior so manual scroll position is preserved instead of being forced back during renders.
+
+### Fixed
+- Fixed the message-flow wrapper layout so the composer remains visible and message lists keep their own scroll area.
+- Fixed developer-tools detection blocking so normal `console.*` calls keep their original arguments and stack traces.
+
 ## [0.1.12] - 2026-06-09
 
 ### Changed
