@@ -46,15 +46,6 @@ function restoreDescriptor(target: object, property: string, descriptor: Propert
   }
 }
 
-function getFullscreenError(): Error {
-  if (typeof DOMException === "function") {
-    return new DOMException("Fullscreen requests are blocked by NeonAgent", "NotAllowedError");
-  }
-  const error = new Error("Fullscreen requests are blocked by NeonAgent");
-  error.name = "NotAllowedError";
-  return error;
-}
-
 function getRequestTargets(): Array<{ label: string; target: object }> {
   const targets: Array<{ label: string; target: object }> = [];
   const constructors = [Element, HTMLElement, HTMLVideoElement].filter(Boolean);
@@ -93,7 +84,7 @@ function installFullscreenBlock(): void {
   const state = fullscreenWindow.__neonagentFullscreenBlock;
   if (!state || state.enabled) return;
 
-  const blockedRequest = () => Promise.reject(getFullscreenError());
+  const blockedRequest = () => Promise.resolve();
   const methods = [
     "requestFullscreen",
     "webkitRequestFullscreen",

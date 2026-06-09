@@ -1084,7 +1084,7 @@ function enableVisibilityBypass(aggressive = false): () => void {
 }
 
 function enableFullscreenBlock(): () => void {
-  const blockedRequest = (() => Promise.reject(new DOMException("Fullscreen requests are blocked by NeonAgent", "NotAllowedError"))) as () => Promise<void>;
+  const blockedRequest = (() => Promise.resolve()) as () => Promise<void>;
   const requestMethods = [
     "requestFullscreen",
     "webkitRequestFullscreen",

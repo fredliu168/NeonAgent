@@ -297,7 +297,7 @@ export function createFullscreenBlockRuntime(input: {
   documentTarget: FullscreenDocumentLike;
 }): () => void {
   const cleaners: Array<() => void> = [];
-  const blockedRequest = (() => Promise.reject(new DOMException("Fullscreen requests are blocked by NeonAgent", "NotAllowedError"))) as () => Promise<void>;
+  const blockedRequest = (() => Promise.resolve()) as () => Promise<void>;
 
   const requestMethods = [
     "requestFullscreen",

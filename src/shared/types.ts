@@ -69,6 +69,7 @@ export interface ChatMessage {
   role: "system" | "user" | "assistant";
   content: string;
   reasoning_content?: string;
+  timestamp?: number;
 }
 
 export interface ChatSession {

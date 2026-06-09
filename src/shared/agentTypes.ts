@@ -113,6 +113,7 @@ export type AgentProgressEvent =
 export interface AgentSessionEntry {
   type: "user" | "assistant" | "thinking" | "tool";
   content: string;
+  timestamp?: number;
   toolCall?: {
     id: string;
     name: string;

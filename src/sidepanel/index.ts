@@ -14,7 +14,7 @@ import {
 import { skillToMarkdown, parseSkillMarkdown, skillsToMarkdown, parseSkillsMarkdown } from "../shared/agentSkills.js";
 import { memoriesToMarkdown, parseMemoriesMarkdown } from "../shared/agentMemory.js";
 import type { ChatMessage, ChatSession, ExamQuestion, LLMConfig, RuntimeStreamEvent } from "../shared/types.js";
-import type { AgentMessage, AgentProgressEvent, AgentSession } from "../shared/agentTypes.js";
+import type { AgentMessage, AgentProgressEvent, AgentSession, AgentSessionEntry } from "../shared/agentTypes.js";
 import {
   createInitialChatState,
   reduceChatState,
@@ -99,8 +99,7 @@ const agentStatusEl = byId<HTMLDivElement>("agentStatus");
 const agentInput = byId<HTMLTextAreaElement>("agentInput");
 const agentComposerRootEl = byId<HTMLDivElement>("agentComposerRoot");
 const agentModeSelect = byId<HTMLSelectElement>("agentModeSelect");
-const agentToolsRowEl = byId<HTMLDivElement>("agentToolsRow");
-const agentToolGroupEl = byId<HTMLDivElement>("agentToolGroup");
+const agentPanelSelect = byId<HTMLSelectElement>("agentPanelSelect");
 const agentModelInput = byId<HTMLSelectElement>("agentModel");
 const agentModelMenuRootEl = byId<HTMLDivElement>("agentModelMenuRoot");
 const agentModelMenuBtn = byId<HTMLButtonElement>("agentModelMenuButton");
@@ -108,9 +107,6 @@ const agentModelMenuEl = byId<HTMLDivElement>("agentModelMenu");
 const agentModelMenuOptionsEl = byId<HTMLDivElement>("agentModelMenuOptions");
 const agentContextMeterEl = byId<HTMLDivElement>("agentContextMeter");
 const agentActionBtn = byId<HTMLButtonElement>("agentAction");
-const toggleMemoriesBtn = byId<HTMLButtonElement>("toggleMemories");
-const toggleSkillsBtn = byId<HTMLButtonElement>("toggleSkills");
-const toggleTasksBtn = byId<HTMLButtonElement>("toggleTasks");
 const agentIterInfoEl = byId<HTMLSpanElement>("agentIterInfo");
 const agentSessionsEl = byId<HTMLDivElement>("agentSessions");
 const skillsPanelEl = byId<HTMLDivElement>("skillsPanel");
@@ -1072,6 +1068,7 @@ interface AgentToolCallEntry {
 interface AgentEntry {
   type: "user" | "assistant" | "thinking" | "tool";
   content: string;
+  timestamp?: number;
   toolCall?: AgentToolCallEntry;
 }
 
@@ -1091,6 +1088,307 @@ const completedAutoSolveSignatures = new Set<string>();
 const agentChatStreamCompletionResolvers = new Map<string, (ok: boolean) => void>();
 const agentStreamThinkingEnabledByRequestId = new Map<string, boolean>();
 const AGENT_COMPOSER_MODE_STORAGE_KEY = "neonagent.agentComposerMode";
+
+function formatMessageTimestamp(timestamp?: number): string {
+  if (typeof timestamp !== "number" || !Number.isFinite(timestamp)) {
+    return "";
+  }
+
+  return new Date(timestamp).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  });
+}
+
+function autoResizeTextarea(textarea: HTMLTextAreaElement): void {
+  textarea.style.height = "auto";
+  const nextHeight = Math.min(textarea.scrollHeight, 180);
+  textarea.style.height = `${Math.max(24, nextHeight)}px`;
+  textarea.style.overflowY = textarea.scrollHeight > 180 ? "auto" : "hidden";
+}
+
+function appendInlineMarkdown(parent: HTMLElement, text: string): void {
+  const pattern = /(\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|`([^`]+)`|\*\*([^*]+)\*\*|\*([^*]+)\*)/g;
+  let lastIndex = 0;
+
+  for (const match of text.matchAll(pattern)) {
+    const index = match.index ?? 0;
+    if (index > lastIndex) {
+      parent.appendChild(document.createTextNode(text.slice(lastIndex, index)));
+    }
+
+    if (match[2] && match[3]) {
+      const link = document.createElement("a");
+      link.href = match[3];
+      link.textContent = match[2];
+      link.target = "_blank";
+      link.rel = "noreferrer noopener";
+      parent.appendChild(link);
+    } else if (match[4]) {
+      const code = document.createElement("code");
+      code.textContent = match[4];
+      parent.appendChild(code);
+    } else if (match[5]) {
+      const strong = document.createElement("strong");
+      appendInlineMarkdown(strong, match[5]);
+      parent.appendChild(strong);
+    } else if (match[6]) {
+      const em = document.createElement("em");
+      appendInlineMarkdown(em, match[6]);
+      parent.appendChild(em);
+    }
+
+    lastIndex = index + match[0].length;
+  }
+
+  if (lastIndex < text.length) {
+    parent.appendChild(document.createTextNode(text.slice(lastIndex)));
+  }
+}
+
+function flushParagraph(buffer: string[], container: HTMLElement): void {
+  if (buffer.length === 0) {
+    return;
+  }
+
+  const paragraph = document.createElement("p");
+  appendInlineMarkdown(paragraph, buffer.join(" "));
+  container.appendChild(paragraph);
+  buffer.length = 0;
+}
+
+function flushList(listType: "ul" | "ol" | null, items: string[], container: HTMLElement): void {
+  if (!listType || items.length === 0) {
+    return;
+  }
+
+  const list = document.createElement(listType);
+  for (const itemText of items) {
+    const item = document.createElement("li");
+    appendInlineMarkdown(item, itemText);
+    list.appendChild(item);
+  }
+  container.appendChild(list);
+  items.length = 0;
+}
+
+function renderMarkdownToElement(container: HTMLElement, markdown: string): void {
+  container.replaceChildren();
+  container.classList.add("msg-body-rendered");
+
+  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
+  const paragraphBuffer: string[] = [];
+  let listType: "ul" | "ol" | null = null;
+  const listItems: string[] = [];
+  let codeFence: { language: string; lines: string[] } | null = null;
+
+  const flushAll = () => {
+    flushParagraph(paragraphBuffer, container);
+    flushList(listType, listItems, container);
+    listType = null;
+  };
+
+  for (const line of lines) {
+    if (codeFence) {
+      if (/^```/.test(line.trim())) {
+        const pre = document.createElement("pre");
+        const code = document.createElement("code");
+        if (codeFence.language) {
+          code.dataset.language = codeFence.language;
+        }
+        code.textContent = codeFence.lines.join("\n");
+        pre.appendChild(code);
+        container.appendChild(pre);
+        codeFence = null;
+      } else {
+        codeFence.lines.push(line);
+      }
+      continue;
+    }
+
+    const trimmed = line.trim();
+    if (!trimmed) {
+      flushAll();
+      continue;
+    }
+
+    const fenceMatch = trimmed.match(/^```([a-z0-9_-]+)?$/i);
+    if (fenceMatch) {
+      flushAll();
+      codeFence = { language: fenceMatch[1] ?? "", lines: [] };
+      continue;
+    }
+
+    const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
+    if (headingMatch) {
+      flushAll();
+      const heading = document.createElement(`h${headingMatch[1].length}` as keyof HTMLElementTagNameMap);
+      appendInlineMarkdown(heading, headingMatch[2].trim());
+      container.appendChild(heading);
+      continue;
+    }
+
+    const blockquoteMatch = line.match(/^>\s?(.*)$/);
+    if (blockquoteMatch) {
+      flushAll();
+      const quote = document.createElement("blockquote");
+      appendInlineMarkdown(quote, blockquoteMatch[1]);
+      container.appendChild(quote);
+      continue;
+    }
+
+    const orderedListMatch = line.match(/^\d+\.\s+(.*)$/);
+    if (orderedListMatch) {
+      flushParagraph(paragraphBuffer, container);
+      if (listType && listType !== "ol") {
+        flushList(listType, listItems, container);
+      }
+      listType = "ol";
+      listItems.push(orderedListMatch[1]);
+      continue;
+    }
+
+    const unorderedListMatch = line.match(/^[-*]\s+(.*)$/);
+    if (unorderedListMatch) {
+      flushParagraph(paragraphBuffer, container);
+      if (listType && listType !== "ul") {
+        flushList(listType, listItems, container);
+      }
+      listType = "ul";
+      listItems.push(unorderedListMatch[1]);
+      continue;
+    }
+
+    flushList(listType, listItems, container);
+    listType = null;
+    paragraphBuffer.push(trimmed);
+  }
+
+  if (codeFence) {
+    const pre = document.createElement("pre");
+    const code = document.createElement("code");
+    code.textContent = codeFence.lines.join("\n");
+    pre.appendChild(code);
+    container.appendChild(pre);
+  }
+
+  flushParagraph(paragraphBuffer, container);
+  flushList(listType, listItems, container);
+
+  if (!container.hasChildNodes()) {
+    container.textContent = markdown;
+    container.classList.remove("msg-body-rendered");
+  }
+}
+
+function getCopyIconMarkup(copied: boolean): string {
+  if (copied) {
+    return '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"></path></svg>';
+  }
+
+  return '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5" y="3" width="8" height="10" rx="1.5"></rect><path d="M3 11V5.5A1.5 1.5 0 0 1 4.5 4"></path></svg>';
+}
+
+async function copyTextToClipboard(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "true");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const succeeded = document.execCommand("copy");
+  document.body.removeChild(textarea);
+  if (!succeeded) {
+    throw new Error("Copy failed");
+  }
+}
+
+function appendMessageMeta(
+  container: HTMLDivElement,
+  options: { content?: string; getContent?: () => string; timestamp?: number; copyLabel?: string }
+): void {
+  const meta = document.createElement("div");
+  meta.className = "msg-meta";
+
+  const copyBtn = document.createElement("button");
+  copyBtn.type = "button";
+  copyBtn.className = "msg-copy-btn";
+  copyBtn.title = options.copyLabel ?? "复制内容";
+  copyBtn.setAttribute("aria-label", options.copyLabel ?? "复制内容");
+  copyBtn.innerHTML = getCopyIconMarkup(false);
+
+  let resetTimer: number | null = null;
+  copyBtn.addEventListener("click", async () => {
+    try {
+      const text = options.getContent ? options.getContent() : (options.content ?? "");
+      await copyTextToClipboard(text);
+      copyBtn.innerHTML = getCopyIconMarkup(true);
+      if (resetTimer) {
+        window.clearTimeout(resetTimer);
+      }
+      resetTimer = window.setTimeout(() => {
+        copyBtn.innerHTML = getCopyIconMarkup(false);
+        resetTimer = null;
+      }, 1200);
+    } catch {
+      copyBtn.title = "复制失败";
+      window.setTimeout(() => {
+        copyBtn.title = options.copyLabel ?? "复制内容";
+      }, 1200);
+    }
+  });
+  meta.appendChild(copyBtn);
+
+  const time = document.createElement("span");
+  time.className = "msg-time";
+  time.textContent = formatMessageTimestamp(options.timestamp);
+  if (options.timestamp) {
+    time.title = new Date(options.timestamp).toLocaleString();
+  }
+  meta.appendChild(time);
+
+  container.appendChild(meta);
+}
+
+function normalizeChatMessage(message: ChatMessage, fallbackTimestamp: number): ChatMessage {
+  return {
+    ...message,
+    timestamp: typeof message.timestamp === "number" ? message.timestamp : fallbackTimestamp
+  };
+}
+
+function normalizeAgentEntry(entry: AgentSessionEntry, fallbackTimestamp: number): AgentEntry {
+  return {
+    ...entry,
+    timestamp: typeof entry.timestamp === "number" ? entry.timestamp : fallbackTimestamp,
+    toolCall: entry.toolCall ? { ...entry.toolCall } : undefined
+  };
+}
+
+function normalizeChatSession(session: ChatSession): ChatSession {
+  return {
+    ...session,
+    messages: (session.messages ?? []).map((message, index) =>
+      normalizeChatMessage(message, session.updatedAt + index)
+    )
+  };
+}
+
+function normalizeAgentSession(session: AgentSession): AgentSession {
+  return {
+    ...session,
+    entries: (session.entries ?? []).map((entry, index) =>
+      normalizeAgentEntry(entry, session.updatedAt + index)
+    )
+  };
+}
 
 async function getCurrentTabId(): Promise<number | undefined> {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -1342,7 +1640,10 @@ function renderChatFull(): void {
   updateChatContextMeter();
 }
 
-function appendChatMessageDOM(msg: { role: string; content: string; reasoning_content?: string }, isLast: boolean): void {
+function appendChatMessageDOM(
+  msg: { role: string; content: string; reasoning_content?: string; timestamp?: number },
+  isLast: boolean
+): void {
   const thinking = msg.reasoning_content;
 
   // Thinking block
@@ -1373,11 +1674,29 @@ function appendChatMessageDOM(msg: { role: string; content: string; reasoning_co
 
   const body = document.createElement("div");
   body.className = "msg-body";
-  body.textContent = msg.content;
+  if (msg.role === "assistant") {
+    renderMarkdownToElement(body, msg.content);
+  } else {
+    body.textContent = msg.content;
+  }
 
+  const container = document.createElement("div");
+  container.className = "msg-stack";
   bubble.appendChild(role);
   bubble.appendChild(body);
-  chatMessagesEl.appendChild(bubble);
+  container.appendChild(bubble);
+  if (msg.role === "assistant" || msg.role === "user") {
+    appendMessageMeta(container, {
+      getContent: () => body.textContent ?? "",
+      timestamp: msg.timestamp,
+      copyLabel: msg.role === "user" ? "复制提问" : "复制回复"
+    });
+    const meta = container.querySelector(".msg-meta");
+    if (meta) {
+      meta.classList.add(msg.role === "user" ? "msg-meta-user" : "msg-meta-assistant");
+    }
+  }
+  chatMessagesEl.appendChild(container);
 
   if (isLast && msg.role === "assistant") {
     chatStreamingBodyEl = body;
@@ -1411,7 +1730,7 @@ function renderChat(): void {
 
   // Incremental update for the last (streaming) assistant message
   if (msgs.length > 0) {
-    const last = msgs[msgs.length - 1] as { role: string; content: string; reasoning_content?: string };
+    const last = msgs[msgs.length - 1] as { role: string; content: string; reasoning_content?: string; timestamp?: number };
     if (last.role === "assistant") {
       // Update thinking in-place
       const thinking = last.reasoning_content;
@@ -1444,7 +1763,7 @@ function renderChat(): void {
 
       // Update content in-place
       if (chatStreamingBodyEl) {
-        chatStreamingBodyEl.textContent = last.content;
+        renderMarkdownToElement(chatStreamingBodyEl, last.content);
       }
     }
   }
@@ -1606,11 +1925,12 @@ function renderChatSessions(): void {
     btn.addEventListener("click", () => {
       activeSessionId = session.id;
       chatState = {
-        messages: session.messages,
+        messages: session.messages.map((message, index) => normalizeChatMessage(message, session.updatedAt + index)),
         pending: false
       };
       renderChatSessions();
       renderChat();
+      autoResizeTextarea(chatInput);
     });
     chatSessionsEl.appendChild(btn);
   }
@@ -1646,7 +1966,7 @@ async function loadChatSessions(): Promise<void> {
     return;
   }
 
-  chatSessions = response.data as ChatSession[];
+  chatSessions = (response.data as ChatSession[]).map(normalizeChatSession);
   if (chatSessions.length > 0) {
     activeSessionId = chatSessions[0].id;
     chatState = {
@@ -1660,6 +1980,7 @@ async function loadChatSessions(): Promise<void> {
 
   renderChatSessions();
   renderChat();
+  autoResizeTextarea(chatInput);
 }
 
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
@@ -2422,6 +2743,7 @@ const loadPageContext = createLoadPageContextAction(
 async function sendChatMessage(): Promise<void> {
   const input = chatInput.value;
   chatInput.value = "";
+  autoResizeTextarea(chatInput);
   if (!input.trim()) {
     return;
   }
@@ -2881,7 +3203,7 @@ function handleAgentChatStreamEvent(event: RuntimeStreamEvent): boolean {
       if (thinkingEntry?.type === "thinking") {
         thinkingEntry.content += event.payload.reasoning;
       } else {
-        agentEntries.push({ type: "thinking", content: event.payload.reasoning });
+        agentEntries.push({ type: "thinking", content: event.payload.reasoning, timestamp: Date.now() });
       }
     }
 
@@ -2890,7 +3212,7 @@ function handleAgentChatStreamEvent(event: RuntimeStreamEvent): boolean {
       if (assistantEntry?.type === "assistant") {
         assistantEntry.content += event.payload.delta;
       } else {
-        agentEntries.push({ type: "assistant", content: event.payload.delta });
+        agentEntries.push({ type: "assistant", content: event.payload.delta, timestamp: Date.now() });
       }
     }
 
@@ -2900,7 +3222,7 @@ function handleAgentChatStreamEvent(event: RuntimeStreamEvent): boolean {
   }
 
   if (event.type === "LLM_STREAM_ERROR") {
-    agentEntries.push({ type: "assistant", content: `Error: ${event.payload.error}` });
+    agentEntries.push({ type: "assistant", content: `Error: ${event.payload.error}`, timestamp: Date.now() });
     agentPending = false;
     activeAgentChatStreamRequestId = null;
     agentStreamThinkingEnabledByRequestId.delete(event.payload.requestId);
@@ -2947,10 +3269,7 @@ function showAgentPanel(panel: "memories" | "skills" | "tasks" | null): void {
   memoriesPanelEl.hidden = panel !== "memories";
   skillsPanelEl.hidden = panel !== "skills";
   tasksPanelEl.hidden = panel !== "tasks";
-
-  toggleMemoriesBtn.classList.toggle("active", panel === "memories");
-  toggleSkillsBtn.classList.toggle("active", panel === "skills");
-  toggleTasksBtn.classList.toggle("active", panel === "tasks");
+  agentPanelSelect.value = panel ?? "";
 }
 
 function getAgentPendingStatusText(): string {
@@ -2986,10 +3305,9 @@ function renderAgentComposerMode(): void {
   const isAgentMode = agentComposerMode === "agent";
   agentModeSelect.value = agentComposerMode;
   agentComposerRootEl.classList.toggle("agent-chat-mode", !isAgentMode);
-  agentToolsRowEl.hidden = !isAgentMode;
-  agentToolsRowEl.style.display = isAgentMode ? "flex" : "none";
-  agentToolGroupEl.hidden = !isAgentMode;
-  agentToolGroupEl.style.display = isAgentMode ? "inline-flex" : "none";
+  agentPanelSelect.hidden = !isAgentMode;
+  agentPanelSelect.disabled = !isAgentMode;
+  agentPanelSelect.style.display = isAgentMode ? "" : "none";
   askAndAutoFillBtn.hidden = isAgentMode;
   askAndAutoFillBtn.disabled = isAgentMode;
   askAndAutoFillBtn.style.display = isAgentMode ? "none" : "";
@@ -2997,12 +3315,11 @@ function renderAgentComposerMode(): void {
   chatThinkingToggleBtn.disabled = isAgentMode;
   chatThinkingToggleBtn.style.display = isAgentMode ? "none" : "";
   agentInput.placeholder = isAgentMode ? "告诉智能体你想做什么..." : "输入消息...";
-  if (!isAgentMode) {
-    showAgentPanel(null);
-  }
+  if (!isAgentMode) showAgentPanel(null);
   agentIterInfoEl.hidden = !isAgentMode && !agentIterInfoText;
   setAgentStatus(getAgentPendingStatusText());
   updateAgentActionButton();
+  autoResizeTextarea(agentInput);
 }
 
 function setAgentComposerMode(mode: AgentComposerMode): void {
@@ -3032,9 +3349,19 @@ function renderAgent(): void {
       const body = document.createElement("div");
       body.className = "msg-body";
       body.textContent = entry.content;
+      const container = document.createElement("div");
+      container.className = "msg-stack";
       bubble.appendChild(role);
       bubble.appendChild(body);
-      agentMessagesEl.appendChild(bubble);
+      container.appendChild(bubble);
+      appendMessageMeta(container, {
+        getContent: () => body.textContent ?? "",
+        timestamp: entry.timestamp,
+        copyLabel: "复制提问"
+      });
+      const meta = container.querySelector(".msg-meta");
+      meta?.classList.add("msg-meta-user");
+      agentMessagesEl.appendChild(container);
     } else if (entry.type === "thinking") {
       const details = document.createElement("details");
       details.className = "thinking-block";
@@ -3108,10 +3435,20 @@ function renderAgent(): void {
       role.textContent = "Agent";
       const body = document.createElement("div");
       body.className = "msg-body";
-      body.textContent = entry.content;
+      renderMarkdownToElement(body, entry.content);
+      const container = document.createElement("div");
+      container.className = "msg-stack";
       bubble.appendChild(role);
       bubble.appendChild(body);
-      agentMessagesEl.appendChild(bubble);
+      container.appendChild(bubble);
+      appendMessageMeta(container, {
+        getContent: () => body.textContent ?? "",
+        timestamp: entry.timestamp,
+        copyLabel: "复制回复"
+      });
+      const meta = container.querySelector(".msg-meta");
+      meta?.classList.add("msg-meta-assistant");
+      agentMessagesEl.appendChild(container);
     }
   }
 
@@ -3133,7 +3470,7 @@ function handleAgentEvent(event: AgentProgressEvent): void {
     if (last?.type === "assistant") {
       last.content += event.payload.delta;
     } else {
-      agentEntries.push({ type: "assistant", content: event.payload.delta });
+      agentEntries.push({ type: "assistant", content: event.payload.delta, timestamp: Date.now() });
     }
     renderAgent();
     scheduleAgentPersist();
@@ -3145,7 +3482,7 @@ function handleAgentEvent(event: AgentProgressEvent): void {
     if (last?.type === "thinking") {
       last.content += event.payload.delta;
     } else {
-      agentEntries.push({ type: "thinking", content: event.payload.delta });
+      agentEntries.push({ type: "thinking", content: event.payload.delta, timestamp: Date.now() });
     }
     renderAgent();
     return;
@@ -3161,6 +3498,7 @@ function handleAgentEvent(event: AgentProgressEvent): void {
       agentEntries.push({
         type: "tool",
         content: "",
+        timestamp: Date.now(),
         toolCall: {
           id: event.payload.toolCallId,
           name: event.payload.name,
@@ -3204,7 +3542,7 @@ function handleAgentEvent(event: AgentProgressEvent): void {
   if (event.type === "AGENT_ERROR") {
     agentPending = false;
     activeAgentRequestId = null;
-    agentEntries.push({ type: "assistant", content: `⚠️ ${event.payload.error}` });
+    agentEntries.push({ type: "assistant", content: `⚠️ ${event.payload.error}`, timestamp: Date.now() });
     renderAgent();
     void persistActiveAgentSession();
     return;
@@ -3217,7 +3555,9 @@ function handleExternalAgentRunStarted(event: ExternalAgentRunStartedEvent): voi
 
   if (existing) {
     activeAgentSessionId = existing.id;
-    agentEntries = (existing.entries ?? []).map((entry) => ({ ...entry }));
+    agentEntries = (existing.entries ?? []).map((entry, index) =>
+      normalizeAgentEntry(entry, existing.updatedAt + index)
+    );
   } else {
     const session: AgentSession = {
       id: event.payload.requestId,
@@ -3228,13 +3568,14 @@ function handleExternalAgentRunStarted(event: ExternalAgentRunStartedEvent): voi
       entries: [
         {
           type: "user",
-          content: event.payload.userMessage
+          content: event.payload.userMessage,
+          timestamp: event.payload.createdAt || now
         }
       ]
     };
     agentSessions = [session, ...agentSessions.filter((s) => s.id !== session.id)];
     activeAgentSessionId = session.id;
-    agentEntries = session.entries.map((entry) => ({ ...entry }));
+    agentEntries = session.entries.map((entry, index) => normalizeAgentEntry(entry, session.updatedAt + index));
   }
 
   activeAgentRequestId = event.payload.requestId;
@@ -3310,6 +3651,7 @@ function buildTrimmedAgentChatMessages(input: {
 async function sendAgentMessage(): Promise<void> {
   const input = agentInput.value.trim();
   agentInput.value = "";
+  autoResizeTextarea(agentInput);
   if (!input) return;
 
   const tabId = await getCurrentTabId();
@@ -3319,7 +3661,7 @@ async function sendAgentMessage(): Promise<void> {
   }
 
   const history = buildAgentHistoryMessages(agentEntries);
-  agentEntries.push({ type: "user", content: input });
+  agentEntries.push({ type: "user", content: input, timestamp: Date.now() });
   agentPending = true;
   renderAgent();
   scheduleAgentPersist();
@@ -3346,7 +3688,8 @@ async function sendAgentMessage(): Promise<void> {
       activeAgentRequestId = null;
       agentEntries.push({
         type: "assistant",
-        content: `Error: ${Array.isArray(response?.errors) ? response.errors.join(", ") : "Agent request failed"}`
+        content: `Error: ${Array.isArray(response?.errors) ? response.errors.join(", ") : "Agent request failed"}`,
+        timestamp: Date.now()
       });
       renderAgent();
     }
@@ -3355,7 +3698,8 @@ async function sendAgentMessage(): Promise<void> {
     activeAgentRequestId = null;
     agentEntries.push({
       type: "assistant",
-      content: `Error: ${error instanceof Error ? error.message : "Unknown error"}`
+      content: `Error: ${error instanceof Error ? error.message : "Unknown error"}`,
+      timestamp: Date.now()
     });
     renderAgent();
   }
@@ -3364,6 +3708,7 @@ async function sendAgentMessage(): Promise<void> {
 async function sendAgentChatMessage(): Promise<void> {
   const input = agentInput.value.trim();
   agentInput.value = "";
+  autoResizeTextarea(agentInput);
   if (!input) return;
 
   await sendAgentChatMessageWithContent(input);
@@ -3377,7 +3722,7 @@ async function sendAgentChatMessageWithContent(
   const includeHistory = options?.includeHistory ?? true;
   const baseConfig = toAgentConfig();
 
-  agentEntries.push({ type: "user", content: input });
+  agentEntries.push({ type: "user", content: input, timestamp: Date.now() });
   agentPending = true;
   renderAgent();
   scheduleAgentPersist();
@@ -3424,7 +3769,7 @@ async function sendAgentChatMessageWithContent(
       const message = Array.isArray(response?.errors)
         ? response.errors.join(", ")
         : "LLM stream request failed";
-      agentEntries.push({ type: "assistant", content: `Error: ${message}` });
+      agentEntries.push({ type: "assistant", content: `Error: ${message}`, timestamp: Date.now() });
       agentPending = false;
       activeAgentChatStreamRequestId = null;
       agentStreamThinkingEnabledByRequestId.delete(requestId);
@@ -3440,7 +3785,8 @@ async function sendAgentChatMessageWithContent(
   } catch (error) {
     agentEntries.push({
       type: "assistant",
-      content: `Error: ${error instanceof Error ? error.message : "Unknown error"}`
+      content: `Error: ${error instanceof Error ? error.message : "Unknown error"}`,
+      timestamp: Date.now()
     });
     agentPending = false;
     activeAgentChatStreamRequestId = null;
@@ -3547,7 +3893,9 @@ function renderAgentSessions(): void {
     btn.title = new Date(session.updatedAt).toLocaleString();
     btn.addEventListener("click", () => {
       activeAgentSessionId = session.id;
-      agentEntries = (session.entries ?? []).map((e) => ({ ...e }));
+      agentEntries = (session.entries ?? []).map((entry, index) =>
+        normalizeAgentEntry(entry, session.updatedAt + index)
+      );
       activeAgentRequestId = null;
       activeAgentChatStreamRequestId = null;
       agentPending = false;
@@ -3599,6 +3947,7 @@ async function persistActiveAgentSession(): Promise<void> {
     entries: agentEntries.map((e) => ({
       type: e.type,
       content: e.content,
+      timestamp: e.timestamp,
       toolCall: e.toolCall ? { ...e.toolCall } : undefined
     }))
   };
@@ -3624,10 +3973,12 @@ async function loadAgentSessions(): Promise<void> {
     return;
   }
 
-  agentSessions = response.data as AgentSession[];
+  agentSessions = (response.data as AgentSession[]).map(normalizeAgentSession);
   if (agentSessions.length > 0) {
     activeAgentSessionId = agentSessions[0].id;
-    agentEntries = (agentSessions[0].entries ?? []).map((e) => ({ ...e }));
+    agentEntries = (agentSessions[0].entries ?? []).map((entry, index) =>
+      normalizeAgentEntry(entry, agentSessions[0].updatedAt + index)
+    );
   } else {
     activeAgentSessionId = null;
     agentEntries = [];
@@ -3635,6 +3986,7 @@ async function loadAgentSessions(): Promise<void> {
 
   renderAgentSessions();
   renderAgent();
+  autoResizeTextarea(agentInput);
 }
 
 function newAgentSession(): void {
@@ -3647,6 +3999,7 @@ function newAgentSession(): void {
   ensureActiveAgentSession();
   renderAgentSessions();
   renderAgent();
+  autoResizeTextarea(agentInput);
 }
 
 async function deleteAgentSession(): Promise<void> {
@@ -3656,7 +4009,9 @@ async function deleteAgentSession(): Promise<void> {
   agentSessions = agentSessions.filter((s) => s.id !== sessionId);
   if (agentSessions.length > 0) {
     activeAgentSessionId = agentSessions[0].id;
-    agentEntries = (agentSessions[0].entries ?? []).map((e) => ({ ...e }));
+    agentEntries = (agentSessions[0].entries ?? []).map((entry, index) =>
+      normalizeAgentEntry(entry, agentSessions[0].updatedAt + index)
+    );
   } else {
     activeAgentSessionId = null;
     agentEntries = [];
@@ -3668,6 +4023,7 @@ async function deleteAgentSession(): Promise<void> {
   setAgentIterationInfo("");
   renderAgentSessions();
   renderAgent();
+  autoResizeTextarea(agentInput);
 
   await chrome.runtime.sendMessage({
     type: "DELETE_AGENT_SESSION",
@@ -4456,6 +4812,7 @@ chatInput.addEventListener("keydown", (e) => {
 });
 
 chatInput.addEventListener("input", () => {
+  autoResizeTextarea(chatInput);
   updateChatContextMeter();
 });
 
@@ -4493,10 +4850,14 @@ byId<HTMLButtonElement>("clearAgentSessions").addEventListener("click", () => {
   void clearAgentSessions();
 });
 
-toggleMemoriesBtn.addEventListener("click", () => {
-  const next = activeAgentPanel === "memories" ? null : "memories";
+agentPanelSelect.addEventListener("change", () => {
+  const next = agentPanelSelect.value === "memories" || agentPanelSelect.value === "skills" || agentPanelSelect.value === "tasks"
+    ? agentPanelSelect.value
+    : null;
   showAgentPanel(next);
   if (next === "memories") void loadMemoriesList();
+  if (next === "skills") void loadSkillsList();
+  if (next === "tasks") void loadTasksList();
 });
 
 byId<HTMLButtonElement>("refreshMemories").addEventListener("click", () => {
@@ -4515,12 +4876,6 @@ byId<HTMLButtonElement>("compressMemories").addEventListener("click", () => {
   void compressMemoriesAction();
 });
 
-toggleSkillsBtn.addEventListener("click", () => {
-  const next = activeAgentPanel === "skills" ? null : "skills";
-  showAgentPanel(next);
-  if (next === "skills") void loadSkillsList();
-});
-
 byId<HTMLButtonElement>("refreshSkills").addEventListener("click", () => {
   void loadSkillsList();
 });
@@ -4531,12 +4886,6 @@ byId<HTMLButtonElement>("importSkills").addEventListener("click", () => {
 
 byId<HTMLButtonElement>("exportSkills").addEventListener("click", () => {
   void exportSkillsToFile();
-});
-
-toggleTasksBtn.addEventListener("click", () => {
-  const next = activeAgentPanel === "tasks" ? null : "tasks";
-  showAgentPanel(next);
-  if (next === "tasks") void loadTasksList();
 });
 
 byId<HTMLButtonElement>("refreshTasks").addEventListener("click", () => {
@@ -4555,6 +4904,7 @@ agentInput.addEventListener("keydown", (e) => {
 });
 
 agentInput.addEventListener("input", () => {
+  autoResizeTextarea(agentInput);
   updateAgentContextMeter();
 });
 
@@ -4603,6 +4953,8 @@ renderChatThinkingToggle();
 renderAgentComposerMode();
 void loadConfig();
 updateApiKeyVisibilityButton();
+autoResizeTextarea(chatInput);
+autoResizeTextarea(agentInput);
 void loadChatSessions();
 void loadAgentSessions();
 setTimeout(() => {

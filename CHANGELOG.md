@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is loosely based on Keep a Changelog, with versions tracked alongside Git tags such as `v0.1.2`.
 
+## [0.1.11] - 2026-06-09
+
+### Changed
+- Updated ask/agent message bubbles to show hover actions below the bubble, with copy buttons and per-message timestamps for both user and assistant messages.
+- Updated the unified ask/agent textareas to auto-resize with user input and shrink back after sending or switching sessions.
+- Updated assistant/agent message rendering in the side panel to display common Markdown formatting instead of raw Markdown source.
+
+### Fixed
+- Fixed fullscreen-request blocking so blocked requests resolve quietly instead of surfacing uncaught `NotAllowedError` promise rejections on target sites.
+- Fixed side-panel version labels so the manifest, HTML title, and visible UI version text now stay aligned with the released package version.
+
 ## [0.1.10] - 2026-06-09
 
 ### Added

@@ -31,7 +31,7 @@ export function reduceChatState(state: ChatState, action: ChatStateAction): Chat
   if (action.type === "START_ASSISTANT_STREAM") {
     return {
       ...state,
-      messages: [...state.messages, { role: "assistant", content: "" }]
+      messages: [...state.messages, { role: "assistant", content: "", timestamp: Date.now() }]
     };
   }
 
@@ -105,6 +105,6 @@ export function reduceChatState(state: ChatState, action: ChatStateAction): Chat
 
   return {
     ...state,
-    messages: [...state.messages, { role, content }]
+    messages: [...state.messages, { role, content, timestamp: Date.now() }]
   };
 }

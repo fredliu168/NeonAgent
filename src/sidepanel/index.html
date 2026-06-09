@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>NeonAgent v0.1.6</title>
+    <title>NeonAgent v0.1.11</title>
     <style>
       /* =========== Reset & Base =========== */
       *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -138,7 +138,13 @@
         border-radius: 12px;
         line-height: 1.5;
         word-wrap: break-word;
-        white-space: pre-wrap;
+      }
+
+      .msg-stack {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        max-width: 88%;
       }
 
       .msg-user {
@@ -175,6 +181,156 @@
       }
 
       .msg-user .msg-role { color: rgba(255,255,255,.7); }
+
+      .msg-body {
+        white-space: pre-wrap;
+      }
+
+      .msg-body-rendered {
+        white-space: normal;
+      }
+
+      .msg-body-rendered > *:first-child {
+        margin-top: 0;
+      }
+
+      .msg-body-rendered > *:last-child {
+        margin-bottom: 0;
+      }
+
+      .msg-body-rendered p,
+      .msg-body-rendered ul,
+      .msg-body-rendered ol,
+      .msg-body-rendered pre,
+      .msg-body-rendered blockquote,
+      .msg-body-rendered h1,
+      .msg-body-rendered h2,
+      .msg-body-rendered h3,
+      .msg-body-rendered h4,
+      .msg-body-rendered h5,
+      .msg-body-rendered h6 {
+        margin: 0 0 8px;
+      }
+
+      .msg-body-rendered h1,
+      .msg-body-rendered h2,
+      .msg-body-rendered h3,
+      .msg-body-rendered h4,
+      .msg-body-rendered h5,
+      .msg-body-rendered h6 {
+        line-height: 1.35;
+        font-weight: 700;
+        color: inherit;
+      }
+
+      .msg-body-rendered h1 { font-size: 18px; }
+      .msg-body-rendered h2 { font-size: 16px; }
+      .msg-body-rendered h3 { font-size: 14px; }
+      .msg-body-rendered h4,
+      .msg-body-rendered h5,
+      .msg-body-rendered h6 { font-size: 13px; }
+
+      .msg-body-rendered ul,
+      .msg-body-rendered ol {
+        padding-left: 20px;
+      }
+
+      .msg-body-rendered li + li {
+        margin-top: 4px;
+      }
+
+      .msg-body-rendered code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 11px;
+        background: #f3f4f6;
+        border-radius: 5px;
+        padding: 1px 4px;
+      }
+
+      .msg-body-rendered pre {
+        overflow-x: auto;
+        padding: 10px 12px;
+        border-radius: 8px;
+        background: #111827;
+        color: #f9fafb;
+      }
+
+      .msg-body-rendered pre code {
+        display: block;
+        padding: 0;
+        background: transparent;
+        color: inherit;
+      }
+
+      .msg-body-rendered blockquote {
+        border-left: 3px solid #cbd5e1;
+        padding-left: 10px;
+        color: #475569;
+      }
+
+      .msg-body-rendered a {
+        color: #0f766e;
+        text-decoration: underline;
+        word-break: break-word;
+      }
+
+      .msg-meta {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        opacity: 0;
+        transition: opacity .15s ease;
+      }
+
+      .msg-stack:hover .msg-meta,
+      .msg-stack:focus-within .msg-meta {
+        opacity: 1;
+      }
+
+      .msg-time {
+        font-size: 10px;
+        color: #94a3b8;
+        letter-spacing: .02em;
+      }
+
+      .msg-meta-assistant {
+        align-self: flex-start;
+        padding-left: 4px;
+      }
+
+      .msg-meta-user {
+        align-self: flex-end;
+        padding-right: 4px;
+      }
+
+      .msg-copy-btn {
+        width: 18px;
+        height: 18px;
+        border: none;
+        background: transparent;
+        color: #64748b;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 5px;
+        cursor: pointer;
+        padding: 0;
+      }
+
+      .msg-copy-btn:hover {
+        background: rgba(148, 163, 184, .14);
+        color: #334155;
+      }
+
+      .msg-copy-btn svg {
+        width: 14px;
+        height: 14px;
+        stroke: currentColor;
+        fill: none;
+        stroke-width: 1.8;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
 
       /* Status bars */
       .status-bar {
@@ -622,6 +778,8 @@
         display: block;
         width: 100%;
         min-height: 24px;
+        max-height: 180px;
+        overflow-y: auto;
         resize: none;
         border: none;
         outline: none;
@@ -811,21 +969,17 @@
         box-shadow: none;
       }
 
-      .agent-tool-group {
-        display: inline-flex;
-        align-items: center;
-        gap: 8px;
-        margin-top: 8px;
-      }
-
-      .agent-tools-row {
-        display: flex;
-        align-items: center;
-        justify-content: flex-start;
-      }
-
-      .chat-composer.agent-chat-mode .agent-tools-row {
-        display: none !important;
+      .agent-panel-select {
+        min-width: 72px;
+        max-width: 96px;
+        border: none;
+        border-radius: 999px;
+        background: #ffffff;
+        color: #1f2937;
+        padding: 6px 10px;
+        font-size: 12px;
+        outline: none;
+        box-shadow: none;
       }
 
       .chat-composer .btn-secondary {
@@ -1664,6 +1818,12 @@
               <button id="askAndAutoFill" class="btn-accent" title="解题" aria-label="解题"><span class="solve-icon" aria-hidden="true">⚡︎</span></button>
             </div>
             <div class="chat-composer-right">
+              <select id="agentPanelSelect" class="agent-panel-select" title="选择资源">
+                <option value="">资源</option>
+                <option value="memories">记忆</option>
+                <option value="skills">技能</option>
+                <option value="tasks">定时</option>
+              </select>
               <div id="agentModelMenuRoot" class="chat-model-stack">
                 <button id="agentModelMenuButton" type="button" class="model-menu-trigger" aria-haspopup="menu" aria-expanded="false">Model</button>
                 <div id="agentModelMenu" class="model-menu" hidden>
@@ -1679,13 +1839,6 @@
               </div>
               <div id="agentContextMeter" class="context-meter" title="上下文占用约 0%"></div>
               <button id="agentAction" class="btn-primary chat-send-btn" title="发送">↑</button>
-            </div>
-          </div>
-          <div id="agentToolsRow" class="agent-tools-row" hidden>
-            <div id="agentToolGroup" class="agent-tool-group">
-              <button id="toggleMemories" class="btn-secondary tool-icon-btn" title="记忆" aria-label="记忆">🧠</button>
-              <button id="toggleSkills" class="btn-secondary tool-icon-btn" title="技能" aria-label="技能">🧩</button>
-              <button id="toggleTasks" class="btn-secondary tool-icon-btn" title="定时" aria-label="定时">⏰</button>
             </div>
           </div>
         </div>
@@ -1914,7 +2067,7 @@
           </section>
 
           <section class="card" style="text-align:center;color:#94a3b8;font-size:11px;">
-            <p>NeonAgent v0.1.6</p>
+            <p>NeonAgent v0.1.11</p>
             <p style="margin-top:4px;">本工具仅供学习研究使用，严禁用于违反考试规则或非法用途。</p>
           </section>
         </div>
