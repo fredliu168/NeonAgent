@@ -611,7 +611,7 @@
       }
 
       .chat-composer {
-        background: #ffffff;
+        background: #E8E8E8;
         border: 1px solid #e5e7eb;
         border-radius: 28px;
         padding: 18px 18px 14px;
@@ -651,6 +651,14 @@
         display: flex;
         align-items: center;
         gap: 8px;
+      }
+
+      .chat-model-stack {
+        position: relative;
+        display: flex;
+        align-items: flex-end;
+        width: max-content;
+        max-width: 220px;
       }
 
       .chat-composer .btn-accent {
@@ -702,6 +710,124 @@
         box-shadow: none;
       }
 
+      .chat-composer-model.is-hidden-native {
+        display: none;
+      }
+
+      .model-menu-trigger {
+        width: max-content;
+        max-width: 220px;
+        border: none;
+        border-radius: 999px;
+        background: #ffffff;
+        color: #1f2937;
+        padding: 7px 12px;
+        font-size: 12px;
+        line-height: 1;
+        cursor: pointer;
+        text-align: right;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .model-menu {
+        position: absolute;
+        right: 0;
+        bottom: calc(100% + 8px);
+        z-index: 20;
+        min-width: 100%;
+        width: max-content;
+        max-width: 220px;
+        max-height: 260px;
+        overflow-y: auto;
+        padding: 8px;
+        border: 1px solid #d1d5db;
+        border-radius: 8px;
+        background: #ffffff;
+        box-shadow: 0 12px 30px rgba(15, 23, 42, .18);
+      }
+
+      .model-menu-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        width: 100%;
+        padding: 8px;
+        border: none;
+        border-radius: 6px;
+        background: transparent;
+        color: #1f2937;
+        font-size: 12px;
+        text-align: left;
+      }
+
+      .model-menu-row span:first-child {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .model-menu-option {
+        cursor: pointer;
+      }
+
+      .model-menu-option:hover,
+      .model-menu-option.is-active {
+        background: #f3f4f6;
+      }
+
+      .model-menu-check {
+        color: #0f766e;
+        font-size: 12px;
+      }
+
+      .model-menu .chat-thinking-toggle {
+        color: #1f2937;
+        cursor: pointer;
+      }
+
+      .model-menu .chat-thinking-toggle:hover {
+        background: #f3f4f6;
+        color: #1f2937;
+      }
+
+      .agent-mode-select {
+        min-width: 72px;
+        max-width: 84px;
+        border: none;
+        border-radius: 999px;
+        background: #ffffff;
+        color: #1f2937;
+        padding: 6px 10px;
+        font-size: 12px;
+        outline: none;
+        box-shadow: none;
+      }
+
+      .agent-mode-select:focus {
+        outline: none;
+        box-shadow: none;
+      }
+
+      .agent-tool-group {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 8px;
+      }
+
+      .agent-tools-row {
+        display: flex;
+        align-items: center;
+        justify-content: flex-start;
+      }
+
+      .chat-composer.agent-chat-mode .agent-tools-row {
+        display: none !important;
+      }
+
       .chat-composer .btn-secondary {
         border: none;
         background: transparent;
@@ -724,6 +850,10 @@
         font-size: 11px;
         cursor: pointer;
         transition: color .15s ease;
+      }
+
+      .chat-model-stack .chat-thinking-toggle {
+        padding: 0 2px;
       }
 
       .chat-thinking-toggle:hover {
@@ -1465,8 +1595,7 @@
   <body>
     <!-- Tabs -->
     <nav class="tab-bar">
-      <button class="tab-btn active" data-tab="tabChat">对话</button>
-      <button class="tab-btn" data-tab="tabAgent">智能体</button>
+      <button class="tab-btn active" data-tab="tabAgent">智能体</button>
       <button class="tab-btn" data-tab="tabTranslate">翻译</button>
       <button class="tab-btn" data-tab="tabSettings">设置</button>
     </nav>
@@ -1474,12 +1603,12 @@
     <div id="injectionNotice" hidden></div>
 
     <!-- ===== Chat Tab ===== -->
-    <main id="tabChat" class="tab-content active">
+    <main id="tabChat" class="tab-content">
       <!-- Session bar -->
       <div class="session-bar">
         <div id="chatSessions" class="session-list"></div>
         <div class="session-actions">
-          <button id="newChat" title="新建对话">+</button>
+          <button id="newChat" title="新建 ask">+</button>
           <button id="deleteChat" title="删除当前">&times;</button>
           <button id="clearChats" title="清空全部">&empty;</button>
         </div>
@@ -1494,20 +1623,13 @@
 
       <!-- Input area -->
       <div class="input-area">
-        <div class="chat-composer">
+        <div id="agentComposerRoot" class="chat-composer">
           <textarea id="chatInput" class="chat-composer-input" placeholder="输入消息..." rows="1"></textarea>
           <div class="chat-composer-footer">
             <div class="chat-composer-left">
-              <button id="askAndAutoFill" class="btn-accent" title="解题" aria-label="解题"><span class="solve-icon" aria-hidden="true">⚡︎</span></button>
-              <button id="chatThinkingToggle" type="button" class="chat-thinking-toggle is-on" title="Thinking 已开启" aria-label="切换 Thinking 模式" aria-pressed="true">
-                <span class="chat-thinking-toggle-track" aria-hidden="true">
-                  <span class="chat-thinking-toggle-thumb"></span>
-                </span>
-                <span class="chat-thinking-toggle-label">Thinking</span>
-              </button>
             </div>
             <div class="chat-composer-right">
-              <select id="chatModel" class="chat-composer-model" title="选择对话模型"></select>
+              <select id="chatModel" class="chat-composer-model" title="选择 ask 模型"></select>
               <div id="chatContextMeter" class="context-meter" title="上下文占用约 0%"></div>
               <button id="chatAction" class="btn-primary chat-send-btn" title="发送">↑</button>
             </div>
@@ -1517,7 +1639,7 @@
     </main>
 
     <!-- ===== Agent Tab ===== -->
-    <main id="tabAgent" class="tab-content">
+    <main id="tabAgent" class="tab-content active">
       <!-- Agent session bar -->
       <div class="session-bar">
         <div id="agentSessions" class="session-list"></div>
@@ -1535,14 +1657,35 @@
           <textarea id="agentInput" class="chat-composer-input" placeholder="告诉智能体你想做什么..." rows="1"></textarea>
           <div class="chat-composer-footer">
             <div class="chat-composer-left">
+              <select id="agentModeSelect" class="agent-mode-select" title="选择模式">
+                <option value="chat">ask</option>
+                <option value="agent" selected>Agent</option>
+              </select>
+              <button id="askAndAutoFill" class="btn-accent" title="解题" aria-label="解题"><span class="solve-icon" aria-hidden="true">⚡︎</span></button>
+            </div>
+            <div class="chat-composer-right">
+              <div id="agentModelMenuRoot" class="chat-model-stack">
+                <button id="agentModelMenuButton" type="button" class="model-menu-trigger" aria-haspopup="menu" aria-expanded="false">Model</button>
+                <div id="agentModelMenu" class="model-menu" hidden>
+                  <button id="chatThinkingToggle" type="button" class="chat-thinking-toggle model-menu-row is-on" title="Thinking 已开启" aria-label="切换 Thinking 模式" aria-pressed="true">
+                    <span class="chat-thinking-toggle-label">Thinking</span>
+                    <span class="chat-thinking-toggle-track" aria-hidden="true">
+                      <span class="chat-thinking-toggle-thumb"></span>
+                    </span>
+                  </button>
+                  <div id="agentModelMenuOptions"></div>
+                </div>
+                <select id="agentModel" class="chat-composer-model is-hidden-native" title="选择智能体模型"></select>
+              </div>
+              <div id="agentContextMeter" class="context-meter" title="上下文占用约 0%"></div>
+              <button id="agentAction" class="btn-primary chat-send-btn" title="发送">↑</button>
+            </div>
+          </div>
+          <div id="agentToolsRow" class="agent-tools-row" hidden>
+            <div id="agentToolGroup" class="agent-tool-group">
               <button id="toggleMemories" class="btn-secondary tool-icon-btn" title="记忆" aria-label="记忆">🧠</button>
               <button id="toggleSkills" class="btn-secondary tool-icon-btn" title="技能" aria-label="技能">🧩</button>
               <button id="toggleTasks" class="btn-secondary tool-icon-btn" title="定时" aria-label="定时">⏰</button>
-            </div>
-            <div class="chat-composer-right">
-              <select id="agentModel" class="chat-composer-model" title="选择智能体模型"></select>
-              <div id="agentContextMeter" class="context-meter" title="上下文占用约 0%"></div>
-              <button id="agentAction" class="btn-primary chat-send-btn" title="发送">↑</button>
             </div>
           </div>
         </div>
@@ -1621,7 +1764,7 @@
           </div>
 
           <label for="agentMaxTokens">智能体 Max Tokens</label>
-          <input id="agentMaxTokens" type="number" placeholder="102400" min="1" />
+          <input id="agentMaxTokens" type="number" placeholder="8192" min="1" max="65536" />
 
           <label for="thinkingFormat">Thinking 回传格式</label>
           <select id="thinkingFormat" style="width:100%;padding:6px 8px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;background:#fff;">
@@ -1692,7 +1835,7 @@
             <div class="switch-row">
               <label><input id="autoSolveCurrentPage" type="checkbox" /> 当前页面自动解题</label>
             </div>
-            <div class="setting-hint">勾选后自动判断当前页面是否包含题目；检测到题目时调用一键解题，并在对话框显示过程与答案</div>
+            <div class="setting-hint">勾选后自动判断当前页面是否包含题目；检测到题目时调用一键解题，并在 ask 框显示过程与答案</div>
 
           </div>
         </section>
@@ -1733,7 +1876,7 @@
             <h2>🧠 核心能力</h2>
             <div style="font-size:12px;color:#475569;line-height:1.8;">
               <p><b>浏览器智能体</b> — 基于 Agent Loop 架构，智能体可自主决策并调用 24 个内置工具与网页交互，包括页面读取、元素点击、表单填写、脚本执行、导航等。</p>
-              <p><b>智能对话</b> — 支持 OpenAI 兼容的多种大模型接入，Markdown 渲染、实时流式输出，多会话管理与历史持久化。</p>
+              <p><b>智能 ask</b> — 支持 OpenAI 兼容的多种大模型接入，Markdown 渲染、实时流式输出，多会话管理与历史持久化。</p>
               <p><b>自动答题</b> — 一键解题模式，AI 自动识别页面题目并填充答案。</p>
             </div>
           </section>

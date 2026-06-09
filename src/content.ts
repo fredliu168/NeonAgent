@@ -405,8 +405,10 @@ const TRANSLATION_HOST_ATTR = "data-neonagent-translation-host";
 const TRANSLATION_TEXT_ATTR = "data-neonagent-translation-text";
 const SELECTION_TRANSLATION_POPUP_ATTR = "data-neonagent-selection-translation";
 const TRANSLATABLE_TEXT_SELECTOR = "p, h1, h2, h3, h4, h5, h6, li, blockquote, figcaption, td, th, header";
+const DIV_TRANSLATABLE_TEXT_SELECTOR = "div, div[role='heading']";
 const NESTED_TRANSLATABLE_TEXT_SELECTOR = "p, h1, h2, h3, h4, h5, h6, li, blockquote, figcaption, td, th";
 const SKIPPED_TRANSLATION_ANCESTOR_SELECTOR = "pre, code, nav, footer, aside, script, style, noscript, textarea, button, input, select";
+const BLOCK_STRUCTURE_SELECTOR = "div, section, article, main, aside, nav, ul, ol, table, form";
 const MEDIA_DESCENDANT_SELECTOR = "img, picture, figure, video, audio, canvas, iframe, svg, source, track, object, embed";
 const AD_CONTAINER_SELECTOR = [
   "[id^='google_ads_iframe_']",
@@ -1141,8 +1143,7 @@ function enableFullscreenBlock(): () => void {
 
 function enableDevtoolsDetectionBlock(): () => void {
   return createDevtoolsDetectionBlockRuntime({
-    windowTarget: window as unknown as EventTargetLike & Record<string, unknown>,
-    consoleTarget: console as unknown as Record<string, unknown>
+    windowTarget: window as unknown as EventTargetLike & Record<string, unknown>
   });
 }
 
@@ -1301,9 +1302,18 @@ function hasNestedTranslatableTextDescendant(node: HTMLElement): boolean {
   return node.querySelector(NESTED_TRANSLATABLE_TEXT_SELECTOR) !== null;
 }
 
+function hasBlockStructureChild(node: HTMLElement): boolean {
+  return Array.from(node.children).some((child) => {
+    if (!(child instanceof HTMLElement)) {
+      return false;
+    }
+    return child.matches(BLOCK_STRUCTURE_SELECTOR);
+  });
+}
+
 function isTranslatableElement(node: HTMLElement): boolean {
   const tag = node.tagName.toLowerCase();
-  const allowedTags = new Set(["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "figcaption", "td", "th", "header"]);
+  const allowedTags = new Set(["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "figcaption", "td", "th", "header", "div"]);
   if (!allowedTags.has(tag)) {
     return false;
   }
@@ -1313,6 +1323,14 @@ function isTranslatableElement(node: HTMLElement): boolean {
   }
 
   if (tag === "header" && hasNestedTranslatableTextDescendant(node)) {
+    return false;
+  }
+
+  if (tag === "div" && hasNestedTranslatableTextDescendant(node)) {
+    return false;
+  }
+
+  if (tag === "div" && hasBlockStructureChild(node)) {
     return false;
   }
 
@@ -1337,9 +1355,11 @@ function isTranslatableElement(node: HTMLElement): boolean {
 }
 
 function collectTranslatableElements(): HTMLElement[] {
-  const candidates = Array.from(
-    document.querySelectorAll<HTMLElement>(TRANSLATABLE_TEXT_SELECTOR)
-  ).filter((node) => isTranslatableElement(node));
+  const candidates = [
+    ...Array.from(document.querySelectorAll<HTMLElement>(TRANSLATABLE_TEXT_SELECTOR)),
+    ...Array.from(document.querySelectorAll<HTMLElement>(DIV_TRANSLATABLE_TEXT_SELECTOR))
+  ].filter((node, index, list) => list.indexOf(node) === index)
+    .filter((node) => isTranslatableElement(node));
   const candidateSet = new Set(candidates);
 
   return candidates.filter((node) => {

@@ -14,6 +14,7 @@ import type {
 import { AGENT_TOOL_DEFINITIONS, BACKGROUND_TOOLS, PAGE_TOOLS, CORE_TOOLS, TOOL_CATEGORIES, type ToolCategory } from "./agentTools.js";
 import { buildAgentSystemPrompt } from "./agentSystemPrompt.js";
 import { requestAgentStream } from "./agentLlmClient.js";
+import { getInputTokenBudget, trimArrayToEstimatedTokenBudget } from "./tokenBudget.js";
 import type { MemoryEntry } from "./agentMemory.js";
 import { formatMemoriesForPrompt } from "./agentMemory.js";
 import type { Skill } from "./agentSkills.js";
@@ -186,10 +187,23 @@ export async function runAgentLoop(
     // 1. Call LLM with tools (streaming)
     let streamResult;
     try {
+      const requestMessages = trimArrayToEstimatedTokenBudget({
+        items: messages,
+        headCount: messages[0]?.role === "system" ? 1 : 0,
+        budgetTokens: getInputTokenBudget({
+          configuredMaxTokens: config.config.agentMaxTokens,
+          model: config.config.model
+        }),
+        estimatePayload: (trimmedMessages) => ({
+          messages: trimmedMessages,
+          tools: currentToolDefs
+        })
+      });
+
       streamResult = await requestAgentStream(
         {
           config: config.config,
-          messages,
+          messages: requestMessages,
           tools: currentToolDefs,
           signal
         },

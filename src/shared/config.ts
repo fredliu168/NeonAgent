@@ -2,6 +2,7 @@ import type { ApiProvider, LLMConfig, ValidationResult } from "./types.js";
 
 const DEFAULT_MODEL = "gpt-4o-mini";
 const CONTROL_CHARS = /^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g;
+export const MAX_AGENT_OUTPUT_TOKENS = 65536;
 
 interface ApiProviderMeta {
   id: string;
@@ -331,6 +332,18 @@ function sanitizeOptionalModel(model: string | undefined): string {
   return typeof model === "string" ? sanitizeText(model) : "";
 }
 
+export function clampAgentMaxTokens(value: unknown): number {
+  const numeric = typeof value === "number"
+    ? value
+    : typeof value === "string"
+      ? Number.parseInt(value, 10)
+      : Number.NaN;
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return DEFAULT_CONFIG.agentMaxTokens;
+  }
+  return Math.min(Math.floor(numeric), MAX_AGENT_OUTPUT_TOKENS);
+}
+
 function isWebSocketUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
@@ -412,6 +425,8 @@ export function migrateConfig(config: LLMConfig): LLMConfig {
     next.thinkingFormat = "field";
   }
 
+  next.agentMaxTokens = clampAgentMaxTokens(next.agentMaxTokens);
+
   if (!next.translationTargetLanguage.trim()) {
     next.translationTargetLanguage = DEFAULT_CONFIG.translationTargetLanguage;
   }
@@ -474,7 +489,7 @@ export const DEFAULT_CONFIG: LLMConfig = {
   models: [DEFAULT_MODEL],
   temperature: 0.2,
   maxTokens: 1024,
-  agentMaxTokens: 102400,
+  agentMaxTokens: 8192,
   systemPrompt: "You are a helpful assistant.",
   translationEnabled: false,
   selectionTranslationEnabled: false,

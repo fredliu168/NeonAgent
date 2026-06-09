@@ -1,4 +1,5 @@
 import type { ChatMessage, LLMConfig } from "./types.js";
+import { resolveMaxOutputTokens } from "./tokenBudget.js";
 
 interface RequestChatCompletionInput {
   config: LLMConfig;
@@ -15,13 +16,19 @@ function buildRequestBody(
   stream: boolean,
   tokenParamName: TokenParamName
 ): string {
+  const messages = buildMessages(input);
+  const maxOutputTokens = resolveMaxOutputTokens({
+    configuredMaxTokens: input.config.agentMaxTokens,
+    model: input.config.model,
+    payloadForInputEstimate: messages
+  });
   return JSON.stringify({
     ...(input.bodyExtras ?? {}),
     model: input.config.model,
     stream,
     temperature: input.config.temperature,
-    [tokenParamName]: input.config.agentMaxTokens,
-    messages: buildMessages(input)
+    [tokenParamName]: maxOutputTokens,
+    messages
   });
 }
 

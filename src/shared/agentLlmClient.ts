@@ -4,6 +4,7 @@
  */
 
 import type { LLMConfig } from "./types.js";
+import { resolveMaxOutputTokens } from "./tokenBudget.js";
 import type {
   AgentMessage,
   AgentStreamResult,
@@ -278,17 +279,29 @@ function buildAgentRequestBody(input: {
   config: LLMConfig;
   messages: AgentMessage[];
   tools: ToolDefinition[];
-}, tokenParamName: TokenParamName): string {
+}, tokenParamName: TokenParamName, maxOutputTokensOverride?: number): string {
+  const messages = serializeMessages(input.messages, input.config.thinkingFormat ?? "field");
+  const maxOutputTokens = resolveMaxOutputTokens({
+    configuredMaxTokens: input.config.agentMaxTokens,
+    model: input.config.model,
+    payloadForInputEstimate: {
+      messages,
+      tools: input.tools
+    }
+  });
+  const effectiveMaxOutputTokens = maxOutputTokensOverride
+    ? Math.max(1, Math.min(maxOutputTokens, Math.floor(maxOutputTokensOverride)))
+    : maxOutputTokens;
   const body: Record<string, unknown> = {
     model: input.config.model,
     stream: true,
     temperature: input.config.temperature,
-    messages: serializeMessages(input.messages, input.config.thinkingFormat ?? "field"),
+    messages,
     tools: input.tools,
     tool_choice: "auto"
   };
 
-  body[tokenParamName] = input.config.agentMaxTokens;
+  body[tokenParamName] = effectiveMaxOutputTokens;
 
   return JSON.stringify(body);
 }
@@ -296,6 +309,29 @@ function buildAgentRequestBody(input: {
 function shouldRetryWithAlternateTokenParam(details: string, currentParam: TokenParamName): boolean {
   const normalized = details.toLowerCase();
   return normalized.includes("unsupported parameter") && normalized.includes(currentParam);
+}
+
+function parseContextLimitRetryMaxTokens(details: string): number | null {
+  const contextMatch = details.match(/maximum context length is\s+(\d+)\s+tokens/i);
+  const requestedMatch = details.match(/requested\s+(\d+)\s+output tokens/i);
+  const inputMatch = details.match(/prompt contains at least\s+(\d+)\s+input tokens/i);
+  if (!contextMatch || !requestedMatch || !inputMatch) {
+    return null;
+  }
+
+  const contextLimit = Number.parseInt(contextMatch[1], 10);
+  const requestedOutput = Number.parseInt(requestedMatch[1], 10);
+  const inputTokens = Number.parseInt(inputMatch[1], 10);
+  if (!Number.isFinite(contextLimit) || !Number.isFinite(requestedOutput) || !Number.isFinite(inputTokens)) {
+    return null;
+  }
+
+  const retryMaxTokens = contextLimit - inputTokens - 1024;
+  if (retryMaxTokens <= 0 || retryMaxTokens >= requestedOutput) {
+    return null;
+  }
+
+  return Math.max(1, retryMaxTokens);
 }
 
 function isThinkingFormatError(text: string): "needs_blocks" | "needs_field" | null {
@@ -320,7 +356,8 @@ async function postAgentStreamRequest(
   },
   tokenParamName: TokenParamName,
   fetcher: typeof fetch,
-  overrideThinkingFormat?: "none" | "field" | "blocks"
+  overrideThinkingFormat?: "none" | "field" | "blocks",
+  maxOutputTokensOverride?: number
 ): Promise<Response> {
   const effectiveConfig = overrideThinkingFormat
     ? { ...input.config, thinkingFormat: overrideThinkingFormat }
@@ -332,7 +369,7 @@ async function postAgentStreamRequest(
       Authorization: `Bearer ${input.config.apiKey}`
     },
     signal: input.signal,
-    body: buildAgentRequestBody({ ...input, config: effectiveConfig }, tokenParamName)
+    body: buildAgentRequestBody({ ...input, config: effectiveConfig }, tokenParamName, maxOutputTokensOverride)
   });
 }
 
@@ -376,6 +413,21 @@ async function requestAgentWithTokenFallback(
       tokenParamName: tokenParam,
       input
     });
+
+    const retryMaxTokens = parseContextLimitRetryMaxTokens(text);
+    if (retryMaxTokens) {
+      const retryResp = await postAgentStreamRequest(input, tokenParam, fetcher, undefined, retryMaxTokens);
+      if (retryResp.ok) {
+        return retryResp;
+      }
+      attempts.push({
+        status: retryResp.status,
+        text: await retryResp.text().catch(() => "Unknown error"),
+        thinkingFormat: configFormat,
+        tokenParamName: tokenParam,
+        input
+      });
+    }
 
     // Check for token param retry
     if (shouldRetryWithAlternateTokenParam(text, tokenParam)) {
@@ -436,6 +488,21 @@ async function requestAgentWithTokenFallback(
   }];
 
   const formatHint = isThinkingFormatError(fallbackText);
+  const retryMaxTokens = parseContextLimitRetryMaxTokens(fallbackText);
+  if (retryMaxTokens) {
+    const retryResp = await postAgentStreamRequest(input, secondaryParam, fetcher, undefined, retryMaxTokens);
+    if (retryResp.ok) {
+      return retryResp;
+    }
+    fallbackAttempts.push({
+      status: retryResp.status,
+      text: await retryResp.text().catch(() => "Unknown error"),
+      thinkingFormat: input.config.thinkingFormat ?? "field",
+      tokenParamName: secondaryParam,
+      input
+    });
+  }
+
   if (formatHint) {
     const configFormat = input.config.thinkingFormat ?? "field";
     const order = formatHint === "needs_blocks"

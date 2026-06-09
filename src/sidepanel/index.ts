@@ -1,6 +1,7 @@
 import {
   CUSTOM_API_PROVIDER_ID,
   DEFAULT_CONFIG,
+  clampAgentMaxTokens,
   createDefaultApiProviders,
   migrateConfig,
   normalizeBaseUrl,
@@ -12,7 +13,7 @@ import {
 } from "../shared/messages.js";
 import { skillToMarkdown, parseSkillMarkdown, skillsToMarkdown, parseSkillsMarkdown } from "../shared/agentSkills.js";
 import { memoriesToMarkdown, parseMemoriesMarkdown } from "../shared/agentMemory.js";
-import type { ChatSession, ExamQuestion, LLMConfig, RuntimeStreamEvent } from "../shared/types.js";
+import type { ChatMessage, ChatSession, ExamQuestion, LLMConfig, RuntimeStreamEvent } from "../shared/types.js";
 import type { AgentMessage, AgentProgressEvent, AgentSession } from "../shared/agentTypes.js";
 import {
   createInitialChatState,
@@ -26,6 +27,7 @@ import {
   sendMessageToTabWithEnsureDiagnosis
 } from "./tabMessaging.js";
 import type { ApiProvider } from "../shared/types.js";
+import { getInputTokenBudget, trimArrayToEstimatedTokenBudget } from "../shared/tokenBudget.js";
 
 function byId<T extends HTMLElement>(id: string): T {
   const el = document.getElementById(id);
@@ -95,7 +97,15 @@ const settingsSubtabPanels = Array.from(document.querySelectorAll<HTMLElement>("
 const agentMessagesEl = byId<HTMLDivElement>("agentMessages");
 const agentStatusEl = byId<HTMLDivElement>("agentStatus");
 const agentInput = byId<HTMLTextAreaElement>("agentInput");
+const agentComposerRootEl = byId<HTMLDivElement>("agentComposerRoot");
+const agentModeSelect = byId<HTMLSelectElement>("agentModeSelect");
+const agentToolsRowEl = byId<HTMLDivElement>("agentToolsRow");
+const agentToolGroupEl = byId<HTMLDivElement>("agentToolGroup");
 const agentModelInput = byId<HTMLSelectElement>("agentModel");
+const agentModelMenuRootEl = byId<HTMLDivElement>("agentModelMenuRoot");
+const agentModelMenuBtn = byId<HTMLButtonElement>("agentModelMenuButton");
+const agentModelMenuEl = byId<HTMLDivElement>("agentModelMenu");
+const agentModelMenuOptionsEl = byId<HTMLDivElement>("agentModelMenuOptions");
 const agentContextMeterEl = byId<HTMLDivElement>("agentContextMeter");
 const agentActionBtn = byId<HTMLButtonElement>("agentAction");
 const toggleMemoriesBtn = byId<HTMLButtonElement>("toggleMemories");
@@ -1065,15 +1075,22 @@ interface AgentEntry {
   toolCall?: AgentToolCallEntry;
 }
 
+type AgentComposerMode = "chat" | "agent";
+
 let agentEntries: AgentEntry[] = [];
 let activeAgentRequestId: string | null = null;
+let activeAgentChatStreamRequestId: string | null = null;
 let agentPending = false;
 let agentSessions: AgentSession[] = [];
 let activeAgentSessionId: string | null = null;
 let activeAgentPanel: "memories" | "skills" | "tasks" | null = null;
+let agentComposerMode: AgentComposerMode = "agent";
 let agentIterInfoText = "";
 const inFlightAutoSolveSignatures = new Set<string>();
 const completedAutoSolveSignatures = new Set<string>();
+const agentChatStreamCompletionResolvers = new Map<string, (ok: boolean) => void>();
+const agentStreamThinkingEnabledByRequestId = new Map<string, boolean>();
+const AGENT_COMPOSER_MODE_STORAGE_KEY = "neonagent.agentComposerMode";
 
 async function getCurrentTabId(): Promise<number | undefined> {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -1680,7 +1697,7 @@ function toConfig(): LLMConfig {
     ),
     temperature: DEFAULT_CONFIG.temperature,
     maxTokens: DEFAULT_CONFIG.maxTokens,
-    agentMaxTokens: parseInt(agentMaxTokensInput.value, 10) || DEFAULT_CONFIG.agentMaxTokens,
+    agentMaxTokens: clampAgentMaxTokens(agentMaxTokensInput.value),
     systemPrompt: DEFAULT_CONFIG.systemPrompt,
     translationEnabled: translationEnabledInput.checked,
     selectionTranslationEnabled: selectionTranslationEnabledInput.checked,
@@ -1791,6 +1808,46 @@ function renderModelSelect(
   } else {
     translationModelInput.value = "";
   }
+
+  renderAgentModelMenu();
+}
+
+function setAgentModelMenuOpen(open: boolean): void {
+  agentModelMenuEl.hidden = !open;
+  agentModelMenuBtn.setAttribute("aria-expanded", String(open));
+}
+
+function renderAgentModelMenu(): void {
+  const selectedModel = agentModelInput.value || DEFAULT_CONFIG.model;
+  agentModelMenuBtn.textContent = selectedModel;
+  agentModelMenuBtn.title = selectedModel;
+  agentModelMenuOptionsEl.innerHTML = "";
+
+  for (const model of currentModels) {
+    const option = document.createElement("button");
+    option.type = "button";
+    option.className = "model-menu-row model-menu-option";
+    option.classList.toggle("is-active", model === selectedModel);
+    option.dataset.model = model;
+
+    const label = document.createElement("span");
+    label.textContent = model;
+    option.appendChild(label);
+
+    if (model === selectedModel) {
+      const check = document.createElement("span");
+      check.className = "model-menu-check";
+      check.textContent = "✓";
+      option.appendChild(check);
+    }
+
+    option.addEventListener("click", () => {
+      agentModelInput.value = model;
+      renderAgentModelMenu();
+      setAgentModelMenuOpen(false);
+    });
+    agentModelMenuOptionsEl.appendChild(option);
+  }
 }
 
 function toFeatureFlags(config: LLMConfig) {
@@ -1813,7 +1870,7 @@ async function loadConfig(): Promise<void> {
 
   const config = response.data as LLMConfig;
   setApiProvidersFromConfig(config);
-  agentMaxTokensInput.value = String(config.agentMaxTokens ?? DEFAULT_CONFIG.agentMaxTokens);
+  agentMaxTokensInput.value = String(clampAgentMaxTokens(config.agentMaxTokens));
   translationEnabledInput.checked = !!config.translationEnabled;
   selectionTranslationEnabledInput.checked = !!config.selectionTranslationEnabled;
   translationTargetLanguageInput.value = config.translationTargetLanguage ?? DEFAULT_CONFIG.translationTargetLanguage;
@@ -2292,7 +2349,7 @@ configImportFileEl.addEventListener("change", () => {
 
       // Reload UI with imported config
       setApiProvidersFromConfig(config);
-      agentMaxTokensInput.value = String(config.agentMaxTokens ?? DEFAULT_CONFIG.agentMaxTokens);
+      agentMaxTokensInput.value = String(clampAgentMaxTokens(config.agentMaxTokens));
       translationEnabledInput.checked = !!config.translationEnabled;
       selectionTranslationEnabledInput.checked = !!config.selectionTranslationEnabled;
       translationTargetLanguageInput.value = config.translationTargetLanguage ?? DEFAULT_CONFIG.translationTargetLanguage;
@@ -2605,9 +2662,24 @@ function buildExamSystemPrompt(): string {
   ].join("\n");
 }
 
+function getActiveMainTabId(): string | null {
+  return document.querySelector<HTMLButtonElement>(".tab-btn.active")?.dataset.tab ?? null;
+}
+
+function setSolveStatus(text: string): void {
+  if (getActiveMainTabId() === "tabAgent" && agentComposerMode === "chat") {
+    setAgentStatus(text);
+    return;
+  }
+
+  setExamStatus(text);
+}
+
 async function askAndAutoFill(options?: { source?: "manual" | "auto" }): Promise<void> {
-  if (chatState.pending || activeStreamRequestId) {
-    setExamStatus(options?.source === "auto" ? "自动解题等待当前回答结束。" : "AI 正在回答中。");
+  const useAgentChat = getActiveMainTabId() === "tabAgent" && agentComposerMode === "chat";
+
+  if (useAgentChat ? agentPending : (chatState.pending || activeStreamRequestId)) {
+    setSolveStatus(options?.source === "auto" ? "自动解题等待当前回答结束。" : "AI 正在回答中。");
     return;
   }
 
@@ -2615,7 +2687,7 @@ async function askAndAutoFill(options?: { source?: "manual" | "auto" }): Promise
   let activeSignature = "";
   try {
     if (options?.source === "auto") {
-      setExamStatus("检测到题目，正在自动解题...");
+      setSolveStatus("检测到题目，正在自动解题...");
     }
 
     const questions = await detectExamQuestionsInternal();
@@ -2626,20 +2698,26 @@ async function askAndAutoFill(options?: { source?: "manual" | "auto" }): Promise
     activeSignature = buildExamQuestionsSignature(questions);
     if (options?.source === "auto" && activeSignature) {
       if (inFlightAutoSolveSignatures.has(activeSignature) || completedAutoSolveSignatures.has(activeSignature)) {
-        setExamStatus("当前题目已请求过答案，不重复答题。");
+        setSolveStatus("当前题目已请求过答案，不重复答题。");
         return;
       }
       inFlightAutoSolveSignatures.add(activeSignature);
     }
 
-    setExamStatus("正在请求模型解题...");
-    const success = await sendChatMessageWithContent(buildExamPrompt(questions), {
-      includePageContext: false,
-      includeHistory: false,
-      systemPromptOverride: buildExamSystemPrompt()
-    });
+    setSolveStatus("正在请求模型解题...");
+    const success = useAgentChat
+      ? await sendAgentChatMessageWithContent(buildExamPrompt(questions), {
+        includePageContext: false,
+        includeHistory: false,
+        systemPromptOverride: buildExamSystemPrompt()
+      })
+      : await sendChatMessageWithContent(buildExamPrompt(questions), {
+        includePageContext: false,
+        includeHistory: false,
+        systemPromptOverride: buildExamSystemPrompt()
+      });
     if (!success) {
-      setExamStatus("模型解题请求失败。");
+      setSolveStatus("模型解题请求失败。");
       return;
     }
 
@@ -2650,7 +2728,7 @@ async function askAndAutoFill(options?: { source?: "manual" | "auto" }): Promise
         if (oldest) completedAutoSolveSignatures.delete(oldest);
       }
     }
-    setExamStatus("模型已给出答案，不自动填充页面。");
+    setSolveStatus("模型已给出答案，不自动填充页面。");
   } finally {
     if (activeSignature) {
       inFlightAutoSolveSignatures.delete(activeSignature);
@@ -2683,7 +2761,8 @@ async function handleAutoSolveCurrentPageRequest(event: AutoSolveCurrentPageRequ
   }).catch(() => {
     // ignored
   });
-  activateTab("tabChat");
+  activateTab("tabAgent");
+  setAgentComposerMode("chat");
   await askAndAutoFill({ source: "auto" });
 }
 
@@ -2790,6 +2869,68 @@ function handleStreamEvent(event: RuntimeStreamEvent): void {
   }
 }
 
+function handleAgentChatStreamEvent(event: RuntimeStreamEvent): boolean {
+  if (!activeAgentChatStreamRequestId || event.payload.requestId !== activeAgentChatStreamRequestId) {
+    return false;
+  }
+
+  if (event.type === "LLM_STREAM_CHUNK") {
+    const thinkingEnabledForRequest = agentStreamThinkingEnabledByRequestId.get(event.payload.requestId) ?? true;
+    if (event.payload.reasoning && thinkingEnabledForRequest) {
+      const thinkingEntry = agentEntries[agentEntries.length - 1];
+      if (thinkingEntry?.type === "thinking") {
+        thinkingEntry.content += event.payload.reasoning;
+      } else {
+        agentEntries.push({ type: "thinking", content: event.payload.reasoning });
+      }
+    }
+
+    if (event.payload.delta) {
+      const assistantEntry = agentEntries[agentEntries.length - 1];
+      if (assistantEntry?.type === "assistant") {
+        assistantEntry.content += event.payload.delta;
+      } else {
+        agentEntries.push({ type: "assistant", content: event.payload.delta });
+      }
+    }
+
+    renderAgent();
+    scheduleAgentPersist();
+    return true;
+  }
+
+  if (event.type === "LLM_STREAM_ERROR") {
+    agentEntries.push({ type: "assistant", content: `Error: ${event.payload.error}` });
+    agentPending = false;
+    activeAgentChatStreamRequestId = null;
+    agentStreamThinkingEnabledByRequestId.delete(event.payload.requestId);
+    const resolve = agentChatStreamCompletionResolvers.get(event.payload.requestId);
+    if (resolve) {
+      resolve(false);
+      agentChatStreamCompletionResolvers.delete(event.payload.requestId);
+    }
+    renderAgent();
+    void persistActiveAgentSession();
+    return true;
+  }
+
+  if (event.type === "LLM_STREAM_DONE") {
+    agentPending = false;
+    activeAgentChatStreamRequestId = null;
+    agentStreamThinkingEnabledByRequestId.delete(event.payload.requestId);
+    const resolve = agentChatStreamCompletionResolvers.get(event.payload.requestId);
+    if (resolve) {
+      resolve(true);
+      agentChatStreamCompletionResolvers.delete(event.payload.requestId);
+    }
+    renderAgent();
+    void persistActiveAgentSession();
+    return true;
+  }
+
+  return false;
+}
+
 // ── Agent Functions ──
 
 function setAgentStatus(text: string): void {
@@ -2812,8 +2953,66 @@ function showAgentPanel(panel: "memories" | "skills" | "tasks" | null): void {
   toggleTasksBtn.classList.toggle("active", panel === "tasks");
 }
 
+function getAgentPendingStatusText(): string {
+  if (!agentPending) {
+    return "";
+  }
+
+  return activeAgentRequestId ? "智能体执行中..." : "AI 思考中...";
+}
+
+function loadStoredAgentComposerMode(): AgentComposerMode {
+  try {
+    const value = window.localStorage.getItem(AGENT_COMPOSER_MODE_STORAGE_KEY);
+    if (value === "chat" || value === "agent") {
+      return value;
+    }
+  } catch {
+    // ignored
+  }
+
+  return "agent";
+}
+
+function persistAgentComposerMode(): void {
+  try {
+    window.localStorage.setItem(AGENT_COMPOSER_MODE_STORAGE_KEY, agentComposerMode);
+  } catch {
+    // ignored
+  }
+}
+
+function renderAgentComposerMode(): void {
+  const isAgentMode = agentComposerMode === "agent";
+  agentModeSelect.value = agentComposerMode;
+  agentComposerRootEl.classList.toggle("agent-chat-mode", !isAgentMode);
+  agentToolsRowEl.hidden = !isAgentMode;
+  agentToolsRowEl.style.display = isAgentMode ? "flex" : "none";
+  agentToolGroupEl.hidden = !isAgentMode;
+  agentToolGroupEl.style.display = isAgentMode ? "inline-flex" : "none";
+  askAndAutoFillBtn.hidden = isAgentMode;
+  askAndAutoFillBtn.disabled = isAgentMode;
+  askAndAutoFillBtn.style.display = isAgentMode ? "none" : "";
+  chatThinkingToggleBtn.hidden = isAgentMode;
+  chatThinkingToggleBtn.disabled = isAgentMode;
+  chatThinkingToggleBtn.style.display = isAgentMode ? "none" : "";
+  agentInput.placeholder = isAgentMode ? "告诉智能体你想做什么..." : "输入消息...";
+  if (!isAgentMode) {
+    showAgentPanel(null);
+  }
+  agentIterInfoEl.hidden = !isAgentMode && !agentIterInfoText;
+  setAgentStatus(getAgentPendingStatusText());
+  updateAgentActionButton();
+}
+
+function setAgentComposerMode(mode: AgentComposerMode): void {
+  agentComposerMode = mode;
+  persistAgentComposerMode();
+  renderAgentComposerMode();
+}
+
 function updateAgentActionButton(): void {
-  const isPending = agentPending || !!activeAgentRequestId;
+  const isPending = agentPending || !!activeAgentRequestId || !!activeAgentChatStreamRequestId;
   agentActionBtn.textContent = isPending ? "■" : "↑";
   agentActionBtn.title = isPending ? "停止" : "发送";
   agentActionBtn.setAttribute("aria-label", isPending ? "停止" : "发送");
@@ -2917,9 +3116,10 @@ function renderAgent(): void {
   }
 
   agentMessagesEl.scrollTop = agentMessagesEl.scrollHeight;
-  setAgentStatus(agentPending ? "智能体执行中..." : "");
+  setAgentStatus(getAgentPendingStatusText());
   updateAgentActionButton();
   updateAgentContextMeter();
+  renderAgentComposerMode();
 }
 
 function handleAgentEvent(event: AgentProgressEvent): void {
@@ -3038,6 +3238,7 @@ function handleExternalAgentRunStarted(event: ExternalAgentRunStartedEvent): voi
   }
 
   activeAgentRequestId = event.payload.requestId;
+  activeAgentChatStreamRequestId = null;
   agentPending = true;
   setAgentIterationInfo("");
   activateTab("tabAgent");
@@ -3066,6 +3267,44 @@ function buildAgentHistoryMessages(entries: AgentEntry[]): AgentMessage[] {
   }
 
   return history;
+}
+
+function buildAgentChatMessages(entries: AgentEntry[]): ChatMessage[] {
+  return buildAgentHistoryMessages(entries)
+    .filter((message): message is AgentMessage & { role: "user" | "assistant" | "system" } => (
+      message.role === "user" || message.role === "assistant" || message.role === "system"
+    ))
+    .map((message) => ({
+      role: message.role,
+      content: message.content ?? "",
+      reasoning_content: message.reasoning_content
+    }));
+}
+
+function buildTrimmedAgentChatMessages(input: {
+  messages: ChatMessage[];
+  config: LLMConfig;
+  pageContext?: string;
+  systemPromptOverride?: string;
+}): { messages: ChatMessage[]; trimmed: boolean } {
+  const budgetTokens = getInputTokenBudget({
+    configuredMaxTokens: input.config.agentMaxTokens,
+    model: input.config.model
+  });
+  const trimmedMessages = trimArrayToEstimatedTokenBudget({
+    items: input.messages,
+    budgetTokens,
+    estimatePayload: (messages) => ({
+      systemPrompt: input.systemPromptOverride ?? input.config.systemPrompt,
+      pageContext: input.pageContext ?? "",
+      messages
+    })
+  });
+
+  return {
+    messages: trimmedMessages,
+    trimmed: trimmedMessages.length < input.messages.length
+  };
 }
 
 async function sendAgentMessage(): Promise<void> {
@@ -3122,7 +3361,126 @@ async function sendAgentMessage(): Promise<void> {
   }
 }
 
+async function sendAgentChatMessage(): Promise<void> {
+  const input = agentInput.value.trim();
+  agentInput.value = "";
+  if (!input) return;
+
+  await sendAgentChatMessageWithContent(input);
+}
+
+async function sendAgentChatMessageWithContent(
+  input: string,
+  options?: { includePageContext?: boolean; includeHistory?: boolean; systemPromptOverride?: string }
+): Promise<boolean> {
+  const includePageContext = options?.includePageContext ?? false;
+  const includeHistory = options?.includeHistory ?? true;
+  const baseConfig = toAgentConfig();
+
+  agentEntries.push({ type: "user", content: input });
+  agentPending = true;
+  renderAgent();
+  scheduleAgentPersist();
+
+  const requestId = `agent-chat-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  activeAgentChatStreamRequestId = requestId;
+  activeAgentRequestId = null;
+  setAgentIterationInfo("");
+  agentStreamThinkingEnabledByRequestId.set(requestId, chatThinkingEnabled);
+
+  const donePromise = new Promise<boolean>((resolve) => {
+    agentChatStreamCompletionResolvers.set(requestId, resolve);
+  });
+
+  try {
+    const rawMessages = includeHistory
+      ? buildAgentChatMessages(agentEntries)
+      : [{ role: "user", content: input } satisfies ChatMessage];
+    const trimmedPayload = buildTrimmedAgentChatMessages({
+      messages: rawMessages,
+      config: options?.systemPromptOverride
+        ? { ...baseConfig, systemPrompt: options.systemPromptOverride }
+        : baseConfig,
+      pageContext: includePageContext ? (contextEl.textContent || undefined) : undefined,
+      systemPromptOverride: options?.systemPromptOverride
+    });
+    if (trimmedPayload.trimmed) {
+      setAgentStatus("上下文接近上限，已自动压缩较早内容。");
+    }
+
+    const response = await chrome.runtime.sendMessage(
+      createLLMStreamRequestMessage({
+        requestId,
+        config: options?.systemPromptOverride
+          ? { ...baseConfig, systemPrompt: options.systemPromptOverride }
+          : baseConfig,
+        messages: trimmedPayload.messages,
+        pageContext: includePageContext ? (contextEl.textContent || undefined) : undefined,
+        thinkingEnabled: chatThinkingEnabled
+      })
+    );
+
+    if (!response?.ok) {
+      const message = Array.isArray(response?.errors)
+        ? response.errors.join(", ")
+        : "LLM stream request failed";
+      agentEntries.push({ type: "assistant", content: `Error: ${message}` });
+      agentPending = false;
+      activeAgentChatStreamRequestId = null;
+      agentStreamThinkingEnabledByRequestId.delete(requestId);
+      renderAgent();
+      scheduleAgentPersist();
+      const resolve = agentChatStreamCompletionResolvers.get(requestId);
+      if (resolve) {
+        resolve(false);
+        agentChatStreamCompletionResolvers.delete(requestId);
+      }
+      return false;
+    }
+  } catch (error) {
+    agentEntries.push({
+      type: "assistant",
+      content: `Error: ${error instanceof Error ? error.message : "Unknown error"}`
+    });
+    agentPending = false;
+    activeAgentChatStreamRequestId = null;
+    agentStreamThinkingEnabledByRequestId.delete(requestId);
+    renderAgent();
+    scheduleAgentPersist();
+    const resolve = agentChatStreamCompletionResolvers.get(requestId);
+    if (resolve) {
+      resolve(false);
+      agentChatStreamCompletionResolvers.delete(requestId);
+    }
+    return false;
+  }
+
+  return donePromise;
+}
+
 async function stopAgent(): Promise<void> {
+  if (activeAgentChatStreamRequestId) {
+    const requestId = activeAgentChatStreamRequestId;
+    activeAgentChatStreamRequestId = null;
+    agentPending = false;
+    agentStreamThinkingEnabledByRequestId.delete(requestId);
+
+    try {
+      await chrome.runtime.sendMessage(createLLMStreamCancelMessage({ requestId }));
+    } catch {
+      // ignored
+    }
+
+    const resolve = agentChatStreamCompletionResolvers.get(requestId);
+    if (resolve) {
+      resolve(false);
+      agentChatStreamCompletionResolvers.delete(requestId);
+    }
+    renderAgent();
+    scheduleAgentPersist();
+    return;
+  }
+
   if (!activeAgentRequestId) return;
   const requestId = activeAgentRequestId;
   activeAgentRequestId = null;
@@ -3143,6 +3501,7 @@ async function stopAgent(): Promise<void> {
 function clearAgent(): void {
   agentEntries = [];
   activeAgentRequestId = null;
+  activeAgentChatStreamRequestId = null;
   agentPending = false;
   setAgentIterationInfo("");
   renderAgent();
@@ -3190,6 +3549,7 @@ function renderAgentSessions(): void {
       activeAgentSessionId = session.id;
       agentEntries = (session.entries ?? []).map((e) => ({ ...e }));
       activeAgentRequestId = null;
+      activeAgentChatStreamRequestId = null;
       agentPending = false;
       setAgentIterationInfo("");
       renderAgentSessions();
@@ -3259,6 +3619,7 @@ async function loadAgentSessions(): Promise<void> {
   if (!response?.ok || !Array.isArray(response?.data)) {
     agentSessions = [];
     activeAgentSessionId = null;
+    activeAgentChatStreamRequestId = null;
     renderAgentSessions();
     return;
   }
@@ -3280,6 +3641,7 @@ function newAgentSession(): void {
   activeAgentSessionId = null;
   agentEntries = [];
   activeAgentRequestId = null;
+  activeAgentChatStreamRequestId = null;
   agentPending = false;
   setAgentIterationInfo("");
   ensureActiveAgentSession();
@@ -3301,6 +3663,7 @@ async function deleteAgentSession(): Promise<void> {
   }
 
   activeAgentRequestId = null;
+  activeAgentChatStreamRequestId = null;
   agentPending = false;
   setAgentIterationInfo("");
   renderAgentSessions();
@@ -3317,6 +3680,7 @@ async function clearAgentSessions(): Promise<void> {
   activeAgentSessionId = null;
   agentEntries = [];
   activeAgentRequestId = null;
+  activeAgentChatStreamRequestId = null;
   agentPending = false;
   setAgentIterationInfo("");
   renderAgentSessions();
@@ -3876,6 +4240,9 @@ function maybeHandleRuntimeMessage(message: unknown): void {
   const type = (message as { type: string }).type;
 
   if (type === "LLM_STREAM_CHUNK" || type === "LLM_STREAM_DONE" || type === "LLM_STREAM_ERROR") {
+    if (handleAgentChatStreamEvent(message as RuntimeStreamEvent)) {
+      return;
+    }
     handleStreamEvent(message as RuntimeStreamEvent);
     return;
   }
@@ -3940,6 +4307,7 @@ apiKeyInput.addEventListener("input", () => {
 modelInput.addEventListener("change", () => {
   chatModelInput.value = modelInput.value;
   agentModelInput.value = modelInput.value;
+  renderAgentModelMenu();
   syncActiveApiProviderModels(modelInput.value);
 });
 
@@ -4048,6 +4416,26 @@ chatThinkingToggleBtn.addEventListener("click", () => {
   setChatThinkingEnabled(!chatThinkingEnabled);
 });
 
+agentModelMenuBtn.addEventListener("click", () => {
+  setAgentModelMenuOpen(agentModelMenuEl.hidden);
+});
+
+agentModelMenuEl.addEventListener("click", (event) => {
+  event.stopPropagation();
+});
+
+document.addEventListener("click", (event) => {
+  if (!agentModelMenuRootEl.contains(event.target as Node)) {
+    setAgentModelMenuOpen(false);
+  }
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    setAgentModelMenuOpen(false);
+  }
+});
+
 byId<HTMLButtonElement>("newChat").addEventListener("click", () => {
   void createNewChat();
 });
@@ -4073,11 +4461,24 @@ chatInput.addEventListener("input", () => {
 
 // Agent event listeners
 agentActionBtn.addEventListener("click", () => {
-  if (agentPending || activeAgentRequestId) {
+  if (agentPending || activeAgentRequestId || activeAgentChatStreamRequestId) {
     void stopAgent();
     return;
   }
+  if (agentComposerMode === "chat") {
+    void sendAgentChatMessage();
+    return;
+  }
   void sendAgentMessage();
+});
+
+agentModeSelect.addEventListener("change", () => {
+  if (agentPending || activeAgentRequestId || activeAgentChatStreamRequestId) {
+    agentModeSelect.value = agentComposerMode;
+    setAgentStatus("当前执行中，结束后再切换模式。");
+    return;
+  }
+  setAgentComposerMode(agentModeSelect.value === "chat" ? "chat" : "agent");
 });
 
 byId<HTMLButtonElement>("newAgent").addEventListener("click", () => {
@@ -4145,6 +4546,10 @@ byId<HTMLButtonElement>("refreshTasks").addEventListener("click", () => {
 agentInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey && !isComposingEnter(e)) {
     e.preventDefault();
+    if (agentComposerMode === "chat") {
+      void sendAgentChatMessage();
+      return;
+    }
     void sendAgentMessage();
   }
 });
@@ -4193,7 +4598,9 @@ chrome.runtime.onMessage.addListener((message) => {
 activateApiConfigSubtab("apiConfigListPanel");
 setActiveApiProvider(activeApiProviderId);
 chatThinkingEnabled = loadStoredChatThinkingEnabled();
+agentComposerMode = loadStoredAgentComposerMode();
 renderChatThinkingToggle();
+renderAgentComposerMode();
 void loadConfig();
 updateApiKeyVisibilityButton();
 void loadChatSessions();

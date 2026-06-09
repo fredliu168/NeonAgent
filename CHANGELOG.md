@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is loosely based on Keep a Changelog, with versions tracked alongside Git tags such as `v0.1.2`.
 
+## [0.1.10] - 2026-06-09
+
+### Added
+- Added a custom agent model menu with an in-menu `Thinking` toggle and a width that follows the current model name.
+- Added shared token-budget helpers for estimating request size and trimming overlong agent contexts before sending requests.
+
+### Changed
+- Hid the top-level conversation tab and moved the primary ask flow into the agent composer.
+- Renamed user-facing conversation labels from “对话” to `ask` in the side panel.
+- Updated the agent composer layout, including the model menu placement, input styling, and ask-focused controls.
+- Updated page translation candidate collection so text-only `div` and `role="heading"` blocks can be translated without swallowing existing paragraph/header candidates.
+
+### Fixed
+- Fixed devtools-detection blocking so it no longer mutates page `console.*` arguments and interfere with site network/error handling.
+- Fixed agent requests that could exceed model context limits by clamping stored `agentMaxTokens`, auto-retrying oversized requests with a safer output budget, and trimming earlier agent context when requests get too large.
+- Fixed full-page translation misses on sites whose main copy is rendered inside text-only `div` containers rather than semantic paragraph tags.
+
 ## [0.1.9] - 2026-06-09
 
 ### Changed

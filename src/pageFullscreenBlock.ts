@@ -154,18 +154,6 @@ function uninstallFullscreenBlock(): void {
   state.enabled = false;
 }
 
-function sanitizeDevtoolsConsoleArg(value: unknown): unknown {
-  if (value === null || typeof value !== "object") {
-    return value;
-  }
-
-  if (value instanceof Error) {
-    return `${value.name}: ${value.message}`;
-  }
-
-  return "[object]";
-}
-
 function installDevtoolsDetectionBlock(): void {
   const state = fullscreenWindow.__neonagentDevtoolsDetectionBlock;
   if (!state || state.enabled) return;
@@ -221,24 +209,6 @@ function installDevtoolsDetectionBlock(): void {
     });
   } catch {
     // ignored
-  }
-
-  const consoleMethods = ["log", "info", "debug", "warn", "error", "dir", "table", "trace"];
-  for (const method of consoleMethods) {
-    const original = (console as unknown as Record<string, unknown>)[method];
-    if (typeof original !== "function") continue;
-
-    rememberDescriptor(state, `console.${method}`, console, method);
-    try {
-      Object.defineProperty(console, method, {
-        configurable: true,
-        value: function (this: unknown, ...args: unknown[]) {
-          return original.apply(this, args.map(sanitizeDevtoolsConsoleArg));
-        }
-      });
-    } catch {
-      // ignored
-    }
   }
 
   state.enabled = true;

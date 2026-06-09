@@ -19,7 +19,7 @@ export class ConfigRepository {
   }
 
   async saveConfig(config: LLMConfig): Promise<void> {
-    await this.storage.set(CONFIG_KEY, config);
+    await this.storage.set(CONFIG_KEY, migrateConfig(config));
   }
 }
 
