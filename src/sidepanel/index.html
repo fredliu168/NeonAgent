@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>NeonAgent v0.1.11</title>
+    <title>NeonAgent v0.1.12</title>
     <style>
       /* =========== Reset & Base =========== */
       *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -133,7 +133,7 @@
       }
 
       .msg {
-        max-width: 88%;
+        max-width: 94%;
         padding: 8px 12px;
         border-radius: 12px;
         line-height: 1.5;
@@ -144,7 +144,7 @@
         display: flex;
         flex-direction: column;
         gap: 4px;
-        max-width: 88%;
+        max-width: 100%;
       }
 
       .msg-user {
@@ -201,6 +201,7 @@
       .msg-body-rendered p,
       .msg-body-rendered ul,
       .msg-body-rendered ol,
+      .msg-body-rendered .md-table-wrap,
       .msg-body-rendered pre,
       .msg-body-rendered blockquote,
       .msg-body-rendered h1,
@@ -247,9 +248,19 @@
         padding: 1px 4px;
       }
 
+      .msg-body-rendered .md-code-block {
+        position: relative;
+      }
+
+      .msg-body-rendered .md-code-block:hover .md-code-copy-btn,
+      .msg-body-rendered .md-code-block:focus-within .md-code-copy-btn {
+        opacity: 1;
+        pointer-events: auto;
+      }
+
       .msg-body-rendered pre {
         overflow-x: auto;
-        padding: 10px 12px;
+        padding: 10px 12px 38px;
         border-radius: 8px;
         background: #111827;
         color: #f9fafb;
@@ -262,6 +273,42 @@
         color: inherit;
       }
 
+      .msg-body-rendered .md-code-copy-btn {
+        position: absolute;
+        right: 8px;
+        bottom: 8px;
+        width: 22px;
+        height: 22px;
+        border: 1px solid rgba(255,255,255,.18);
+        background: rgba(17, 24, 39, .65);
+        color: #e5e7eb;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 6px;
+        cursor: pointer;
+        padding: 0;
+        backdrop-filter: blur(4px);
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity .15s ease;
+      }
+
+      .msg-body-rendered .md-code-copy-btn:hover {
+        background: rgba(31, 41, 55, .88);
+        color: #fff;
+      }
+
+      .msg-body-rendered .md-code-copy-btn svg {
+        width: 14px;
+        height: 14px;
+        stroke: currentColor;
+        fill: none;
+        stroke-width: 1.8;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+
       .msg-body-rendered blockquote {
         border-left: 3px solid #cbd5e1;
         padding-left: 10px;
@@ -272,6 +319,29 @@
         color: #0f766e;
         text-decoration: underline;
         word-break: break-word;
+      }
+
+      .msg-body-rendered .md-table-wrap {
+        overflow-x: auto;
+      }
+
+      .msg-body-rendered table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 12px;
+      }
+
+      .msg-body-rendered th,
+      .msg-body-rendered td {
+        padding: 6px 8px;
+        border: 1px solid #dbe2ea;
+        text-align: left;
+        vertical-align: top;
+      }
+
+      .msg-body-rendered th {
+        background: #f8fafc;
+        font-weight: 600;
       }
 
       .msg-meta {
@@ -385,8 +455,8 @@
         color: #4338ca;
         font-size: 11px;
         line-height: 1.5;
-        max-height: 200px;
-        overflow-y: auto;
+        max-height: none;
+        overflow: visible;
         border-top: 1px solid #e0e7ff;
         background: #f5f3ff;
       }
@@ -400,6 +470,7 @@
         font-size: 12px;
         background: #f9fafb;
         flex-shrink: 0;
+        overflow: hidden;
       }
 
       .tool-call-header {
@@ -409,6 +480,12 @@
         display: flex;
         align-items: center;
         gap: 6px;
+        list-style: none;
+        cursor: pointer;
+      }
+
+      .tool-call-header::-webkit-details-marker {
+        display: none;
       }
 
       .tool-call-card .tool-icon {
@@ -433,6 +510,22 @@
         margin-left: auto;
         font-size: 10px;
         color: #9ca3af;
+      }
+
+      .tool-call-card .tool-elapsed {
+        font-size: 10px;
+        color: #64748b;
+      }
+
+      .tool-call-card .tool-chevron {
+        font-size: 10px;
+        color: #94a3b8;
+        margin-left: 2px;
+        transition: transform .15s ease;
+      }
+
+      .tool-call-card[open] .tool-chevron {
+        transform: rotate(90deg);
       }
 
       .tool-call-card .tool-status.success { color: #059669; }
@@ -2067,7 +2160,7 @@
           </section>
 
           <section class="card" style="text-align:center;color:#94a3b8;font-size:11px;">
-            <p>NeonAgent v0.1.11</p>
+            <p>NeonAgent v0.1.12</p>
             <p style="margin-top:4px;">本工具仅供学习研究使用，严禁用于违反考试规则或非法用途。</p>
           </section>
         </div>

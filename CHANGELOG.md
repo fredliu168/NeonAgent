@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is loosely based on Keep a Changelog, with versions tracked alongside Git tags such as `v0.1.2`.
 
+## [0.1.12] - 2026-06-09
+
+### Changed
+- Updated agent/code block rendering so copy buttons appear on hover and code fences can be copied directly from the message bubble.
+- Updated tool-call cards so running tools show elapsed seconds, then auto-collapse once finished while remaining expandable.
+
 ## [0.1.11] - 2026-06-09
 
 ### Changed

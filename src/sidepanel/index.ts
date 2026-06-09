@@ -1063,6 +1063,9 @@ interface AgentToolCallEntry {
   result?: string;
   isError?: boolean;
   status: "running" | "success" | "error";
+  startedAt?: number;
+  finishedAt?: number;
+  expanded?: boolean;
 }
 
 interface AgentEntry {
@@ -1083,6 +1086,7 @@ let activeAgentSessionId: string | null = null;
 let activeAgentPanel: "memories" | "skills" | "tasks" | null = null;
 let agentComposerMode: AgentComposerMode = "agent";
 let agentIterInfoText = "";
+let agentToolTimer: number | null = null;
 const inFlightAutoSolveSignatures = new Set<string>();
 const completedAutoSolveSignatures = new Set<string>();
 const agentChatStreamCompletionResolvers = new Map<string, (ok: boolean) => void>();
@@ -1106,6 +1110,32 @@ function autoResizeTextarea(textarea: HTMLTextAreaElement): void {
   const nextHeight = Math.min(textarea.scrollHeight, 180);
   textarea.style.height = `${Math.max(24, nextHeight)}px`;
   textarea.style.overflowY = textarea.scrollHeight > 180 ? "auto" : "hidden";
+}
+
+function formatElapsedSeconds(startedAt?: number, finishedAt?: number): string {
+  if (typeof startedAt !== "number" || !Number.isFinite(startedAt)) {
+    return "";
+  }
+
+  const end = typeof finishedAt === "number" && Number.isFinite(finishedAt) ? finishedAt : Date.now();
+  return `${Math.max(0, Math.floor((end - startedAt) / 1000))}s`;
+}
+
+function syncAgentToolTimer(): void {
+  const hasRunningTool = agentEntries.some((entry) => entry.type === "tool" && entry.toolCall?.status === "running");
+  if (hasRunningTool) {
+    if (agentToolTimer === null) {
+      agentToolTimer = window.setInterval(() => {
+        renderAgent();
+      }, 1000);
+    }
+    return;
+  }
+
+  if (agentToolTimer !== null) {
+    window.clearInterval(agentToolTimer);
+    agentToolTimer = null;
+  }
 }
 
 function appendInlineMarkdown(parent: HTMLElement, text: string): void {
@@ -1173,6 +1203,92 @@ function flushList(listType: "ul" | "ol" | null, items: string[], container: HTM
   items.length = 0;
 }
 
+function splitMarkdownTableRow(line: string): string[] {
+  const trimmed = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+  return trimmed.split("|").map((cell) => cell.trim());
+}
+
+function isMarkdownTableSeparator(line: string): boolean {
+  const cells = splitMarkdownTableRow(line);
+  return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+}
+
+function appendMarkdownTable(container: HTMLElement, headerLine: string, bodyLines: string[]): void {
+  const wrapper = document.createElement("div");
+  wrapper.className = "md-table-wrap";
+  const table = document.createElement("table");
+  const thead = document.createElement("thead");
+  const tbody = document.createElement("tbody");
+  const headerRow = document.createElement("tr");
+
+  for (const cellText of splitMarkdownTableRow(headerLine)) {
+    const th = document.createElement("th");
+    appendInlineMarkdown(th, cellText);
+    headerRow.appendChild(th);
+  }
+
+  thead.appendChild(headerRow);
+
+  for (const rowLine of bodyLines) {
+    const row = document.createElement("tr");
+    for (const cellText of splitMarkdownTableRow(rowLine)) {
+      const td = document.createElement("td");
+      appendInlineMarkdown(td, cellText);
+      row.appendChild(td);
+    }
+    tbody.appendChild(row);
+  }
+
+  table.appendChild(thead);
+  table.appendChild(tbody);
+  wrapper.appendChild(table);
+  container.appendChild(wrapper);
+}
+
+function appendMarkdownCodeBlock(container: HTMLElement, codeText: string, language?: string): void {
+  const wrapper = document.createElement("div");
+  wrapper.className = "md-code-block";
+
+  const pre = document.createElement("pre");
+  const code = document.createElement("code");
+  if (language) {
+    code.dataset.language = language;
+  }
+  code.textContent = codeText;
+  pre.appendChild(code);
+  wrapper.appendChild(pre);
+
+  const copyBtn = document.createElement("button");
+  copyBtn.type = "button";
+  copyBtn.className = "md-code-copy-btn";
+  copyBtn.title = "复制代码";
+  copyBtn.setAttribute("aria-label", "复制代码");
+  copyBtn.innerHTML = getCopyIconMarkup(false);
+
+  let resetTimer: number | null = null;
+  copyBtn.addEventListener("click", async () => {
+    try {
+      await copyTextToClipboard(codeText);
+      copyBtn.innerHTML = getCopyIconMarkup(true);
+      if (resetTimer) {
+        window.clearTimeout(resetTimer);
+      }
+      resetTimer = window.setTimeout(() => {
+        copyBtn.innerHTML = getCopyIconMarkup(false);
+        resetTimer = null;
+      }, 1200);
+    } catch {
+      copyBtn.title = "复制失败";
+      window.setTimeout(() => {
+        copyBtn.title = "复制代码";
+      }, 1200);
+    }
+  });
+
+  wrapper.appendChild(copyBtn);
+  container.appendChild(wrapper);
+}
+
 function renderMarkdownToElement(container: HTMLElement, markdown: string): void {
   container.replaceChildren();
   container.classList.add("msg-body-rendered");
@@ -1189,17 +1305,11 @@ function renderMarkdownToElement(container: HTMLElement, markdown: string): void
     listType = null;
   };
 
-  for (const line of lines) {
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
     if (codeFence) {
       if (/^```/.test(line.trim())) {
-        const pre = document.createElement("pre");
-        const code = document.createElement("code");
-        if (codeFence.language) {
-          code.dataset.language = codeFence.language;
-        }
-        code.textContent = codeFence.lines.join("\n");
-        pre.appendChild(code);
-        container.appendChild(pre);
+        appendMarkdownCodeBlock(container, codeFence.lines.join("\n"), codeFence.language);
         codeFence = null;
       } else {
         codeFence.lines.push(line);
@@ -1238,6 +1348,24 @@ function renderMarkdownToElement(container: HTMLElement, markdown: string): void
       continue;
     }
 
+    const nextLine = index + 1 < lines.length ? lines[index + 1] : "";
+    if (line.includes("|") && nextLine.includes("|") && isMarkdownTableSeparator(nextLine)) {
+      flushAll();
+      const bodyLines: string[] = [];
+      index += 2;
+      while (index < lines.length) {
+        const rowLine = lines[index].trim();
+        if (!rowLine || !rowLine.includes("|")) {
+          index -= 1;
+          break;
+        }
+        bodyLines.push(lines[index]);
+        index += 1;
+      }
+      appendMarkdownTable(container, line, bodyLines);
+      continue;
+    }
+
     const orderedListMatch = line.match(/^\d+\.\s+(.*)$/);
     if (orderedListMatch) {
       flushParagraph(paragraphBuffer, container);
@@ -1266,11 +1394,7 @@ function renderMarkdownToElement(container: HTMLElement, markdown: string): void
   }
 
   if (codeFence) {
-    const pre = document.createElement("pre");
-    const code = document.createElement("code");
-    code.textContent = codeFence.lines.join("\n");
-    pre.appendChild(code);
-    container.appendChild(pre);
+    appendMarkdownCodeBlock(container, codeFence.lines.join("\n"), codeFence.language);
   }
 
   flushParagraph(paragraphBuffer, container);
@@ -3376,10 +3500,11 @@ function renderAgent(): void {
       agentMessagesEl.appendChild(details);
     } else if (entry.type === "tool" && entry.toolCall) {
       const tc = entry.toolCall;
-      const card = document.createElement("div");
+      const card = document.createElement("details");
       card.className = "tool-call-card";
+      card.open = tc.expanded ?? tc.status === "running";
 
-      const header = document.createElement("div");
+      const header = document.createElement("summary");
       header.className = "tool-call-header";
       const icon = document.createElement("span");
       icon.className = "tool-icon";
@@ -3392,10 +3517,28 @@ function renderAgent(): void {
       status.textContent =
         tc.status === "running" ? "运行中..." :
         tc.status === "error" ? "失败" : "完成";
+      const elapsed = document.createElement("span");
+      elapsed.className = "tool-elapsed";
+      const elapsedValue = formatElapsedSeconds(tc.startedAt, tc.finishedAt);
+      elapsed.textContent = elapsedValue
+        ? (tc.status === "running" ? `已处理 ${elapsedValue}` : `耗时 ${elapsedValue}`)
+        : "";
+      const chevron = document.createElement("span");
+      chevron.className = "tool-chevron";
+      chevron.textContent = "›";
       header.appendChild(icon);
       header.appendChild(name);
       header.appendChild(status);
+      header.appendChild(elapsed);
+      header.appendChild(chevron);
       card.appendChild(header);
+      card.addEventListener("toggle", () => {
+        if (tc.expanded === card.open) {
+          return;
+        }
+        tc.expanded = card.open;
+        scheduleAgentPersist();
+      });
 
       const body = document.createElement("div");
       body.className = "tool-call-body";
@@ -3457,6 +3600,7 @@ function renderAgent(): void {
   updateAgentActionButton();
   updateAgentContextMeter();
   renderAgentComposerMode();
+  syncAgentToolTimer();
 }
 
 function handleAgentEvent(event: AgentProgressEvent): void {
@@ -3494,6 +3638,10 @@ function handleAgentEvent(event: AgentProgressEvent): void {
     );
     if (existing && existing.toolCall) {
       existing.toolCall.arguments = event.payload.arguments;
+      existing.toolCall.startedAt ??= Date.now();
+      existing.toolCall.status = "running";
+      existing.toolCall.finishedAt = undefined;
+      existing.toolCall.expanded = true;
     } else {
       agentEntries.push({
         type: "tool",
@@ -3503,7 +3651,9 @@ function handleAgentEvent(event: AgentProgressEvent): void {
           id: event.payload.toolCallId,
           name: event.payload.name,
           arguments: event.payload.arguments,
-          status: "running"
+          status: "running",
+          startedAt: Date.now(),
+          expanded: true
         }
       });
     }
@@ -3519,6 +3669,8 @@ function handleAgentEvent(event: AgentProgressEvent): void {
       entry.toolCall.result = event.payload.result;
       entry.toolCall.isError = event.payload.isError;
       entry.toolCall.status = event.payload.isError ? "error" : "success";
+      entry.toolCall.finishedAt = Date.now();
+      entry.toolCall.expanded = false;
     }
     renderAgent();
     scheduleAgentPersist();

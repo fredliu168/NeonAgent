@@ -121,6 +121,9 @@ export interface AgentSessionEntry {
     result?: string;
     isError?: boolean;
     status: "running" | "success" | "error";
+    startedAt?: number;
+    finishedAt?: number;
+    expanded?: boolean;
   };
 }
 
