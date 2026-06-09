@@ -1080,6 +1080,7 @@ interface AgentEntry {
   type: "user" | "assistant" | "thinking" | "tool";
   content: string;
   timestamp?: number;
+  expanded?: boolean;
   toolCall?: AgentToolCallEntry;
 }
 
@@ -1160,6 +1161,33 @@ function updateChatScrollToBottomButton(): void {
 
 function updateAgentScrollToBottomButton(): void {
   agentScrollToBottomBtn.hidden = isNearScrollBottom(agentMessagesEl);
+}
+
+function bindChatThinkingDetails(details: HTMLDetailsElement): void {
+  let initialized = false;
+  queueMicrotask(() => {
+    initialized = true;
+  });
+  details.addEventListener("toggle", () => {
+    if (!initialized) {
+      return;
+    }
+    chatStreamingThinkingExpanded = details.open;
+  });
+}
+
+function bindAgentThinkingDetails(details: HTMLDetailsElement, entry: AgentEntry): void {
+  let initialized = false;
+  queueMicrotask(() => {
+    initialized = true;
+  });
+  details.addEventListener("toggle", () => {
+    if (!initialized) {
+      return;
+    }
+    entry.expanded = details.open;
+    scheduleAgentPersist();
+  });
 }
 
 function appendInlineMarkdown(parent: HTMLElement, text: string): void {
@@ -1718,6 +1746,7 @@ let chatRenderedCount = 0;
 let chatStreamingThinkingPre: HTMLPreElement | null = null;
 let chatStreamingThinkingDetails: HTMLElement | null = null;
 let chatStreamingBodyEl: HTMLDivElement | null = null;
+let chatStreamingThinkingExpanded = true;
 
 function updateChatActionButton(): void {
   const isPending = chatState.pending || !!activeStreamRequestId;
@@ -1777,6 +1806,7 @@ function renderChatFull(): void {
   chatStreamingThinkingPre = null;
   chatStreamingThinkingDetails = null;
   chatStreamingBodyEl = null;
+  chatStreamingThinkingExpanded = true;
 
   for (const msg of chatState.messages) {
     appendChatMessageDOM(msg, chatState.messages.indexOf(msg) === chatState.messages.length - 1);
@@ -1800,7 +1830,8 @@ function appendChatMessageDOM(
   if (msg.role === "assistant" && thinking) {
     const details = document.createElement("details");
     details.className = "thinking-block";
-    details.open = true;
+    details.open = isLast ? chatStreamingThinkingExpanded : true;
+    bindChatThinkingDetails(details);
     const summary = document.createElement("summary");
     summary.textContent = "\u{1F4AD} 思考过程";
     const pre = document.createElement("pre");
@@ -1892,7 +1923,8 @@ function renderChat(): void {
           // Need to create the thinking block (first thinking delta for this message)
           const details = document.createElement("details");
           details.className = "thinking-block";
-          details.open = true;
+          details.open = chatStreamingThinkingExpanded;
+          bindChatThinkingDetails(details);
           const summary = document.createElement("summary");
           summary.textContent = "\u{1F4AD} 思考过程";
           const pre = document.createElement("pre");
@@ -3357,7 +3389,7 @@ function handleAgentChatStreamEvent(event: RuntimeStreamEvent): boolean {
       if (thinkingEntry?.type === "thinking") {
         thinkingEntry.content += event.payload.reasoning;
       } else {
-        agentEntries.push({ type: "thinking", content: event.payload.reasoning, timestamp: Date.now() });
+        agentEntries.push({ type: "thinking", content: event.payload.reasoning, timestamp: Date.now(), expanded: true });
       }
     }
 
@@ -3520,7 +3552,8 @@ function renderAgent(): void {
     } else if (entry.type === "thinking") {
       const details = document.createElement("details");
       details.className = "thinking-block";
-      details.open = true;
+      details.open = entry.expanded ?? true;
+      bindAgentThinkingDetails(details, entry);
       const summary = document.createElement("summary");
       summary.textContent = "\u{1F4AD} 思考过程";
       const pre = document.createElement("pre");
@@ -3660,9 +3693,10 @@ function handleAgentEvent(event: AgentProgressEvent): void {
     if (last?.type === "thinking") {
       last.content += event.payload.delta;
     } else {
-      agentEntries.push({ type: "thinking", content: event.payload.delta, timestamp: Date.now() });
+      agentEntries.push({ type: "thinking", content: event.payload.delta, timestamp: Date.now(), expanded: true });
     }
     renderAgent();
+    scheduleAgentPersist();
     return;
   }
 
@@ -4134,6 +4168,7 @@ async function persistActiveAgentSession(): Promise<void> {
       type: e.type,
       content: e.content,
       timestamp: e.timestamp,
+      expanded: e.expanded,
       toolCall: e.toolCall ? { ...e.toolCall } : undefined
     }))
   };

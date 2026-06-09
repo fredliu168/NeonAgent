@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is loosely based on Keep a Changelog, with versions tracked alongside Git tags such as `v0.1.2`.
 
+## [0.1.14] - 2026-06-09
+
+### Fixed
+- Fixed ask/agent thinking blocks so manual collapse state is preserved during streaming updates and agent re-renders.
+
 ## [0.1.13] - 2026-06-09
 
 ### Changed

@@ -114,6 +114,7 @@ export interface AgentSessionEntry {
   type: "user" | "assistant" | "thinking" | "tool";
   content: string;
   timestamp?: number;
+  expanded?: boolean;
   toolCall?: {
     id: string;
     name: string;
