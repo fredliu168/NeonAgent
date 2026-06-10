@@ -99,6 +99,7 @@ type FullscreenDocumentLike = EventTargetLike & {
 const SELECTION_UNLOCK_STYLE_ID = "neonagent-selection-unlock-style";
 const SELECTION_UNLOCK_CSS =
   "html, body, * { user-select: text !important; -webkit-user-select: text !important; }";
+let mainWorldBlockScriptReady: Promise<void> | null = null;
 
 function addCaptureBlocker(target: EventTargetLike, event: string): () => void {
   const handler = (e: Event) => {
@@ -1164,6 +1165,21 @@ function syncMainWorldDevtoolsDetectionBlock(enabled: boolean): void {
   }));
 }
 
+function ensureMainWorldBlockScript(): Promise<void> {
+  if (mainWorldBlockScriptReady) {
+    return mainWorldBlockScriptReady;
+  }
+
+  mainWorldBlockScriptReady = chrome.runtime.sendMessage({
+    type: "ENSURE_MAIN_WORLD_BLOCK_SCRIPT"
+  }).then(() => undefined).catch((error) => {
+    mainWorldBlockScriptReady = null;
+    throw error;
+  });
+
+  return mainWorldBlockScriptReady;
+}
+
 function applyFeatureFlags(flags: FeatureFlags): void {
   while (cleanupFns.length > 0) {
     const fn = cleanupFns.pop();
@@ -1183,12 +1199,30 @@ function applyFeatureFlags(flags: FeatureFlags): void {
   if (flags.blockFullscreenRequests) {
     cleanupFns.push(enableFullscreenBlock());
   }
-  syncMainWorldFullscreenBlock(flags.blockFullscreenRequests);
 
   if (flags.blockDevtoolsDetection) {
     cleanupFns.push(enableDevtoolsDetectionBlock());
   }
-  syncMainWorldDevtoolsDetectionBlock(flags.blockDevtoolsDetection);
+
+  if (flags.blockFullscreenRequests || flags.blockDevtoolsDetection) {
+    void ensureMainWorldBlockScript()
+      .then(() => {
+        syncMainWorldFullscreenBlock(flags.blockFullscreenRequests);
+        syncMainWorldDevtoolsDetectionBlock(flags.blockDevtoolsDetection);
+      })
+      .catch(() => {
+        // ignored
+      });
+  } else if (mainWorldBlockScriptReady) {
+    void mainWorldBlockScriptReady
+      .then(() => {
+        syncMainWorldFullscreenBlock(false);
+        syncMainWorldDevtoolsDetectionBlock(false);
+      })
+      .catch(() => {
+        // ignored
+      });
+  }
 
   setFloatingBall(flags.enableFloatingBall);
 }

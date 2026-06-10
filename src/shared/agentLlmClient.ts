@@ -152,6 +152,7 @@ function parseAgentStreamLine(dataLine: string): AgentStreamDelta | null {
     choices?: Array<{
       delta?: {
         content?: string | Array<{ type?: string; text?: string; thinking?: string }>;
+        reasoning?: string;
         reasoning_content?: string;
         tool_calls?: Array<{
           index: number;
@@ -197,6 +198,10 @@ function parseAgentStreamLine(dataLine: string): AgentStreamDelta | null {
   // Also handle flat reasoning_content field (native DeepSeek)
   if (reasoning === null && typeof delta?.reasoning_content === "string") {
     reasoning = delta.reasoning_content;
+  }
+
+  if (reasoning === null && typeof delta?.reasoning === "string") {
+    reasoning = delta.reasoning;
   }
 
   const finishReason = choice.finish_reason ?? null;

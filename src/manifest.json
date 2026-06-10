@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
-  "name": "NeonAgent v0.1.14",
-  "version": "0.1.14",
+  "name": "NeonAgent v0.1.15",
+  "version": "0.1.15",
   "description": "AI assistant side panel for lawful and authorized learning scenarios.",
   "icons": {
     "16": "images/icon-16.png",
@@ -22,12 +22,6 @@
     "default_path": "sidepanel/index.html"
   },
   "content_scripts": [
-    {
-      "matches": ["<all_urls>"],
-      "js": ["pageFullscreenBlock.js"],
-      "run_at": "document_start",
-      "world": "MAIN"
-    },
     {
       "matches": ["<all_urls>"],
       "js": ["content.js"],

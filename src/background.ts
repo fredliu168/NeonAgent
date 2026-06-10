@@ -274,6 +274,9 @@ function getTranslationRequestConfig(config: LLMConfig): LLMConfig {
 
 function getTranslationRequestBodyExtras(config: LLMConfig): Record<string, unknown> | undefined {
   const model = config.model.trim();
+  if (/^deepseek-v4$/i.test(model)) {
+    return { reasoning_effort: "" };
+  }
   if (/qwen/i.test(model)) {
     return { enable_thinking: false };
   }
@@ -291,6 +294,13 @@ function getChatThinkingRequestBodyExtras(
   config: LLMConfig,
   thinkingEnabled: boolean | undefined
 ): Record<string, unknown> | undefined {
+  const model = config.model.trim();
+  if (/^deepseek-v4$/i.test(model)) {
+    return {
+      reasoning_effort: thinkingEnabled === false ? "" : "high"
+    };
+  }
+
   if (thinkingEnabled !== false) {
     return undefined;
   }
@@ -1734,6 +1744,23 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
         return;
       }
 
+      if (message.type === "ENSURE_MAIN_WORLD_BLOCK_SCRIPT") {
+        const tabId = sender.tab?.id;
+        if (typeof tabId !== "number" || !chrome.scripting?.executeScript) {
+          sendResponse({ ok: false, errors: ["Unable to inject main-world block script"] });
+          return;
+        }
+
+        const frameIds = typeof sender.frameId === "number" ? [sender.frameId] : undefined;
+        await chrome.scripting.executeScript({
+          target: frameIds ? { tabId, frameIds } : { tabId },
+          files: ["pageFullscreenBlock.js"],
+          world: "MAIN"
+        });
+        sendResponse({ ok: true });
+        return;
+      }
+
       if (message.type === "GET_LOCAL_COMMAND_STATUS") {
         sendResponse({ ok: true, data: getLocalCommandStatus() });
         return;
@@ -2337,7 +2364,11 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
           const content = await invokeLLM({
             config: message.payload.config,
             messages: message.payload.messages,
-            pageContext: message.payload.pageContext
+            pageContext: message.payload.pageContext,
+            bodyExtras: getChatThinkingRequestBodyExtras(
+              message.payload.config,
+              message.payload.thinkingEnabled
+            )
           });
 
           sendResponse({ ok: true, data: { content } });

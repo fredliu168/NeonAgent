@@ -93,7 +93,7 @@ function parseStreamDelta(dataLine: string): StreamDelta | null {
   }
 
   let parsed: {
-    choices?: Array<{ delta?: { content?: string | Array<{ type?: string; text?: string; thinking?: string }>; reasoning_content?: string } }>;
+    choices?: Array<{ delta?: { content?: string | Array<{ type?: string; text?: string; thinking?: string }>; reasoning?: string; reasoning_content?: string } }>;
   };
 
   try {
@@ -121,6 +121,10 @@ function parseStreamDelta(dataLine: string): StreamDelta | null {
 
   if (reasoning === null && typeof delta?.reasoning_content === "string") {
     reasoning = delta.reasoning_content;
+  }
+
+  if (reasoning === null && typeof delta?.reasoning === "string") {
+    reasoning = delta.reasoning;
   }
 
   if (content === null && reasoning === null) {
