@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "NeonAgent v0.1.15",
-  "version": "0.1.15",
-  "description": "AI assistant side panel for lawful and authorized learning scenarios.",
+  "name": "NeonAgent v0.1.16",
+  "version": "0.1.16",
+  "description": "A personal AI assistant and translation companion in your browser",
   "icons": {
     "16": "images/icon-16.png",
     "32": "images/icon-32.png",
