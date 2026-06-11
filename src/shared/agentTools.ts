@@ -683,6 +683,29 @@ export const AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: "function",
     function: {
+      name: "wait_for_url",
+      description:
+        "等待当前页面的 URL 包含指定字符串或匹配正则。用于操作后，等待页面跳转到了新的地址或路由变化完成。",
+      parameters: {
+        type: "object",
+        properties: {
+          urlPattern: {
+            type: "string",
+            description: "要等待的 URL 子串或正则（如 /login/i）"
+          },
+          timeout: {
+            type: "integer",
+            description: "超时时间（毫秒），默认 5000"
+          }
+        },
+        required: ["urlPattern"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "get_form_data",
       description:
         "获取页面上表单中所有输入字段的当前值。可指定表单选择器，默认获取页面上第一个表单。",
@@ -1359,6 +1382,7 @@ export const PAGE_TOOLS = new Set([
 /** Tools that execute in the background service worker */
 export const BACKGROUND_TOOLS = new Set([
   "navigate",
+  "wait_for_url",
   "get_current_time",
   "load_tool_category",
   "save_memory", "search_memories", "delete_memory",
@@ -1381,6 +1405,6 @@ export const TOOL_CATEGORIES: Record<ToolCategory, string[]> = {
 
 export const CORE_TOOLS = new Set([
   "get_page_info", "read_page_content", "query_selector", "click_element",
-  "type_text", "wait_for_element", "navigate", "scroll_page", "execute_script",
+  "type_text", "wait_for_element", "wait_for_url", "navigate", "scroll_page", "execute_script",
   "inspect_visibility_detection", "press_key", "get_form_data", "select_option", "get_current_time", "load_tool_category", "translate_current_page"
 ]);

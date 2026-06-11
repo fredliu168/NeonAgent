@@ -86,6 +86,30 @@ export interface StreamDelta {
   reasoning: string | null;
 }
 
+function extractReasoningDetailsText(
+  details: Array<{ text?: string }> | undefined
+): string | null {
+  if (!Array.isArray(details) || details.length === 0) {
+    return null;
+  }
+
+  const text = details
+    .map((detail) => (typeof detail?.text === "string" ? detail.text : ""))
+    .join("");
+
+  return text || null;
+}
+
+function getStreamAppend(snapshotOrDelta: string, accumulated: string): string {
+  if (!snapshotOrDelta) {
+    return "";
+  }
+  if (accumulated && snapshotOrDelta.startsWith(accumulated)) {
+    return snapshotOrDelta.slice(accumulated.length);
+  }
+  return snapshotOrDelta;
+}
+
 function parseStreamDelta(dataLine: string): StreamDelta | null {
   const data = dataLine.slice("data:".length).trim();
   if (!data || data === "[DONE]") {
@@ -93,7 +117,7 @@ function parseStreamDelta(dataLine: string): StreamDelta | null {
   }
 
   let parsed: {
-    choices?: Array<{ delta?: { content?: string | Array<{ type?: string; text?: string; thinking?: string }>; reasoning?: string; reasoning_content?: string } }>;
+    choices?: Array<{ delta?: { content?: string | Array<{ type?: string; text?: string; thinking?: string }>; reasoning?: string; reasoning_content?: string; reasoning_details?: Array<{ text?: string }> } }>;
   };
 
   try {
@@ -125,6 +149,10 @@ function parseStreamDelta(dataLine: string): StreamDelta | null {
 
   if (reasoning === null && typeof delta?.reasoning === "string") {
     reasoning = delta.reasoning;
+  }
+
+  if (reasoning === null) {
+    reasoning = extractReasoningDetailsText(delta?.reasoning_details);
   }
 
   if (content === null && reasoning === null) {
@@ -180,6 +208,8 @@ export async function* requestChatCompletionStream(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let accumulatedContent = "";
+  let accumulatedReasoning = "";
 
   while (true) {
     const { done, value } = await reader.read();
@@ -200,7 +230,22 @@ export async function* requestChatCompletionStream(
 
       const delta = parseStreamDelta(trimmed);
       if (delta) {
-        yield delta;
+        const nextContent = delta.content ? getStreamAppend(delta.content, accumulatedContent) : null;
+        const nextReasoning = delta.reasoning ? getStreamAppend(delta.reasoning, accumulatedReasoning) : null;
+
+        if (nextContent) {
+          accumulatedContent += nextContent;
+        }
+        if (nextReasoning) {
+          accumulatedReasoning += nextReasoning;
+        }
+
+        if (nextContent !== null || nextReasoning !== null) {
+          yield {
+            content: nextContent,
+            reasoning: nextReasoning
+          };
+        }
       }
     }
   }
@@ -208,7 +253,15 @@ export async function* requestChatCompletionStream(
   if (buffer.trim().startsWith("data:")) {
     const delta = parseStreamDelta(buffer.trim());
     if (delta) {
-      yield delta;
+      const nextContent = delta.content ? getStreamAppend(delta.content, accumulatedContent) : null;
+      const nextReasoning = delta.reasoning ? getStreamAppend(delta.reasoning, accumulatedReasoning) : null;
+
+      if (nextContent !== null || nextReasoning !== null) {
+        yield {
+          content: nextContent,
+          reasoning: nextReasoning
+        };
+      }
     }
   }
 }

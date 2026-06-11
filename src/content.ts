@@ -3192,6 +3192,13 @@ function agentClickElement(args: Record<string, unknown>): string {
   if (index >= elements.length) return `Index ${index} out of range (found ${elements.length})`;
 
   const el = elements[index];
+  
+  // Prevent opening new tabs which causes the agent to lose context
+  const anchor = el.closest("a");
+  if (anchor && anchor.getAttribute("target") === "_blank") {
+    anchor.removeAttribute("target");
+  }
+
   el.click();
   const tag = el.tagName.toLowerCase();
   const text = (el.innerText || "").slice(0, 50).trim();

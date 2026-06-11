@@ -274,6 +274,12 @@ function getTranslationRequestConfig(config: LLMConfig): LLMConfig {
 
 function getTranslationRequestBodyExtras(config: LLMConfig): Record<string, unknown> | undefined {
   const model = config.model.trim();
+  if (/^minimax-m3$/i.test(model)) {
+    return {
+      thinking: { type: "disabled" },
+      reasoning_split: true
+    };
+  }
   if (/^deepseek-v4$/i.test(model)) {
     return { reasoning_effort: "" };
   }
@@ -295,6 +301,14 @@ function getChatThinkingRequestBodyExtras(
   thinkingEnabled: boolean | undefined
 ): Record<string, unknown> | undefined {
   const model = config.model.trim();
+  if (/^minimax-m3$/i.test(model)) {
+    return {
+      thinking: {
+        type: thinkingEnabled === false ? "disabled" : "adaptive"
+      },
+      reasoning_split: true
+    };
+  }
   if (/^deepseek-v4$/i.test(model)) {
     return {
       reasoning_effort: thinkingEnabled === false ? "" : "high"
@@ -849,14 +863,30 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
     }
   };
 
-  const sendTabMessage =
-    deps.sendTabMessage ??
-    ((tabId: number, msg: unknown) => {
-      if (typeof chrome !== "undefined" && chrome.tabs?.sendMessage) {
-        return chrome.tabs.sendMessage(tabId, msg);
+  const sendTabMessageWithAutoInject = async (tabId: number, msg: unknown) => {
+    if (typeof chrome !== "undefined" && chrome.scripting?.executeScript) {
+      const existing = await chrome.tabs.sendMessage(tabId, { type: "PING" }).catch(() => null);
+      if (!existing) {
+        await chrome.scripting.executeScript({
+          target: { tabId },
+          files: ["pageFullscreenBlock.js"],
+          world: "MAIN"
+        }).catch(() => null);
+
+        await chrome.scripting.executeScript({
+          target: { tabId },
+          files: ["content.js"]
+        }).catch(() => null);
+        await new Promise(r => setTimeout(r, 50));
       }
-      return Promise.reject(new Error("chrome.tabs.sendMessage not available"));
-    });
+    }
+    if (typeof chrome !== "undefined" && chrome.tabs?.sendMessage) {
+      return chrome.tabs.sendMessage(tabId, msg);
+    }
+    return Promise.reject(new Error("chrome.tabs.sendMessage not available"));
+  };
+
+  const sendTabMessage = deps.sendTabMessage ?? sendTabMessageWithAutoInject;
 
   const activeAgentControllers = new Map<string, AbortController>();
 
@@ -963,6 +993,71 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
           toolCallId: "",
           toolName,
           output: `Navigate failed: ${error instanceof Error ? error.message : String(error)}`,
+          isError: true
+        };
+      }
+    }
+
+    if (toolName === "wait_for_url") {
+      const urlPattern = typeof args.urlPattern === "string" ? args.urlPattern : "";
+      const timeout = typeof args.timeout === "number" ? args.timeout : 5000;
+      if (!urlPattern) {
+        return { toolCallId: "", toolName, output: "Error: urlPattern is required", isError: true };
+      }
+
+      let matcher: RegExp;
+      try {
+        const regexMatch = /^\/(.+)\/([dgimsuvy]*)$/.exec(urlPattern.trim());
+        if (regexMatch) {
+          matcher = new RegExp(regexMatch[1], regexMatch[2]);
+        } else {
+          matcher = new RegExp(urlPattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+        }
+      } catch (error) {
+        return { toolCallId: "", toolName, output: `Error: Invalid regex pattern - ${error instanceof Error ? error.message : String(error)}`, isError: true };
+      }
+
+      try {
+        if (typeof chrome === "undefined" || !chrome.tabs?.get) {
+          throw new Error("chrome.tabs.get not available");
+        }
+
+        const checkUrl = async () => {
+          const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+          if (tabs && tabs.length > 0) {
+            return tabs[0].url || "";
+          }
+          const tab = await chrome.tabs.get(tabId);
+          return tab.url || "";
+        };
+
+        const initialUrl = await checkUrl();
+        if (matcher.test(initialUrl)) {
+          return { toolCallId: "", toolName, output: `URL matched immediately: ${initialUrl}`, isError: false };
+        }
+
+        return await new Promise<ToolResult>((resolve) => {
+          const startTime = Date.now();
+          const interval = setInterval(async () => {
+            try {
+              const currentUrl = await checkUrl();
+              if (matcher.test(currentUrl)) {
+                clearInterval(interval);
+                resolve({ toolCallId: "", toolName, output: `URL matched: ${currentUrl}`, isError: false });
+              } else if (Date.now() - startTime >= timeout) {
+                clearInterval(interval);
+                resolve({ toolCallId: "", toolName, output: `Timeout waiting for URL pattern: ${urlPattern} (${timeout}ms). Current URL: ${currentUrl}`, isError: false });
+              }
+            } catch (err) {
+              clearInterval(interval);
+              resolve({ toolCallId: "", toolName, output: `Error checking tab URL: ${err instanceof Error ? err.message : String(err)}`, isError: true });
+            }
+          }, 200);
+        });
+      } catch (error) {
+        return {
+          toolCallId: "", toolName,
+          output: `wait_for_url failed: ${error instanceof Error ? error.message : String(error)}`,
           isError: true
         };
       }
@@ -1317,17 +1412,27 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
     const controller = new AbortController();
     activeAgentControllers.set(payload.requestId, controller);
 
+    const getActiveTabId = async (fallback: number) => {
+       try {
+           const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+           return tab?.id ?? fallback;
+       } catch {
+           return fallback;
+       }
+    };
+
     void (async () => {
       try {
         await runAgent(
           payload,
           {
             emit: emitAgentEvent,
-            executePageTool: async (tabId, toolName, args) => executePageTool(tabId, toolName, args),
-            executeBackgroundTool: async (tabId, toolName, args) => executeBackgroundTool(tabId, toolName, args, payload.config),
+            executePageTool: async (tabId, toolName, args) => executePageTool(await getActiveTabId(tabId), toolName, args),
+            executeBackgroundTool: async (tabId, toolName, args) => executeBackgroundTool(await getActiveTabId(tabId), toolName, args, payload.config),
             getPageContext: async (tabId) => {
+              const activeId = await getActiveTabId(tabId);
               try {
-                const resp = await sendTabMessage(tabId, { type: "GET_PAGE_CONTEXT" }) as { ok?: boolean; data?: string } | undefined;
+                const resp = await sendTabMessage(activeId, { type: "GET_PAGE_CONTEXT" }) as { ok?: boolean; data?: string } | undefined;
                 if (resp?.ok && typeof resp.data === "string") {
                   const titleMatch = resp.data.match(/^Title:\s*(.+)/);
                   return { title: titleMatch?.[1], url: undefined };
@@ -2774,6 +2879,51 @@ async function handleAlarmFired(alarm: chrome.alarms.Alarm): Promise<void> {
               return { toolCallId: "", toolName, output: `Navigating to ${url}`, isError: false };
             } catch (error) {
               return { toolCallId: "", toolName, output: `Navigate failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+            }
+          }
+          if (toolName === "wait_for_url") {
+            const urlPattern = typeof args.urlPattern === "string" ? args.urlPattern : "";
+            const timeout = typeof args.timeout === "number" ? args.timeout : 5000;
+            if (!urlPattern) return { toolCallId: "", toolName, output: "Error: urlPattern is required", isError: true };
+
+            let matcher: RegExp;
+            try {
+              const regexMatch = /^\/(.+)\/([dgimsuvy]*)$/.exec(urlPattern.trim());
+              if (regexMatch) matcher = new RegExp(regexMatch[1], regexMatch[2]);
+              else matcher = new RegExp(urlPattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+            } catch (error) {
+              return { toolCallId: "", toolName, output: `Error: Invalid pattern - ${String(error)}`, isError: true };
+            }
+
+            try {
+              const checkUrl = async () => {
+                const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+                if (tabs && tabs.length > 0) return tabs[0].url || "";
+                return (await chrome.tabs.get(tabId!)).url || "";
+              };
+              const initialUrl = await checkUrl();
+              if (matcher.test(initialUrl)) return { toolCallId: "", toolName, output: `URL matched: ${initialUrl}`, isError: false };
+
+              return await new Promise<ToolResult>((resolve) => {
+                const startTime = Date.now();
+                const interval = setInterval(async () => {
+                  try {
+                    const currentUrl = await checkUrl();
+                    if (matcher.test(currentUrl)) {
+                      clearInterval(interval);
+                      resolve({ toolCallId: "", toolName, output: `URL matched: ${currentUrl}`, isError: false });
+                    } else if (Date.now() - startTime >= timeout) {
+                      clearInterval(interval);
+                      resolve({ toolCallId: "", toolName, output: `Timeout waiting for URL pattern: ${urlPattern}`, isError: false });
+                    }
+                  } catch (err) {
+                    clearInterval(interval);
+                    resolve({ toolCallId: "", toolName, output: `Error: ${String(err)}`, isError: true });
+                  }
+                }, 200);
+              });
+            } catch (error) {
+              return { toolCallId: "", toolName, output: `wait_for_url failed: ${String(error)}`, isError: true };
             }
           }
           if (toolName === "get_current_time") {

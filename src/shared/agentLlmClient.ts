@@ -27,6 +27,90 @@ export interface AgentStreamDelta {
 
 type TokenParamName = "max_tokens" | "max_completion_tokens";
 
+function isMiniMaxM3Model(model: string): boolean {
+  return /^minimax-m3$/i.test(model.trim());
+}
+
+function getAgentRequestBodyExtras(config: LLMConfig): Record<string, unknown> | undefined {
+  if (isMiniMaxM3Model(config.model)) {
+    return {
+      thinking: { type: "adaptive" },
+      reasoning_split: true
+    };
+  }
+  return undefined;
+}
+
+function extractReasoningDetailsText(
+  details: Array<{ text?: string }> | undefined
+): string | null {
+  if (!Array.isArray(details) || details.length === 0) {
+    return null;
+  }
+
+  const text = details
+    .map((detail) => (typeof detail?.text === "string" ? detail.text : ""))
+    .join("");
+
+  return text || null;
+}
+
+function getStreamAppend(snapshotOrDelta: string, accumulated: string): string {
+  if (!snapshotOrDelta) {
+    return "";
+  }
+  if (accumulated && snapshotOrDelta.startsWith(accumulated)) {
+    return snapshotOrDelta.slice(accumulated.length);
+  }
+  return snapshotOrDelta;
+}
+
+function fallbackStatusText(status: number): string {
+  switch (status) {
+    case 400:
+      return "Bad Request";
+    case 401:
+      return "Unauthorized";
+    case 403:
+      return "Forbidden";
+    case 404:
+      return "Not Found";
+    case 408:
+      return "Request Timeout";
+    case 409:
+      return "Conflict";
+    case 422:
+      return "Unprocessable Entity";
+    case 429:
+      return "Too Many Requests";
+    case 500:
+      return "Internal Server Error";
+    case 502:
+      return "Bad Gateway";
+    case 503:
+      return "Service Unavailable";
+    case 504:
+      return "Gateway Timeout";
+    default:
+      return "Unknown error";
+  }
+}
+
+async function readErrorDetails(response: Response): Promise<string> {
+  const bodyText = await response.text().catch(() => "");
+  const trimmedBodyText = bodyText.trim();
+  if (trimmedBodyText) {
+    return trimmedBodyText;
+  }
+
+  const trimmedStatusText = response.statusText.trim();
+  if (trimmedStatusText) {
+    return trimmedStatusText;
+  }
+
+  return fallbackStatusText(response.status);
+}
+
 function summarizeSerializedMessages(messages: unknown[]): string {
   const summary = messages.map((message, index) => {
     if (!message || typeof message !== "object") {
@@ -154,6 +238,7 @@ function parseAgentStreamLine(dataLine: string): AgentStreamDelta | null {
         content?: string | Array<{ type?: string; text?: string; thinking?: string }>;
         reasoning?: string;
         reasoning_content?: string;
+        reasoning_details?: Array<{ text?: string }>;
         tool_calls?: Array<{
           index: number;
           id?: string;
@@ -202,6 +287,10 @@ function parseAgentStreamLine(dataLine: string): AgentStreamDelta | null {
 
   if (reasoning === null && typeof delta?.reasoning === "string") {
     reasoning = delta.reasoning;
+  }
+
+  if (reasoning === null) {
+    reasoning = extractReasoningDetailsText(delta?.reasoning_details);
   }
 
   const finishReason = choice.finish_reason ?? null;
@@ -298,6 +387,7 @@ function buildAgentRequestBody(input: {
     ? Math.max(1, Math.min(maxOutputTokens, Math.floor(maxOutputTokensOverride)))
     : maxOutputTokens;
   const body: Record<string, unknown> = {
+    ...(getAgentRequestBodyExtras(input.config) ?? {}),
     model: input.config.model,
     stream: true,
     temperature: input.config.temperature,
@@ -410,7 +500,7 @@ async function requestAgentWithTokenFallback(
     const resp = await postAgentStreamRequest(input, tokenParam, fetcher);
     if (resp.ok) return resp;
 
-    const text = await resp.text();
+    const text = await readErrorDetails(resp);
     attempts.push({
       status: resp.status,
       text,
@@ -425,13 +515,13 @@ async function requestAgentWithTokenFallback(
       if (retryResp.ok) {
         return retryResp;
       }
-      attempts.push({
-        status: retryResp.status,
-        text: await retryResp.text().catch(() => "Unknown error"),
-        thinkingFormat: configFormat,
-        tokenParamName: tokenParam,
-        input
-      });
+        attempts.push({
+          status: retryResp.status,
+          text: await readErrorDetails(retryResp),
+          thinkingFormat: configFormat,
+          tokenParamName: tokenParam,
+          input
+        });
     }
 
     // Check for token param retry
@@ -455,7 +545,7 @@ async function requestAgentWithTokenFallback(
         }
         attempts.push({
           status: retryResp.status,
-          text: await retryResp.text().catch(() => "Unknown error"),
+          text: await readErrorDetails(retryResp),
           thinkingFormat: fmt,
           tokenParamName: tokenParam,
           input
@@ -474,7 +564,7 @@ async function requestAgentWithTokenFallback(
   const fallbackResp = await postAgentStreamRequest(input, secondaryParam, fetcher);
   if (fallbackResp.ok) return fallbackResp;
 
-  const fallbackText = await fallbackResp.text();
+  const fallbackText = await readErrorDetails(fallbackResp);
   const fallbackAttempts: Array<{
     status: number;
     text: string;
@@ -501,7 +591,7 @@ async function requestAgentWithTokenFallback(
     }
     fallbackAttempts.push({
       status: retryResp.status,
-      text: await retryResp.text().catch(() => "Unknown error"),
+      text: await readErrorDetails(retryResp),
       thinkingFormat: input.config.thinkingFormat ?? "field",
       tokenParamName: secondaryParam,
       input
@@ -522,7 +612,7 @@ async function requestAgentWithTokenFallback(
       }
       fallbackAttempts.push({
         status: retryResp.status,
-        text: await retryResp.text().catch(() => "Unknown error"),
+        text: await readErrorDetails(retryResp),
         thinkingFormat: fmt,
         tokenParamName: secondaryParam,
         input
@@ -590,13 +680,19 @@ export async function requestAgentStream(
       if (!delta) continue;
 
       if (delta.content) {
-        accContent += delta.content;
-        callbacks?.onTextDelta?.(delta.content);
+        const contentDelta = getStreamAppend(delta.content, accContent);
+        if (contentDelta) {
+          accContent += contentDelta;
+          callbacks?.onTextDelta?.(contentDelta);
+        }
       }
 
       if (delta.reasoning) {
-        accThinking += delta.reasoning;
-        callbacks?.onThinkingDelta?.(delta.reasoning);
+        const reasoningDelta = getStreamAppend(delta.reasoning, accThinking);
+        if (reasoningDelta) {
+          accThinking += reasoningDelta;
+          callbacks?.onThinkingDelta?.(reasoningDelta);
+        }
       }
 
       if (delta.toolCalls) {
@@ -629,12 +725,18 @@ export async function requestAgentStream(
     const delta = parseAgentStreamLine(buffer.trim());
     if (delta) {
       if (delta.content) {
-        accContent += delta.content;
-        callbacks?.onTextDelta?.(delta.content);
+        const contentDelta = getStreamAppend(delta.content, accContent);
+        if (contentDelta) {
+          accContent += contentDelta;
+          callbacks?.onTextDelta?.(contentDelta);
+        }
       }
       if (delta.reasoning) {
-        accThinking += delta.reasoning;
-        callbacks?.onThinkingDelta?.(delta.reasoning);
+        const reasoningDelta = getStreamAppend(delta.reasoning, accThinking);
+        if (reasoningDelta) {
+          accThinking += reasoningDelta;
+          callbacks?.onThinkingDelta?.(reasoningDelta);
+        }
       }
     }
   }
