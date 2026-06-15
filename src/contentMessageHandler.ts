@@ -7,6 +7,7 @@ const defaultFeatureFlags: FeatureFlags = {
   aggressiveVisibilityBypass: false,
   blockFullscreenRequests: false,
   blockDevtoolsDetection: false,
+  autoBlockXSpamAccounts: false,
   enableFloatingBall: false
 };
 

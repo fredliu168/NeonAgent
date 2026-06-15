@@ -1,6 +1,6 @@
 {
   "name": "neonagent",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,6 +9,7 @@
     "copy:static": "mkdir -p dist/sidepanel dist/images && cp src/manifest.json dist/manifest.json && cp src/sidepanel/index.html dist/sidepanel/index.html && perl -0pi -e 's#src=\"../../dist/sidepanel/index.js\"#src=\"index.js\"#' dist/sidepanel/index.html && cp images/* dist/images/",
     "generate-icons": "node scripts/generate-icons.mjs",
     "local-server": "node scripts/neonagent-local-server.mjs",
+    "local-server:py": "python3 scripts/neonagent-local-server.py",
     "test": "vitest run",
     "test:ci": "vitest run --reporter=basic --retry=1",
     "test:watch": "vitest"

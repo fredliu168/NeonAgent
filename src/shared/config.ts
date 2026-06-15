@@ -459,6 +459,10 @@ export function migrateConfig(config: LLMConfig): LLMConfig {
     next.autoSolveCurrentPage = DEFAULT_CONFIG.autoSolveCurrentPage;
   }
 
+  if (typeof next.autoBlockXSpamAccounts !== "boolean") {
+    next.autoBlockXSpamAccounts = DEFAULT_CONFIG.autoBlockXSpamAccounts;
+  }
+
   if (!next.localCommandWsUrl.trim()) {
     next.localCommandWsUrl = DEFAULT_CONFIG.localCommandWsUrl;
   }
@@ -509,6 +513,7 @@ export const DEFAULT_CONFIG: LLMConfig = {
   blockFullscreenRequests: false,
   blockDevtoolsDetection: false,
   autoSolveCurrentPage: false,
+  autoBlockXSpamAccounts: false,
   enableFloatingBall: false,
   localCommandEnabled: false,
   localCommandWsUrl: "ws://127.0.0.1:8787/neonagent",
@@ -617,6 +622,10 @@ export function validateConfig(input: LLMConfig): ValidationResult {
 
   if (typeof input.autoSolveCurrentPage !== "boolean") {
     errors.push("autoSolveCurrentPage must be boolean");
+  }
+
+  if (typeof input.autoBlockXSpamAccounts !== "boolean") {
+    errors.push("autoBlockXSpamAccounts must be boolean");
   }
 
   if (typeof input.enableFloatingBall !== "boolean") {

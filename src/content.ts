@@ -4,6 +4,7 @@ type FeatureFlags = {
   aggressiveVisibilityBypass: boolean;
   blockFullscreenRequests: boolean;
   blockDevtoolsDetection: boolean;
+  autoBlockXSpamAccounts: boolean;
   enableFloatingBall: boolean;
 };
 
@@ -25,6 +26,7 @@ type LLMConfig = {
   blockFullscreenRequests: boolean;
   blockDevtoolsDetection: boolean;
   autoSolveCurrentPage: boolean;
+  autoBlockXSpamAccounts: boolean;
   enableFloatingBall: boolean;
 };
 
@@ -444,6 +446,7 @@ const defaultFeatureFlags: FeatureFlags = {
   aggressiveVisibilityBypass: false,
   blockFullscreenRequests: false,
   blockDevtoolsDetection: false,
+  autoBlockXSpamAccounts: false,
   enableFloatingBall: false
 };
 
@@ -482,7 +485,44 @@ let autoSolveTimer: ReturnType<typeof setTimeout> | null = null;
 let autoSolveAttachTimer: ReturnType<typeof setTimeout> | null = null;
 let lastAutoSolveQuestionSignature = "";
 const sentAutoSolveSignatures = new Set<string>();
+let autoBlockXSpamAccountsEnabled = false;
+let xAutoBlockObserver: MutationObserver | null = null;
+let xAutoBlockTimer: ReturnType<typeof setTimeout> | null = null;
+let xAutoBlockAttachTimer: ReturnType<typeof setTimeout> | null = null;
+let xAutoBlockRunning = false;
+let xAutoBlockSpaUnlisten: (() => void) | null = null;
+let xAutoBlockLastSweepSignature = "";
+let xAutoBlockRunToken = 0;
+const xAutoBlockHandledAccounts = new Set<string>();
+type XModelRiskDecision = {
+  decision: "block" | "skip" | "unknown";
+  category: "adult" | "marketing" | "normal" | "unknown";
+  confidence: number;
+  reason: string;
+};
+const xAutoBlockReviewCache = new Map<string, XModelRiskDecision>();
 const PAGE_TRANSLATION_MAX_ATTEMPTS = 3;
+const X_ACCOUNT_HANDLE_PATTERN = /^\/([A-Za-z0-9_]{1,15})(?:\/.*)?$/;
+const X_RESERVED_PATHS = new Set([
+  "home", "explore", "notifications", "messages", "i", "search", "compose", "settings",
+  "bookmarks", "lists", "communities", "premium", "jobs", "privacy", "tos", "about", "login", "signup"
+]);
+const X_ADULT_KEYWORDS = [
+  "onlyfans", "nsfw", "18+", "escort", "porn", "nude", "裸体", "成人视频", "福利姬", "约炮", "色情网", "裸聊",
+  "打✈️", "打飞机", "可约", "资源群", "福利", "骚", "骚货", "发骚", "线下", "可啪", "可做",
+  "处男", "免费约", "处男免费", "首次免费", "约啪",
+  // 网络性暗语：能打 = 颜值可约
+  "能打", "可打", "颜值能打", "值得打", "打得过"
+];
+const X_MARKETING_KEYWORDS = [
+  "营销", "推广", "引流", "私信我", "兼职", "副业", "赚钱", "稳赚", "躺赚", "返利", "加v", "加微信",
+  "telegram", "whatsapp", "airdrop", "crypto", "币圈", "代投", "买粉", "刷粉", "开户", "招商", "代理", "推广合作",
+  "tg", "电报", "附近", "附近好友", "牵线", "真实可靠", "无套路", "同城", "交友", "约会", "资源", "安排",
+  "约见", "点我主页", "主页见", "看我主页", "点我头像", "看我头像", "戳我头像", "头像见"
+];
+const X_MARKETING_HANDLE_KEYWORDS = [
+  "promo", "marketing", "ads", "traffic", "growth", "crypto", "airdrop", "onlyfans", "vip", "sex", "nsfw"
+];
 
 function buildPageContext(): string {
   const title = document.title || "Untitled";
@@ -942,6 +982,690 @@ function attachAutoSolveObserver(): void {
   scheduleAutoSolveCurrentPage("observer_attached");
 }
 
+function isXAutoBlockSupportedHost(): boolean {
+  return location.hostname === "x.com" || location.hostname === "twitter.com";
+}
+
+function normalizeXAutoBlockText(input: string): string {
+  return normalizeText(input).toLowerCase();
+}
+
+function extractXHandleFromHref(href: string | null): string | null {
+  if (!href) {
+    return null;
+  }
+
+  const match = X_ACCOUNT_HANDLE_PATTERN.exec(href.trim());
+  if (!match) {
+    return null;
+  }
+
+  const handle = match[1].toLowerCase();
+  if (!handle || X_RESERVED_PATHS.has(handle)) {
+    return null;
+  }
+
+  return handle;
+}
+
+function collectXHandlesFromArticle(article: HTMLElement): string[] {
+  const handles = Array.from(article.querySelectorAll<HTMLAnchorElement>("a[href^='/']"))
+    .map((anchor) => extractXHandleFromHref(anchor.getAttribute("href")))
+    .filter((handle): handle is string => !!handle);
+
+  return Array.from(new Set(handles));
+}
+
+function hasXVerifiedBadge(article: HTMLElement): boolean {
+  return !!article.querySelector(
+    '[data-testid="icon-verified"], svg[aria-label*="Verified"], svg[aria-label*="已认证"]'
+  );
+}
+
+function scoreKeywordMatches(text: string, keywords: string[]): number {
+  return keywords.reduce((score, keyword) => score + (text.includes(keyword) ? 1 : 0), 0);
+}
+
+function getMatchedKeywords(text: string, keywords: string[]): string[] {
+  return keywords.filter((keyword) => text.includes(keyword));
+}
+
+function classifyXAccountArticle(article: HTMLElement): {
+  shouldBlock: boolean;
+  handle: string | null;
+  reason: string;
+  debug: {
+    displayName: string;
+    snippet: string;
+    hardAdultLureScore: number;
+    adultScore: number;
+    marketingScore: number;
+    profileLureComboScore: number;
+    externalContactScore: number;
+    hashtagBurstScore: number;
+    dollarBurstScore: number;
+    pureEmojiBurstScore: number;
+    verifiedPenalty: number;
+    totalAdultScore: number;
+    totalMarketingScore: number;
+    matchedAdultKeywords: string[];
+    matchedMarketingKeywords: string[];
+    matchedHandleKeywords: string[];
+  };
+} {
+  const handles = collectXHandlesFromArticle(article);
+  const handle = handles.find((candidate) => !X_RESERVED_PATHS.has(candidate)) ?? null;
+  const displayName = extractXDisplayName(article);
+  const text = normalizeXAutoBlockText(article.innerText || "");
+  const snippet = text.slice(0, 120);
+  const emptyDebug = {
+    displayName,
+    snippet,
+    hardAdultLureScore: 0,
+    adultScore: 0,
+    marketingScore: 0,
+    profileLureComboScore: 0,
+    externalContactScore: 0,
+    hashtagBurstScore: 0,
+    dollarBurstScore: 0,
+    pureEmojiBurstScore: 0,
+    verifiedPenalty: 0,
+    totalAdultScore: 0,
+    totalMarketingScore: 0,
+    matchedAdultKeywords: [] as string[],
+    matchedMarketingKeywords: [] as string[],
+    matchedHandleKeywords: [] as string[]
+  };
+  if (!handle) {
+    return { shouldBlock: false, handle: null, reason: "", debug: emptyDebug };
+  }
+
+  if (xAutoBlockHandledAccounts.has(handle)) {
+    return { shouldBlock: false, handle, reason: "", debug: emptyDebug };
+  }
+
+  const handleText = normalizeXAutoBlockText(handle);
+  const matchedAdultKeywords = getMatchedKeywords(text, X_ADULT_KEYWORDS);
+  const matchedMarketingKeywords = getMatchedKeywords(text, X_MARKETING_KEYWORDS);
+  const matchedHandleKeywords = getMatchedKeywords(handleText, X_MARKETING_HANDLE_KEYWORDS);
+  const hardAdultLurePattern = /(?:主页|头像|资料|bio|home|ホーム|プロフ(?:ィール)?).{0,8}(?:能打|可打|可约|约炮|约啪|可啪|可做|线下|やれる|会える)/i;
+  const hardAdultLureScore = hardAdultLurePattern.test(text) ? 3 : 0;
+  const adultScore = matchedAdultKeywords.length + matchedHandleKeywords.length;
+  const marketingScore = matchedMarketingKeywords.length + matchedHandleKeywords.length;
+  const hasProfileLure = /(?:主页|头像|资料|bio)/i.test(text);
+  const hasSexualSlang = /(?:能打|可打|可约|约炮|约啪|可啪|可做|线下)/i.test(text);
+  const profileLureComboScore = hasProfileLure && hasSexualSlang ? 2 : 0;
+  const externalContactScore = /(?:t\.me\/|telegram|whatsapp|line id|vx[:：]?|wechat|onlyfans)/i.test(text) ? 2 : 0;
+  const hashtagBurstScore = (text.match(/#[^\s#]+/g) ?? []).length >= 5 ? 1 : 0;
+  const dollarBurstScore = (text.match(/\$[A-Za-z0-9_]+/g) ?? []).length >= 3 ? 1 : 0;
+  // Pure-emoji post: strip emoji and whitespace; if no readable text remains
+  // and there are ≥4 emoji, treat it as a noise/lure burst (+2 marketing score).
+  const emojiCount = (text.match(/\p{Emoji_Presentation}|\p{Extended_Pictographic}/gu) ?? []).length;
+  const textWithoutEmoji = text.replace(/\p{Emoji_Presentation}|\p{Extended_Pictographic}/gu, "").replace(/\s/g, "");
+  const pureEmojiBurstScore = emojiCount >= 4 && textWithoutEmoji.length === 0 ? 2 : 0;
+  const verifiedPenalty = hasXVerifiedBadge(article) ? 2 : 0;
+  const totalAdultScore = hardAdultLureScore + adultScore + externalContactScore + profileLureComboScore - verifiedPenalty;
+  const totalMarketingScore = marketingScore + externalContactScore + hashtagBurstScore + dollarBurstScore + pureEmojiBurstScore + profileLureComboScore - verifiedPenalty;
+  const debug = {
+    displayName,
+    snippet,
+    hardAdultLureScore,
+    adultScore,
+    marketingScore,
+    profileLureComboScore,
+    externalContactScore,
+    hashtagBurstScore,
+    dollarBurstScore,
+    pureEmojiBurstScore,
+    verifiedPenalty,
+    totalAdultScore,
+    totalMarketingScore,
+    matchedAdultKeywords,
+    matchedMarketingKeywords,
+    matchedHandleKeywords
+  };
+
+  if (totalAdultScore >= 3) {
+    return { shouldBlock: true, handle, reason: "adult", debug };
+  }
+
+  if (totalMarketingScore >= 4) {
+    return { shouldBlock: true, handle, reason: "marketing", debug };
+  }
+
+  return { shouldBlock: false, handle, reason: "", debug };
+}
+
+async function reviewXAccountWithModel(input: {
+  article: HTMLElement;
+  handle: string;
+  localReason: string;
+}): Promise<XModelRiskDecision> {
+  const runtime = getChromeRuntime();
+  if (!runtime?.sendMessage) {
+    return {
+      decision: "unknown",
+      category: "unknown",
+      confidence: 0,
+      reason: "runtime_unavailable"
+    };
+  }
+
+  const displayName = extractXDisplayName(input.article);
+  const snippet = normalizeXAutoBlockText(input.article.innerText || "").slice(0, 50);
+  const cacheKey = `${input.handle}::${displayName}::${snippet}`;
+  const cached = xAutoBlockReviewCache.get(cacheKey);
+  if (cached) {
+    console.info("[NeonAgent] X auto-block model review cache hit", {
+      handle: input.handle,
+      displayName,
+      snippet,
+      modelDecision: cached
+    });
+    return cached;
+  }
+
+  try {
+    const response = await runtime.sendMessage({
+      type: "CLASSIFY_X_ACCOUNT_RISK",
+      payload: {
+        handle: input.handle,
+        displayName,
+        snippet,
+        localReason: input.localReason
+      }
+    }) as {
+      ok?: boolean;
+      data?: Partial<XModelRiskDecision>;
+    } | undefined;
+
+    const raw = response?.data;
+    const decision: XModelRiskDecision = {
+      decision: raw?.decision === "block" || raw?.decision === "skip" || raw?.decision === "unknown"
+        ? raw.decision
+        : "unknown",
+      category: raw?.category === "adult" || raw?.category === "marketing" || raw?.category === "normal" || raw?.category === "unknown"
+        ? raw.category
+        : "unknown",
+      confidence: typeof raw?.confidence === "number" && Number.isFinite(raw.confidence)
+        ? Math.max(0, Math.min(1, raw.confidence))
+        : 0,
+      reason: typeof raw?.reason === "string" && raw.reason.trim()
+        ? raw.reason.trim()
+        : "no_reason"
+    };
+    xAutoBlockReviewCache.set(cacheKey, decision);
+    console.info("[NeonAgent] X auto-block model review", {
+      handle: input.handle,
+      displayName,
+      snippet,
+      localReason: input.localReason,
+      modelDecision: decision
+    });
+    return decision;
+  } catch {
+    console.warn("[NeonAgent] X auto-block model review failed before response", {
+      handle: input.handle,
+      displayName,
+      snippet,
+      localReason: input.localReason
+    });
+    return {
+      decision: "unknown",
+      category: "unknown",
+      confidence: 0,
+      reason: "send_failed"
+    };
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
+async function findElementWithRetries<T extends Element>(
+  finder: () => T | null,
+  attempts = 8,
+  delayMs = 180
+): Promise<T | null> {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const result = finder();
+    if (result) {
+      return result;
+    }
+    await delay(delayMs);
+  }
+  return null;
+}
+
+function findXMoreButton(article: HTMLElement): HTMLButtonElement | null {
+  return article.querySelector<HTMLButtonElement>(
+    'button[aria-label*="More"], button[aria-label*="更多"], [data-testid="caret"]'
+  );
+}
+
+function findXBlockMenuItem(handle: string): HTMLElement | null {
+  const items = Array.from(
+    document.querySelectorAll<HTMLElement>('[role="menuitem"], [data-testid="Dropdown"] [tabindex="0"]')
+  );
+  const targetPatterns = [
+    new RegExp(`\\bblock\\s+@?${handle}\\b`, "i"),
+    new RegExp(`\\b屏蔽\\s+@?${handle}\\b`, "i"),
+    /\bblock\b/i,
+    /屏蔽/
+  ];
+
+  return items.find((item) => {
+    const text = normalizeText(item.innerText || "");
+    return targetPatterns.some((pattern) => pattern.test(text)) && !/unblock|取消屏蔽/i.test(text);
+  }) ?? null;
+}
+
+function findXBlockConfirmButton(): HTMLButtonElement | null {
+  return document.querySelector<HTMLButtonElement>(
+    '[data-testid="confirmationSheetConfirm"], button[data-testid="confirmationSheetConfirm"], [data-testid="confirmationSheetDialog"] button'
+  ) ?? Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((button) => {
+    const text = normalizeText(button.innerText || "");
+    return /\bblock\b/i.test(text) || /屏蔽/.test(text);
+  }) ?? null;
+}
+
+async function autoBlockXAccountFromArticle(article: HTMLElement, handle: string): Promise<void> {
+  const moreButton = findXMoreButton(article);
+  if (!moreButton) {
+    return;
+  }
+
+  moreButton.click();
+
+  const blockMenuItem = await findElementWithRetries(() => findXBlockMenuItem(handle));
+  if (!blockMenuItem) {
+    return;
+  }
+  blockMenuItem.click();
+
+  const confirmButton = await findElementWithRetries(findXBlockConfirmButton);
+  confirmButton?.click();
+}
+
+function hideBlockedXArticle(article: HTMLElement): void {
+  article.setAttribute("data-neonagent-hidden-x-block", "true");
+  article.style.display = "none";
+
+  const separator = article.nextElementSibling as HTMLElement | null;
+  if (separator && separator.getAttribute("role") === "separator") {
+    separator.style.display = "none";
+  }
+}
+
+async function recordBlockedXAccount(input: {
+  handle: string;
+  displayName: string;
+  reason: "marketing" | "adult";
+  article: HTMLElement;
+}): Promise<void> {
+  const runtime = getChromeRuntime();
+  if (!runtime?.sendMessage) {
+    return;
+  }
+
+  const snippet = normalizeText((input.article.innerText || "").slice(0, 280));
+  try {
+    await runtime.sendMessage({
+      type: "RECORD_X_BLOCKED_ACCOUNT",
+      payload: {
+        id: `xblock:${input.handle.toLowerCase()}`,
+        handle: input.handle.toLowerCase(),
+        displayName: input.displayName || input.handle,
+        reason: input.reason,
+        blockedAt: Date.now(),
+        sourceUrl: location.href,
+        postSnippet: snippet
+      }
+    });
+  } catch {
+    // ignored
+  }
+}
+
+function extractXDisplayName(article: HTMLElement): string {
+  const candidates = Array.from(article.querySelectorAll<HTMLElement>("div[dir='ltr'] span, [data-testid='User-Name'] span"));
+  for (const candidate of candidates) {
+    const text = normalizeText(candidate.innerText || "");
+    if (text && !text.startsWith("@")) {
+      return text;
+    }
+  }
+  return "";
+}
+
+function findXUnblockMenuItem(handle: string): HTMLElement | null {
+  const items = Array.from(
+    document.querySelectorAll<HTMLElement>('[role="menuitem"], [data-testid="Dropdown"] [tabindex="0"]')
+  );
+  const targetPatterns = [
+    new RegExp(`\\bunblock\\s+@?${handle}\\b`, "i"),
+    new RegExp(`\\b取消屏蔽\\s+@?${handle}\\b`, "i"),
+    /\bunblock\b/i,
+    /取消屏蔽/
+  ];
+
+  return items.find((item) => {
+    const text = normalizeText(item.innerText || "");
+    return targetPatterns.some((pattern) => pattern.test(text));
+  }) ?? null;
+}
+
+function findXUnblockConfirmButton(): HTMLButtonElement | null {
+  return document.querySelector<HTMLButtonElement>(
+    '[data-testid="confirmationSheetConfirm"], button[data-testid="confirmationSheetConfirm"], [data-testid="confirmationSheetDialog"] button'
+  ) ?? Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((button) => {
+    const text = normalizeText(button.innerText || "");
+    return /\bunblock\b/i.test(text) || /取消屏蔽/.test(text);
+  }) ?? null;
+}
+
+async function restoreBlockedXAccount(handle: string): Promise<string> {
+  if (!isXAutoBlockSupportedHost()) {
+    return "Error: restore only works on x.com / twitter.com";
+  }
+
+  const normalizedHandle = handle.trim().replace(/^@/, "").toLowerCase();
+  if (!normalizedHandle) {
+    return "Error: handle is required";
+  }
+
+  if (!location.pathname.toLowerCase().startsWith(`/${normalizedHandle}`)) {
+    location.href = `https://x.com/${normalizedHandle}`;
+    return `Navigating to @${normalizedHandle}`;
+  }
+
+  const profileHeader = await findElementWithRetries(
+    () => document.querySelector<HTMLElement>('div[data-testid="primaryColumn"], main')
+  );
+  if (!profileHeader) {
+    return `Error: profile for @${normalizedHandle} did not load`;
+  }
+
+  const moreButton = await findElementWithRetries(
+    () => document.querySelector<HTMLButtonElement>('button[aria-label*="More"], button[aria-label*="更多"], [data-testid="userActions"]')
+  );
+  if (!moreButton) {
+    return `Error: could not find profile menu for @${normalizedHandle}`;
+  }
+
+  moreButton.click();
+  const unblockItem = await findElementWithRetries(() => findXUnblockMenuItem(normalizedHandle));
+  if (!unblockItem) {
+    return `Error: could not find unblock action for @${normalizedHandle}`;
+  }
+  unblockItem.click();
+
+  const confirmButton = await findElementWithRetries(findXUnblockConfirmButton);
+  if (!confirmButton) {
+    return `Error: could not find unblock confirmation for @${normalizedHandle}`;
+  }
+  confirmButton.click();
+
+  xAutoBlockHandledAccounts.delete(normalizedHandle);
+  return `Unblocked @${normalizedHandle}`;
+}
+
+function buildXAutoBlockPageSignature(articles: HTMLElement[]): string {
+  const articleSignatures = articles
+    .slice(0, 24)
+    .map((article) => {
+      const handle = collectXHandlesFromArticle(article)[0] ?? "no_handle";
+      const snippet = normalizeXAutoBlockText(article.innerText || "")
+        .replace(/\p{Emoji_Presentation}|\p{Extended_Pictographic}/gu, "")
+        .slice(0, 64);
+      return `${handle}:${snippet}`;
+    })
+    .join("|");
+
+  return `${location.pathname}|${articles.length}|${articleSignatures}`;
+}
+
+async function runXAutoBlockSweep(reason: string): Promise<void> {
+  if (!autoBlockXSpamAccountsEnabled || xAutoBlockRunning || !isXAutoBlockSupportedHost()) {
+    console.info("[NeonAgent] X auto-block sweep skipped", {
+      enabled: autoBlockXSpamAccountsEnabled,
+      running: xAutoBlockRunning,
+      host: location.hostname,
+      reason
+    });
+    return;
+  }
+
+  xAutoBlockRunning = true;
+  const runToken = xAutoBlockRunToken;
+  try {
+    const articles = Array.from(document.querySelectorAll<HTMLElement>('article[data-testid="tweet"]'));
+    if (!autoBlockXSpamAccountsEnabled || runToken !== xAutoBlockRunToken) {
+      return;
+    }
+    const sweepSignature = buildXAutoBlockPageSignature(articles);
+    if (sweepSignature === xAutoBlockLastSweepSignature) {
+      return;
+    }
+
+    console.info("[NeonAgent] X auto-block sweep started", {
+      reason,
+      articleCount: articles.length,
+      url: location.href
+    });
+
+    for (const article of articles) {
+      if (!autoBlockXSpamAccountsEnabled || runToken !== xAutoBlockRunToken) {
+        return;
+      }
+      const classification = classifyXAccountArticle(article);
+      if (classification.handle) {
+        console.info("[NeonAgent] X auto-block scan result", {
+          handle: classification.handle,
+          shouldBlock: classification.shouldBlock,
+          localReason: classification.reason || "none",
+          debug: classification.debug,
+          trigger: reason
+        });
+      }
+      if (!classification.handle) {
+        continue;
+      }
+
+      const modelDecision = await reviewXAccountWithModel({
+        article,
+        handle: classification.handle,
+        localReason: classification.reason || "none"
+      });
+      if (!autoBlockXSpamAccountsEnabled || runToken !== xAutoBlockRunToken) {
+        return;
+      }
+
+      const shouldBlockByModel = modelDecision.decision === "block";
+      const shouldBlockFinal = shouldBlockByModel || classification.shouldBlock;
+
+      console.info("[NeonAgent] X auto-block merged classification", {
+        handle: classification.handle,
+        localShouldBlock: classification.shouldBlock,
+        localReason: classification.reason || "none",
+        modelDecision,
+        shouldBlockFinal,
+        debug: classification.debug,
+        trigger: reason
+      });
+
+      if (!shouldBlockFinal) {
+        continue;
+      }
+
+      if (modelDecision.decision === "skip") {
+        console.info("[NeonAgent] Skipped X auto-block after model review", {
+          handle: classification.handle,
+          localReason: classification.reason,
+          debug: classification.debug,
+          modelDecision
+        });
+        continue;
+      }
+
+      xAutoBlockHandledAccounts.add(classification.handle);
+      const resolvedReason: "marketing" | "adult" =
+        modelDecision.category === "adult" || modelDecision.category === "marketing"
+          ? modelDecision.category
+          : (classification.reason === "adult" || classification.reason === "marketing"
+            ? classification.reason
+            : "marketing");
+      try {
+        hideBlockedXArticle(article);
+        console.info("[NeonAgent] Hidden X account by model review", {
+          handle: classification.handle,
+          reason: resolvedReason,
+          debug: classification.debug,
+          modelDecision,
+          trigger: reason
+        });
+      } catch (error) {
+        console.warn("[NeonAgent] Failed to hide X account", {
+          handle: classification.handle,
+          reason: resolvedReason,
+          debug: classification.debug,
+          modelDecision,
+          trigger: reason,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+      await delay(300);
+    }
+    console.info("[NeonAgent] X auto-block sweep finished", {
+      reason,
+      articleCount: articles.length
+    });
+    xAutoBlockLastSweepSignature = sweepSignature;
+    // After sweep, do a delayed follow-up scan to catch scroll-loaded tweets.
+    if (autoBlockXSpamAccountsEnabled) {
+      xAutoBlockTimer = setTimeout(() => {
+        xAutoBlockTimer = null;
+        void runXAutoBlockSweep("post_sweep_followup");
+      }, 3000);
+    }
+  } finally {
+    xAutoBlockRunning = false;
+  }
+}
+
+function scheduleXAutoBlock(reason: string): void {
+  if (!autoBlockXSpamAccountsEnabled || !isXAutoBlockSupportedHost()) {
+    return;
+  }
+
+  if (xAutoBlockTimer) {
+    clearTimeout(xAutoBlockTimer);
+  }
+
+  xAutoBlockTimer = setTimeout(() => {
+    xAutoBlockTimer = null;
+    void runXAutoBlockSweep(reason);
+  }, 1200);
+}
+
+function attachXAutoBlockObserver(): void {
+  if (!autoBlockXSpamAccountsEnabled || xAutoBlockObserver || !isXAutoBlockSupportedHost()) {
+    console.info("[NeonAgent] X auto-block observer not attached", {
+      enabled: autoBlockXSpamAccountsEnabled,
+      hasObserver: !!xAutoBlockObserver,
+      host: location.hostname
+    });
+    return;
+  }
+
+  if (!document.body) {
+    if (!xAutoBlockAttachTimer) {
+      console.info("[NeonAgent] X auto-block waiting for document.body");
+      xAutoBlockAttachTimer = setTimeout(() => {
+        xAutoBlockAttachTimer = null;
+        attachXAutoBlockObserver();
+      }, 500);
+    }
+    return;
+  }
+
+  xAutoBlockObserver = new MutationObserver(() => {
+    scheduleXAutoBlock("page_mutation");
+  });
+  xAutoBlockObserver.observe(document.body, {
+    childList: true,
+    subtree: true
+  });
+  console.info("[NeonAgent] X auto-block observer attached", {
+    url: location.href
+  });
+  scheduleXAutoBlock("observer_attached");
+}
+
+function applyAutoBlockXSpamAccounts(enabled: boolean): void {
+  autoBlockXSpamAccountsEnabled = !!enabled;
+  xAutoBlockRunToken += 1;
+  console.info("[NeonAgent] X auto-block toggled", {
+    enabled,
+    host: location.hostname,
+    url: location.href
+  });
+
+  if (!enabled) {
+    if (xAutoBlockTimer) {
+      clearTimeout(xAutoBlockTimer);
+      xAutoBlockTimer = null;
+    }
+    if (xAutoBlockAttachTimer) {
+      clearTimeout(xAutoBlockAttachTimer);
+      xAutoBlockAttachTimer = null;
+    }
+    xAutoBlockObserver?.disconnect();
+    xAutoBlockObserver = null;
+    xAutoBlockRunning = false;
+    xAutoBlockLastSweepSignature = "";
+    xAutoBlockHandledAccounts.clear();
+    xAutoBlockReviewCache.clear();
+    xAutoBlockSpaUnlisten?.();
+    xAutoBlockSpaUnlisten = null;
+    console.info("[NeonAgent] X auto-block disabled and caches cleared");
+    return;
+  }
+
+  // SPA navigation detection: X uses history.pushState for client-side routing.
+  // When the URL changes, clear the handled set and trigger a fresh sweep.
+  if (!xAutoBlockSpaUnlisten) {
+    const onNavigation = (): void => {
+      if (!autoBlockXSpamAccountsEnabled) {
+        return;
+      }
+      xAutoBlockLastSweepSignature = "";
+      xAutoBlockHandledAccounts.clear();
+      xAutoBlockReviewCache.clear();
+      scheduleXAutoBlock("spa_navigation");
+    };
+
+    const origPushState = history.pushState.bind(history);
+    history.pushState = function pushState(...args: Parameters<typeof history.pushState>) {
+      origPushState(...args);
+      onNavigation();
+    };
+
+    window.addEventListener("popstate", onNavigation);
+
+    xAutoBlockSpaUnlisten = () => {
+      history.pushState = origPushState;
+      window.removeEventListener("popstate", onNavigation);
+    };
+  }
+
+  attachXAutoBlockObserver();
+  scheduleXAutoBlock("enabled");
+}
+
 function applyExamAnswersToPage(matches: ExamAnswerMatch[]): { applied: number } {
   let applied = 0;
   const questionRoots = resolveExamQuestionRoots();
@@ -1225,6 +1949,7 @@ function applyFeatureFlags(flags: FeatureFlags): void {
   }
 
   setFloatingBall(flags.enableFloatingBall);
+  applyAutoBlockXSpamAccounts(flags.autoBlockXSpamAccounts);
 }
 
 function flagsFromConfig(config: Partial<LLMConfig>): FeatureFlags {
@@ -1234,6 +1959,7 @@ function flagsFromConfig(config: Partial<LLMConfig>): FeatureFlags {
     aggressiveVisibilityBypass: !!config.aggressiveVisibilityBypass,
     blockFullscreenRequests: !!config.blockFullscreenRequests,
     blockDevtoolsDetection: !!config.blockDevtoolsDetection,
+    autoBlockXSpamAccounts: !!config.autoBlockXSpamAccounts,
     enableFloatingBall: !!config.enableFloatingBall
   };
 }
@@ -3867,6 +4593,17 @@ function createContentMessageHandler(options?: {
       applyTranslationSettings(translationSettingsFromConfig(payload ?? {}));
       sendResponse({ ok: true });
       return;
+    }
+
+    if (message.type === "RESTORE_X_BLOCKED_ACCOUNT") {
+      const payload = message.payload as { handle?: string } | undefined;
+      const handle = typeof payload?.handle === "string" ? payload.handle : "";
+      void restoreBlockedXAccount(handle).then((result) => {
+        sendResponse({ ok: !/^Error:/i.test(result), data: result, errors: /^Error:/i.test(result) ? [result] : undefined });
+      }).catch((error) => {
+        sendResponse({ ok: false, errors: [error instanceof Error ? error.message : String(error)] });
+      });
+      return true as unknown as void;
     }
 
     if (message.type === "TRANSLATE_CURRENT_PAGE_ONCE") {

@@ -1,6 +1,6 @@
 import { DEFAULT_CONFIG, validateConfig } from "./shared/config.js";
 import { chromeStorageAdapter } from "./shared/chromeStorageAdapter.js";
-import { ChatHistoryRepository, ConfigRepository, AgentHistoryRepository } from "./shared/storage.js";
+import { ChatHistoryRepository, ConfigRepository, AgentHistoryRepository, XBlockedAccountRepository } from "./shared/storage.js";
 import { isRuntimeMessage } from "./shared/messageGuards.js";
 import {
   requestChatCompletion,
@@ -8,7 +8,7 @@ import {
 } from "./shared/llmClient.js";
 import { runAgentLoop } from "./shared/agentLoop.js";
 import type { AgentProgressEvent, AgentRunConfig, AgentSession, ToolResult } from "./shared/agentTypes.js";
-import type { ChatSession, LLMConfig } from "./shared/types.js";
+import type { ChatSession, LLMConfig, XBlockedAccountRecord } from "./shared/types.js";
 import type { RuntimeStreamEvent } from "./shared/types.js";
 import type { StorageLike } from "./shared/storage.js";
 import { addMemory, searchMemories, deleteMemory, getAllMemories, importMemories, compressMemories, needsCompression } from "./shared/agentMemory.js";
@@ -59,6 +59,13 @@ type WordLookupDetails = {
 type WordLookupCache = Record<string, WordLookupDetails & {
   updatedAt: number;
 }>;
+
+type XAccountRiskDecision = {
+  decision: "block" | "skip" | "unknown";
+  category: "adult" | "marketing" | "normal" | "unknown";
+  confidence: number;
+  reason: string;
+};
 
 interface AgentExternalCommandPayload {
   requestId?: string;
@@ -389,6 +396,158 @@ function parseWordLookupResponse(content: string): WordLookupDetails {
   };
 }
 
+function buildXAccountRiskPrompt(input: {
+  handle: string;
+  displayName: string;
+  snippet: string;
+  localReason: string;
+}): string {
+  return [
+    "You are reviewing whether an X.com account should be auto-blocked as spam/adult content.",
+    "Return strict JSON only with this shape:",
+    '{"decision":"block|skip|unknown","category":"adult|marketing|normal|unknown","confidence":0.0,"reason":"short reason"}',
+    "Rules:",
+    '1. Return "block" only when the text clearly looks like色情招嫖/约炮引流/营销引流/诈骗式导流/明显垃圾营销。',
+    '2. Return "skip" when the text looks normal, ambiguous, joke-only, or evidence is weak.',
+    '3. Return "unknown" when there is not enough information.',
+    '4. confidence must be a number between 0 and 1.',
+    '5. reason must be short and plain text, no markdown.',
+    "Signals that strongly support block include:",
+    "- inviting users to view homepage/profile/avatar for hookups or contact info",
+    "- nearby/friends/meetup/real reliable/no套路/约见/免费/处男/福利/线下/骚货 style solicitation",
+    "- telegram/tg/whatsapp/wechat/onlyfans/contact diversion",
+    "- repeated emoji-grid or noise text combined with a sexual or marketing display name",
+    "Input:",
+    `handle: @${input.handle}`,
+    `displayName: ${input.displayName || "(empty)"}`,
+    `localReason: ${input.localReason || "(none)"}`,
+    "snippet:",
+    "```text",
+    input.snippet || "(empty)",
+    "```"
+  ].join("\n\n");
+}
+
+function parseXAccountRiskDecision(content: string): XAccountRiskDecision {
+  const trimmed = stripJsonFences(content);
+  let record: Record<string, unknown> | null = null;
+
+  const parseObject = (value: string): Record<string, unknown> | null => {
+    try {
+      const parsed = JSON.parse(value);
+      return typeof parsed === "object" && parsed !== null ? parsed as Record<string, unknown> : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const extractBalancedObject = (value: string): string | null => {
+    const start = value.indexOf("{");
+    if (start < 0) {
+      return null;
+    }
+
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = start; i < value.length; i += 1) {
+      const ch = value[i];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+          continue;
+        }
+        if (ch === "\\") {
+          escaped = true;
+          continue;
+        }
+        if (ch === '"') {
+          inString = false;
+        }
+        continue;
+      }
+
+      if (ch === '"') {
+        inString = true;
+        continue;
+      }
+
+      if (ch === "{") {
+        depth += 1;
+      } else if (ch === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          return value.slice(start, i + 1);
+        }
+      }
+    }
+    return null;
+  };
+
+  const normalizedQuotes = trimmed
+    .replace(/[\u201c\u201d]/g, '"')
+    .replace(/[\u2018\u2019]/g, "'");
+  const candidates = [
+    trimmed,
+    extractBalancedObject(trimmed),
+    normalizedQuotes,
+    extractBalancedObject(normalizedQuotes)
+  ].filter((value): value is string => Boolean(value));
+  for (const candidate of candidates) {
+    record = parseObject(candidate);
+    if (record) {
+      break;
+    }
+  }
+
+  if (!record) {
+    const decisionMatch = trimmed.match(/decision\s*[:=]\s*"?(block|skip|unknown)"?/i);
+    const categoryMatch = trimmed.match(/category\s*[:=]\s*"?(adult|marketing|normal|unknown)"?/i);
+    const confidenceMatch = trimmed.match(/confidence\s*[:=]\s*"?([0-9]+(?:\.[0-9]+)?%?)"?/i);
+    const reasonMatch = trimmed.match(/reason\s*[:=]\s*([^\n\r]+)/i);
+    record = {
+      decision: decisionMatch?.[1],
+      category: categoryMatch?.[1],
+      confidence: confidenceMatch?.[1] ?? "",
+      reason: reasonMatch?.[1]?.trim() ?? ""
+    };
+  }
+
+  const rawDecision = typeof record?.decision === "string" ? record.decision.trim().toLowerCase() : "";
+  const rawCategory = typeof record?.category === "string" ? record.category.trim().toLowerCase() : "";
+  const rawConfidence = typeof record?.confidence === "number"
+    ? record.confidence
+    : typeof record?.confidence === "string"
+      ? (() => {
+        const value = record.confidence.trim();
+        if (value.endsWith("%")) {
+          return Number(value.slice(0, -1)) / 100;
+        }
+        return Number(value);
+      })()
+      : Number.NaN;
+  const reason = typeof record?.reason === "string" ? record.reason.trim() : "";
+
+  const decision: XAccountRiskDecision["decision"] =
+    rawDecision === "block" || rawDecision === "skip" || rawDecision === "unknown"
+      ? rawDecision
+      : "unknown";
+  const category: XAccountRiskDecision["category"] =
+    rawCategory === "adult" || rawCategory === "marketing" || rawCategory === "normal" || rawCategory === "unknown"
+      ? rawCategory
+      : "unknown";
+  const confidence = Number.isFinite(rawConfidence)
+    ? Math.max(0, Math.min(1, rawConfidence))
+    : 0;
+
+  return {
+    decision,
+    category,
+    confidence,
+    reason: reason || "no_reason"
+  };
+}
+
 function parseTranslationResponse(content: string, expectedCount: number): string[] {
   const trimmed = content.trim();
   let parsed: unknown;
@@ -596,6 +755,7 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
   const repo = new ConfigRepository(storage);
   const chatRepo = new ChatHistoryRepository(storage);
   const agentRepo = new AgentHistoryRepository(storage);
+  const xBlockedAccountRepo = new XBlockedAccountRepository(storage);
   const invokeLLM = deps.invokeLLM ?? requestChatCompletion;
   const invokeLLMStream = deps.invokeLLMStream ?? requestChatCompletionStream;
   const runAgent = deps.runAgent ?? runAgentLoop;
@@ -887,6 +1047,35 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
   };
 
   const sendTabMessage = deps.sendTabMessage ?? sendTabMessageWithAutoInject;
+
+  const waitForTabComplete = async (tabId: number, timeoutMs = 15000): Promise<void> => {
+    if (typeof chrome === "undefined" || !chrome.tabs?.get || !chrome.tabs?.onUpdated) {
+      return;
+    }
+
+    const current = await chrome.tabs.get(tabId).catch(() => null);
+    if (current?.status === "complete") {
+      return;
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        chrome.tabs.onUpdated.removeListener(listener);
+        reject(new Error(`Timed out waiting for tab ${tabId} to load`));
+      }, timeoutMs);
+
+      const listener = (updatedTabId: number, changeInfo: chrome.tabs.TabChangeInfo) => {
+        if (updatedTabId !== tabId || changeInfo.status !== "complete") {
+          return;
+        }
+        clearTimeout(timer);
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      };
+
+      chrome.tabs.onUpdated.addListener(listener);
+    });
+  };
 
   const activeAgentControllers = new Map<string, AbortController>();
 
@@ -2061,6 +2250,135 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
       if (message.type === "CLEAR_AGENT_SESSIONS") {
         await agentRepo.clearAllSessions();
         sendResponse({ ok: true });
+        return;
+      }
+
+      if (message.type === "RECORD_X_BLOCKED_ACCOUNT") {
+        const payload = message.payload as Partial<XBlockedAccountRecord> | undefined;
+        if (!payload?.handle || !payload?.id) {
+          sendResponse({ ok: false, errors: ["id and handle are required"] });
+          return;
+        }
+
+        const record: XBlockedAccountRecord = {
+          id: payload.id,
+          handle: payload.handle,
+          displayName: typeof payload.displayName === "string" ? payload.displayName : payload.handle,
+          reason: payload.reason === "adult" ? "adult" : "marketing",
+          blockedAt: typeof payload.blockedAt === "number" ? payload.blockedAt : Date.now(),
+          sourceUrl: typeof payload.sourceUrl === "string" ? payload.sourceUrl : "",
+          postSnippet: typeof payload.postSnippet === "string" ? payload.postSnippet : "",
+          restoredAt: typeof payload.restoredAt === "number" ? payload.restoredAt : undefined
+        };
+        await xBlockedAccountRepo.saveRecord(record);
+        sendResponse({ ok: true });
+        return;
+      }
+
+      if (message.type === "LIST_X_BLOCKED_ACCOUNTS") {
+        const records = await xBlockedAccountRepo.getRecords();
+        sendResponse({ ok: true, data: records });
+        return;
+      }
+
+      if (message.type === "RESTORE_X_BLOCKED_ACCOUNT") {
+        const payload = message.payload as { handle?: string } | undefined;
+        const handle = typeof payload?.handle === "string" ? payload.handle.trim() : "";
+        if (!handle) {
+          sendResponse({ ok: false, errors: ["handle is required"] });
+          return;
+        }
+
+        try {
+          if (typeof chrome === "undefined" || !chrome.tabs?.query || !chrome.tabs?.update) {
+            throw new Error("chrome.tabs API not available");
+          }
+
+          const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+          if (!activeTab?.id) {
+            throw new Error("No active tab found");
+          }
+
+          const targetUrl = `https://x.com/${handle}`;
+          await chrome.tabs.update(activeTab.id, { url: targetUrl });
+          await waitForTabComplete(activeTab.id);
+
+          const response = await sendTabMessage(activeTab.id, {
+            type: "RESTORE_X_BLOCKED_ACCOUNT",
+            payload: { handle }
+          }) as { ok?: boolean; data?: string; errors?: string[] } | undefined;
+
+          if (!response?.ok) {
+            throw new Error(Array.isArray(response?.errors) ? response.errors.join(", ") : "Failed to restore blocked account");
+          }
+
+          await xBlockedAccountRepo.markRestored(handle);
+          sendResponse({ ok: true, data: { handle, url: targetUrl, result: response.data ?? "restored" } });
+        } catch (error) {
+          sendResponse({ ok: false, errors: [error instanceof Error ? error.message : "Failed to restore blocked account"] });
+        }
+        return;
+      }
+
+      if (message.type === "CLASSIFY_X_ACCOUNT_RISK") {
+        const payload = message.payload as {
+          handle?: string;
+          displayName?: string;
+          snippet?: string;
+          localReason?: string;
+        } | undefined;
+        const handle = typeof payload?.handle === "string" ? payload.handle.trim().replace(/^@/, "").toLowerCase() : "";
+        const snippet = typeof payload?.snippet === "string" ? payload.snippet.trim().slice(0, 120) : "";
+        const displayName = typeof payload?.displayName === "string" ? payload.displayName.trim().slice(0, 80) : "";
+        const localReason = typeof payload?.localReason === "string" ? payload.localReason.trim().slice(0, 24) : "";
+
+        if (!handle) {
+          sendResponse({ ok: false, errors: ["handle is required"] });
+          return;
+        }
+
+        try {
+          const config = await repo.getConfig();
+          if (!config.baseUrl || !config.apiKey || !config.model) {
+            sendResponse({
+              ok: true,
+              data: {
+                decision: "unknown",
+                category: "unknown",
+                confidence: 0,
+                reason: "config_unavailable"
+              } satisfies XAccountRiskDecision
+            });
+            return;
+          }
+
+          const classificationConfig: LLMConfig = {
+            ...config,
+            maxTokens: Math.min(config.maxTokens, 96),
+            agentMaxTokens: Math.min(config.agentMaxTokens, 96)
+          };
+          const raw = await invokeLLM({
+            config: classificationConfig,
+            messages: [{
+              role: "user",
+              content: buildXAccountRiskPrompt({ handle, displayName, snippet, localReason })
+            }],
+            bodyExtras: getChatThinkingRequestBodyExtras(classificationConfig, false)
+          });
+          const decision = parseXAccountRiskDecision(raw);
+          sendResponse({ ok: true, data: decision });
+        } catch (error) {
+          console.warn("[NeonAgent] X account model review failed", error);
+          sendResponse({
+            ok: true,
+            data: {
+              decision: "unknown",
+              category: "unknown",
+              confidence: 0,
+              reason: "llm_error"
+            } satisfies XAccountRiskDecision
+          });
+        }
         return;
       }
 

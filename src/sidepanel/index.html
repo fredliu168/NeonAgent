@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>NeonAgent v0.1.17</title>
+    <title>NeonAgent v0.1.18</title>
     <style>
       /* =========== Reset & Base =========== */
       *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -1961,6 +1961,7 @@
                 <option value="memories">记忆</option>
                 <option value="skills">技能</option>
                 <option value="tasks">定时</option>
+                <option value="xblocks">拉黑</option>
               </select>
               <div id="agentModelMenuRoot" class="chat-model-stack">
                 <button id="agentModelMenuButton" type="button" class="model-menu-trigger" aria-haspopup="menu" aria-expanded="false">Model</button>
@@ -2011,6 +2012,13 @@
             <button id="refreshTasks" class="btn-secondary" style="padding:2px 8px;font-size:11px;">刷新</button>
           </div>
           <div id="tasksList" class="tasks-list"></div>
+        </div>
+        <div id="xBlockedAccountsPanel" class="skills-panel" hidden>
+          <div class="skills-header">
+            <span class="skills-title">X 拉黑记录</span>
+            <button id="refreshXBlockedAccounts" class="btn-secondary" style="padding:2px 8px;font-size:11px;">刷新</button>
+          </div>
+          <div id="xBlockedAccountsList" class="skills-list"></div>
         </div>
       </div>
     </main>
@@ -2128,6 +2136,11 @@
             </div>
             <div class="setting-hint">勾选后自动判断当前页面是否包含题目；检测到题目时调用一键解题，并在 ask 框显示过程与答案</div>
 
+            <div class="switch-row">
+              <label><input id="autoBlockXSpamAccounts" type="checkbox" /> x.com 自动拉黑营销/色情号</label>
+            </div>
+            <div class="setting-hint">仅在 x.com / twitter.com 生效；命中高风险规则后会直接执行拉黑，请谨慎开启。</div>
+
           </div>
         </section>
 
@@ -2205,7 +2218,7 @@
           </section>
 
           <section class="card" style="text-align:center;color:#94a3b8;font-size:11px;">
-            <p>NeonAgent v0.1.17</p>
+            <p>NeonAgent v0.1.18</p>
             <p style="margin-top:4px;">本工具仅供学习研究使用，严禁用于违反考试规则或非法用途。</p>
           </section>
         </div>

@@ -36,6 +36,7 @@ export interface LLMConfig {
   blockFullscreenRequests: boolean;
   blockDevtoolsDetection: boolean;
   autoSolveCurrentPage: boolean;
+  autoBlockXSpamAccounts: boolean;
   enableFloatingBall: boolean;
   /** Built-in local command WebSocket client for Codex/OpenClaw control. */
   localCommandEnabled: boolean;
@@ -57,6 +58,7 @@ export interface FeatureFlags {
   aggressiveVisibilityBypass: boolean;
   blockFullscreenRequests: boolean;
   blockDevtoolsDetection: boolean;
+  autoBlockXSpamAccounts: boolean;
   enableFloatingBall: boolean;
 }
 
@@ -96,6 +98,17 @@ export interface ExamAnswerMatch {
   questionId: string;
   answerLabel: string;
   answerLabels?: string[];
+}
+
+export interface XBlockedAccountRecord {
+  id: string;
+  handle: string;
+  displayName: string;
+  reason: "marketing" | "adult";
+  blockedAt: number;
+  sourceUrl: string;
+  postSnippet: string;
+  restoredAt?: number;
 }
 
 export interface LLMRequestPayload {

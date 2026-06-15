@@ -64,6 +64,7 @@ const aggressiveVisibilityBypassInput = byId<HTMLInputElement>("aggressiveVisibi
 const blockFullscreenRequestsInput = byId<HTMLInputElement>("blockFullscreenRequests");
 const blockDevtoolsDetectionInput = byId<HTMLInputElement>("blockDevtoolsDetection");
 const autoSolveCurrentPageInput = byId<HTMLInputElement>("autoSolveCurrentPage");
+const autoBlockXSpamAccountsInput = byId<HTMLInputElement>("autoBlockXSpamAccounts");
 const localCommandEnabledInput = byId<HTMLInputElement>("localCommandEnabled");
 const localCommandWsUrlInput = byId<HTMLInputElement>("localCommandWsUrl");
 const localCommandTokenInput = byId<HTMLInputElement>("localCommandToken");
@@ -119,6 +120,8 @@ const memoriesListEl = byId<HTMLDivElement>("memoriesList");
 const memoryImportFileEl = byId<HTMLInputElement>("memoryImportFile");
 const tasksPanelEl = byId<HTMLDivElement>("tasksPanel");
 const tasksListEl = byId<HTMLDivElement>("tasksList");
+const xBlockedAccountsPanelEl = byId<HTMLDivElement>("xBlockedAccountsPanel");
+const xBlockedAccountsListEl = byId<HTMLDivElement>("xBlockedAccountsList");
 
 let chatState = createInitialChatState();
 let activeStreamRequestId: string | null = null;
@@ -1092,7 +1095,7 @@ let activeAgentChatStreamRequestId: string | null = null;
 let agentPending = false;
 let agentSessions: AgentSession[] = [];
 let activeAgentSessionId: string | null = null;
-let activeAgentPanel: "memories" | "skills" | "tasks" | null = null;
+let activeAgentPanel: "memories" | "skills" | "tasks" | "xblocks" | null = null;
 let agentComposerMode: AgentComposerMode = "agent";
 let agentIterInfoText = "";
 let agentToolTimer: number | null = null;
@@ -2223,6 +2226,7 @@ function toConfig(): LLMConfig {
     blockFullscreenRequests: blockFullscreenRequestsInput.checked,
     blockDevtoolsDetection: blockDevtoolsDetectionInput.checked,
     autoSolveCurrentPage: autoSolveCurrentPageInput.checked,
+    autoBlockXSpamAccounts: autoBlockXSpamAccountsInput.checked,
     enableFloatingBall: DEFAULT_CONFIG.enableFloatingBall,
     localCommandEnabled: localCommandEnabledInput.checked,
     localCommandWsUrl: localCommandWsUrlInput.value.trim() || DEFAULT_CONFIG.localCommandWsUrl,
@@ -2364,6 +2368,7 @@ function toFeatureFlags(config: LLMConfig) {
     aggressiveVisibilityBypass: config.aggressiveVisibilityBypass,
     blockFullscreenRequests: config.blockFullscreenRequests,
     blockDevtoolsDetection: config.blockDevtoolsDetection,
+    autoBlockXSpamAccounts: config.autoBlockXSpamAccounts,
     enableFloatingBall: config.enableFloatingBall
   };
 }
@@ -2395,6 +2400,7 @@ async function loadConfig(): Promise<void> {
   blockFullscreenRequestsInput.checked = !!config.blockFullscreenRequests;
   blockDevtoolsDetectionInput.checked = !!config.blockDevtoolsDetection;
   autoSolveCurrentPageInput.checked = !!config.autoSolveCurrentPage;
+  autoBlockXSpamAccountsInput.checked = !!config.autoBlockXSpamAccounts;
   localCommandEnabledInput.checked = !!config.localCommandEnabled;
   localCommandWsUrlInput.value = config.localCommandWsUrl ?? DEFAULT_CONFIG.localCommandWsUrl;
   localCommandTokenInput.value = config.localCommandToken ?? DEFAULT_CONFIG.localCommandToken;
@@ -2874,6 +2880,7 @@ configImportFileEl.addEventListener("change", () => {
       blockFullscreenRequestsInput.checked = !!config.blockFullscreenRequests;
       blockDevtoolsDetectionInput.checked = !!config.blockDevtoolsDetection;
       autoSolveCurrentPageInput.checked = !!config.autoSolveCurrentPage;
+      autoBlockXSpamAccountsInput.checked = !!config.autoBlockXSpamAccounts;
       localCommandEnabledInput.checked = !!config.localCommandEnabled;
       localCommandWsUrlInput.value = config.localCommandWsUrl ?? DEFAULT_CONFIG.localCommandWsUrl;
       localCommandTokenInput.value = config.localCommandToken ?? DEFAULT_CONFIG.localCommandToken;
@@ -3450,11 +3457,12 @@ function setAgentIterationInfo(text: string): void {
   agentIterInfoEl.textContent = text;
 }
 
-function showAgentPanel(panel: "memories" | "skills" | "tasks" | null): void {
+function showAgentPanel(panel: "memories" | "skills" | "tasks" | "xblocks" | null): void {
   activeAgentPanel = panel;
   memoriesPanelEl.hidden = panel !== "memories";
   skillsPanelEl.hidden = panel !== "skills";
   tasksPanelEl.hidden = panel !== "tasks";
+  xBlockedAccountsPanelEl.hidden = panel !== "xblocks";
   agentPanelSelect.value = panel ?? "";
 }
 
@@ -4728,6 +4736,17 @@ interface TaskSummary {
   runCount: number;
 }
 
+interface XBlockedAccountSummary {
+  id: string;
+  handle: string;
+  displayName: string;
+  reason: "marketing" | "adult";
+  blockedAt: number;
+  sourceUrl: string;
+  postSnippet: string;
+  restoredAt?: number;
+}
+
 async function loadTasksList(): Promise<void> {
   try {
     const response = await chrome.runtime.sendMessage({ type: "LIST_SCHEDULED_TASKS" });
@@ -4790,6 +4809,82 @@ function renderTasksList(tasks: TaskSummary[]): void {
     item.appendChild(scheduleEl);
     item.appendChild(toggleBtn);
     tasksListEl.appendChild(item);
+  }
+}
+
+function formatPanelTimestamp(timestamp?: number): string {
+  if (typeof timestamp !== "number" || !Number.isFinite(timestamp)) {
+    return "";
+  }
+  const date = new Date(timestamp);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")} ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+}
+
+async function loadXBlockedAccountsList(): Promise<void> {
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "LIST_X_BLOCKED_ACCOUNTS" });
+    if (!response?.ok) {
+      xBlockedAccountsListEl.innerHTML = '<div style="padding:8px;color:#991b1b;font-size:11px;">加载拉黑记录失败</div>';
+      return;
+    }
+    renderXBlockedAccountsList((response.data ?? []) as XBlockedAccountSummary[]);
+  } catch {
+    xBlockedAccountsListEl.innerHTML = '<div style="padding:8px;color:#991b1b;font-size:11px;">加载拉黑记录失败</div>';
+  }
+}
+
+function renderXBlockedAccountsList(records: XBlockedAccountSummary[]): void {
+  xBlockedAccountsListEl.innerHTML = "";
+  if (records.length === 0) {
+    xBlockedAccountsListEl.innerHTML = '<div style="padding:8px;color:#94a3b8;font-size:11px;text-align:center;">暂无拉黑记录</div>';
+    return;
+  }
+
+  for (const record of records) {
+    const item = document.createElement("div");
+    item.className = "skill-item";
+
+    const nameEl = document.createElement("span");
+    nameEl.className = "skill-name";
+    nameEl.textContent = `${record.displayName || record.handle} (@${record.handle})`;
+    nameEl.title = record.postSnippet || record.sourceUrl || record.handle;
+
+    const metaEl = document.createElement("span");
+    metaEl.className = "skill-meta";
+    metaEl.textContent = `${record.reason === "adult" ? "色情" : "营销"} · ${formatPanelTimestamp(record.blockedAt)}${record.restoredAt ? " · 已恢复" : ""}`;
+
+    const restoreBtn = document.createElement("button");
+    restoreBtn.className = "skill-run-btn";
+    restoreBtn.textContent = record.restoredAt ? "已恢复" : "恢复";
+    restoreBtn.disabled = !!record.restoredAt;
+    restoreBtn.addEventListener("click", () => {
+      void restoreXBlockedAccount(record.handle);
+    });
+
+    item.appendChild(nameEl);
+    item.appendChild(metaEl);
+    item.appendChild(restoreBtn);
+    xBlockedAccountsListEl.appendChild(item);
+  }
+}
+
+async function restoreXBlockedAccount(handle: string): Promise<void> {
+  if (!confirm(`确定恢复 @${handle} 的拉黑状态？会在当前活动标签页自动执行取消拉黑。`)) {
+    return;
+  }
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "RESTORE_X_BLOCKED_ACCOUNT",
+      payload: { handle }
+    });
+    if (!response?.ok) {
+      alert(`恢复失败: ${response?.errors?.[0] ?? "未知错误"}`);
+      return;
+    }
+    await loadXBlockedAccountsList();
+  } catch {
+    alert("恢复失败");
   }
 }
 
@@ -4904,7 +4999,7 @@ localCommandEnabledInput.addEventListener("change", (event) => {
   void handleFeatureSwitchChange(event.currentTarget as HTMLElement, { refreshLocalCommandStatus: true });
 });
 
-[unlockContextMenuInput, blockVisibilityDetectionInput, aggressiveVisibilityBypassInput, blockFullscreenRequestsInput, blockDevtoolsDetectionInput].forEach((input) => {
+[unlockContextMenuInput, blockVisibilityDetectionInput, aggressiveVisibilityBypassInput, blockFullscreenRequestsInput, blockDevtoolsDetectionInput, autoBlockXSpamAccountsInput].forEach((input) => {
   input.addEventListener("change", (event) => {
     void handleFeatureSwitchChange(event.currentTarget as HTMLElement);
   });
@@ -5081,13 +5176,14 @@ byId<HTMLButtonElement>("clearAgentSessions").addEventListener("click", () => {
 });
 
 agentPanelSelect.addEventListener("change", () => {
-  const next = agentPanelSelect.value === "memories" || agentPanelSelect.value === "skills" || agentPanelSelect.value === "tasks"
+  const next = agentPanelSelect.value === "memories" || agentPanelSelect.value === "skills" || agentPanelSelect.value === "tasks" || agentPanelSelect.value === "xblocks"
     ? agentPanelSelect.value
     : null;
   showAgentPanel(next);
   if (next === "memories") void loadMemoriesList();
   if (next === "skills") void loadSkillsList();
   if (next === "tasks") void loadTasksList();
+  if (next === "xblocks") void loadXBlockedAccountsList();
 });
 
 byId<HTMLButtonElement>("refreshMemories").addEventListener("click", () => {
@@ -5120,6 +5216,10 @@ byId<HTMLButtonElement>("exportSkills").addEventListener("click", () => {
 
 byId<HTMLButtonElement>("refreshTasks").addEventListener("click", () => {
   void loadTasksList();
+});
+
+byId<HTMLButtonElement>("refreshXBlockedAccounts").addEventListener("click", () => {
+  void loadXBlockedAccountsList();
 });
 
 agentInput.addEventListener("keydown", (e) => {
