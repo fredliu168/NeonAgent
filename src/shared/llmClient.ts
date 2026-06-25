@@ -4,9 +4,31 @@ import { resolveMaxOutputTokens } from "./tokenBudget.js";
 interface RequestChatCompletionInput {
   config: LLMConfig;
   messages: ChatMessage[];
+  referenceContext?: string;
   pageContext?: string;
   signal?: AbortSignal;
   bodyExtras?: Record<string, unknown>;
+}
+
+interface VisionContentPartText {
+  type: "text";
+  text: string;
+}
+
+interface VisionContentPartImage {
+  type: "image_url";
+  image_url: {
+    url: string;
+  };
+}
+
+interface RequestVisionChatCompletionInput {
+  config: LLMConfig;
+  prompt: string;
+  imageDataUrl: string;
+  systemPrompt?: string;
+  bodyExtras?: Record<string, unknown>;
+  signal?: AbortSignal;
 }
 
 type TokenParamName = "max_tokens" | "max_completion_tokens";
@@ -51,6 +73,25 @@ async function postChatCompletion(
     },
     signal: input.signal,
     body: buildRequestBody(input, stream, tokenParamName)
+  });
+}
+
+async function postChatCompletionBody(
+  input: {
+    config: LLMConfig;
+    signal?: AbortSignal;
+  },
+  body: Record<string, unknown>,
+  fetcher: typeof fetch
+): Promise<Response> {
+  return fetcher(input.config.baseUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${input.config.apiKey}`
+    },
+    signal: input.signal,
+    body: JSON.stringify(body)
   });
 }
 
@@ -169,6 +210,16 @@ function buildMessages(input: RequestChatCompletionInput): ChatMessage[] {
     merged.push({ role: "system", content: input.config.systemPrompt.trim() });
   }
 
+  if (input.referenceContext?.trim()) {
+    merged.push({
+      role: "system",
+      content: [
+        "Reference workbook context (prioritize this when the user's question is related):",
+        input.referenceContext.trim()
+      ].join("\n")
+    });
+  }
+
   if (input.pageContext?.trim()) {
     merged.push({ role: "system", content: `Page context:\n${input.pageContext.trim()}` });
   }
@@ -184,14 +235,110 @@ export async function requestChatCompletion(
   const response = await requestWithTokenFallback(input, false, fetcher);
 
   const data = (await response.json()) as {
-    choices?: Array<{ message?: { content?: string } }>;
+    choices?: Array<{ message?: { content?: string | Array<{ type?: string; text?: string }> } }>;
   };
 
-  const content = data.choices?.[0]?.message?.content?.trim();
+  const rawContent = data.choices?.[0]?.message?.content;
+  const content = typeof rawContent === "string"
+    ? rawContent.trim()
+    : Array.isArray(rawContent)
+      ? rawContent.map((block) => (block?.type === "text" && typeof block.text === "string" ? block.text : "")).join("").trim()
+      : "";
   if (!content) {
     throw new Error("LLM response missing content");
   }
 
+  return content;
+}
+
+export async function requestVisionChatCompletion(
+  input: RequestVisionChatCompletionInput,
+  fetcher: typeof fetch = fetch
+): Promise<string> {
+  const userContent: Array<VisionContentPartText | VisionContentPartImage> = [
+    { type: "text", text: input.prompt.trim() },
+    {
+      type: "image_url",
+      image_url: {
+        url: input.imageDataUrl
+      }
+    }
+  ];
+  const messages: Array<{ role: "system" | "user"; content: string | Array<VisionContentPartText | VisionContentPartImage> }> = [];
+
+  if (input.systemPrompt?.trim()) {
+    messages.push({ role: "system", content: input.systemPrompt.trim() });
+  }
+  messages.push({ role: "user", content: userContent });
+
+  const maxOutputTokens = resolveMaxOutputTokens({
+    configuredMaxTokens: Math.min(input.config.agentMaxTokens, 2048),
+    model: input.config.model,
+    payloadForInputEstimate: messages,
+    minimumOutputTokens: 256,
+    reserveTokens: 1024
+  });
+
+  const bodyBase = {
+    ...(input.bodyExtras ?? {}),
+    model: input.config.model,
+    stream: false,
+    temperature: input.config.temperature,
+    messages
+  };
+
+  const tryRequest = async (tokenParamName: TokenParamName): Promise<Response> => {
+    return postChatCompletionBody(
+      input,
+      {
+        ...bodyBase,
+        [tokenParamName]: maxOutputTokens
+      },
+      fetcher
+    );
+  };
+
+  const primaryParam: TokenParamName = "max_tokens";
+  const primaryResponse = await tryRequest(primaryParam);
+  if (!primaryResponse.ok) {
+    const primaryDetails = typeof primaryResponse.text === "function" ? await primaryResponse.text() : "";
+    if (!shouldRetryWithAlternateTokenParam(primaryDetails, primaryParam)) {
+      throw new Error(`LLM vision request failed: ${primaryResponse.status} ${primaryDetails}`.trim());
+    }
+
+    const fallbackResponse = await tryRequest("max_completion_tokens");
+    if (!fallbackResponse.ok) {
+      const fallbackDetails = typeof fallbackResponse.text === "function" ? await fallbackResponse.text() : "";
+      throw new Error(`LLM vision request failed: ${fallbackResponse.status} ${fallbackDetails}`.trim());
+    }
+
+    const fallbackData = (await fallbackResponse.json()) as {
+      choices?: Array<{ message?: { content?: string | Array<{ type?: string; text?: string }> } }>;
+    };
+    const fallbackRawContent = fallbackData.choices?.[0]?.message?.content;
+    const fallbackContent = typeof fallbackRawContent === "string"
+      ? fallbackRawContent.trim()
+      : Array.isArray(fallbackRawContent)
+        ? fallbackRawContent.map((block) => (block?.type === "text" && typeof block.text === "string" ? block.text : "")).join("").trim()
+        : "";
+    if (!fallbackContent) {
+      throw new Error("LLM vision response missing content");
+    }
+    return fallbackContent;
+  }
+
+  const data = (await primaryResponse.json()) as {
+    choices?: Array<{ message?: { content?: string | Array<{ type?: string; text?: string }> } }>;
+  };
+  const rawContent = data.choices?.[0]?.message?.content;
+  const content = typeof rawContent === "string"
+    ? rawContent.trim()
+    : Array.isArray(rawContent)
+      ? rawContent.map((block) => (block?.type === "text" && typeof block.text === "string" ? block.text : "")).join("").trim()
+      : "";
+  if (!content) {
+    throw new Error("LLM vision response missing content");
+  }
   return content;
 }
 

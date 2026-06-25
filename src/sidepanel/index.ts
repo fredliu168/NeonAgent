@@ -20,6 +20,10 @@ import {
   reduceChatState,
   type ChatStateAction
 } from "./chatState.js";
+import {
+  buildScopedExcelReferenceContext,
+  resolveReferenceConversationHistory
+} from "./excelQuestionLookup.js";
 import { createLoadPageContextAction } from "./contextActions.js";
 import {
   TabInjectionDiagnosticError,
@@ -28,6 +32,19 @@ import {
 } from "./tabMessaging.js";
 import type { ApiProvider } from "../shared/types.js";
 import { getInputTokenBudget, trimArrayToEstimatedTokenBudget } from "../shared/tokenBudget.js";
+
+declare const XLSX: {
+  read(data: ArrayBuffer, options: { type: "array" }): {
+    SheetNames: string[];
+    Sheets: Record<string, unknown>;
+  };
+  utils: {
+    sheet_to_json(
+      sheet: unknown,
+      options: { header: 1; raw: false; defval: string; blankrows: false }
+    ): unknown[][];
+  };
+};
 
 function byId<T extends HTMLElement>(id: string): T {
   const el = document.getElementById(id);
@@ -83,6 +100,12 @@ const injectionNoticeEl = byId<HTMLDivElement>("injectionNotice");
 const contextEl = byId<HTMLPreElement>("context");
 const chatModelInput = byId<HTMLSelectElement>("chatModel");
 const chatInput = byId<HTMLTextAreaElement>("chatInput");
+const excelReferenceFileInput = byId<HTMLInputElement>("excelReferenceFile");
+const chatExcelMenuRootEl = byId<HTMLDivElement>("chatExcelMenuRoot");
+const chatExcelMenuToggleBtn = byId<HTMLButtonElement>("chatExcelMenuToggle");
+const chatExcelMenuEl = byId<HTMLDivElement>("chatExcelMenu");
+const chatExcelUploadBtn = byId<HTMLButtonElement>("chatExcelUpload");
+const chatExcelClearBtn = byId<HTMLButtonElement>("chatExcelClear");
 const chatThinkingToggleBtn = byId<HTMLButtonElement>("chatThinkingToggle");
 const chatContextMeterEl = byId<HTMLDivElement>("chatContextMeter");
 const chatActionBtn = byId<HTMLButtonElement>("chatAction");
@@ -99,10 +122,16 @@ const settingsSubtabPanels = Array.from(document.querySelectorAll<HTMLElement>("
 const agentMessagesEl = byId<HTMLDivElement>("agentMessages");
 const agentScrollToBottomBtn = byId<HTMLButtonElement>("agentScrollToBottom");
 const agentStatusEl = byId<HTMLDivElement>("agentStatus");
+const agentDropComposerRootEl = byId<HTMLDivElement>("agentDropComposerRoot");
 const agentInput = byId<HTMLTextAreaElement>("agentInput");
 const agentComposerRootEl = byId<HTMLDivElement>("agentComposerRoot");
 const agentModeSelect = byId<HTMLSelectElement>("agentModeSelect");
 const agentPanelSelect = byId<HTMLSelectElement>("agentPanelSelect");
+const agentExcelMenuRootEl = byId<HTMLDivElement>("agentExcelMenuRoot");
+const agentExcelMenuToggleBtn = byId<HTMLButtonElement>("agentExcelMenuToggle");
+const agentExcelMenuEl = byId<HTMLDivElement>("agentExcelMenu");
+const agentExcelUploadBtn = byId<HTMLButtonElement>("agentExcelUpload");
+const agentExcelClearBtn = byId<HTMLButtonElement>("agentExcelClear");
 const agentModelInput = byId<HTMLSelectElement>("agentModel");
 const agentModelMenuRootEl = byId<HTMLDivElement>("agentModelMenuRoot");
 const agentModelMenuBtn = byId<HTMLButtonElement>("agentModelMenuButton");
@@ -137,6 +166,7 @@ let apiKeyVisible = false;
 let apiProviders: ApiProvider[] = createDefaultApiProviders();
 let activeApiProviderId = CUSTOM_API_PROVIDER_ID;
 let formApiProviderId = CUSTOM_API_PROVIDER_ID;
+let activeExcelMenu: "chat" | "agent" | null = null;
 interface ApiProviderInlineDraft {
   name: string;
   baseUrl: string;
@@ -151,8 +181,21 @@ let activeApiProviderInlineDraft: ApiProviderInlineDraft | null = null;
 const CONFIGURED_API_PROVIDER_ID_PREFIX = "configured:";
 const DEFAULT_CHAT_CONTEXT_BUDGET = 16000;
 const DEFAULT_AGENT_CONTEXT_BUDGET = 32000;
+const EXCEL_REFERENCE_MAX_SHEETS = 4;
+const EXCEL_REFERENCE_MAX_ROWS_PER_SHEET = 40;
+const EXCEL_REFERENCE_MAX_COLS = 12;
+const EXCEL_REFERENCE_MAX_CHARS = 16000;
+const EXCEL_REFERENCE_LOOKUP_MAX_SHEETS = 12;
+const EXCEL_REFERENCE_LOOKUP_MAX_ROWS_PER_SHEET = 2500;
+const EXCEL_REFERENCE_LOOKUP_MAX_COLS = 20;
+const EXCEL_REFERENCE_LOOKUP_MAX_CHARS = 500000;
 const CHAT_THINKING_STORAGE_KEY = "neonagent.chatThinkingEnabled";
 let chatThinkingEnabled = true;
+let uploadedExcelReferenceText = "";
+let uploadedExcelReferenceLookupText = "";
+let uploadedExcelReferenceName = "";
+let uploadedExcelReferenceMeta = "";
+let temporarySolveStatusTimeoutId: number | null = null;
 
 function sanitizeApiProviderForUi(provider: ApiProvider, fallbackId: string): ApiProvider {
   const sanitizeModel = (value: string): string => value.replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, "");
@@ -1090,11 +1133,13 @@ interface AgentEntry {
 type AgentComposerMode = "chat" | "agent";
 
 let agentEntries: AgentEntry[] = [];
+let agentRawMessages: AgentMessage[] = [];
 let activeAgentRequestId: string | null = null;
 let activeAgentChatStreamRequestId: string | null = null;
 let agentPending = false;
 let agentSessions: AgentSession[] = [];
 let activeAgentSessionId: string | null = null;
+let agentLoadedToolCategories = new Set<string>();
 let activeAgentPanel: "memories" | "skills" | "tasks" | "xblocks" | null = null;
 let agentComposerMode: AgentComposerMode = "agent";
 let agentIterInfoText = "";
@@ -1563,9 +1608,30 @@ function normalizeChatSession(session: ChatSession): ChatSession {
 function normalizeAgentSession(session: AgentSession): AgentSession {
   return {
     ...session,
+    messages: Array.isArray(session.messages) ? session.messages : [],
+    loadedToolCategories: Array.isArray(session.loadedToolCategories) ? session.loadedToolCategories : [],
     entries: (session.entries ?? []).map((entry, index) =>
       normalizeAgentEntry(entry, session.updatedAt + index)
     )
+  };
+}
+
+function cloneAgentMessage(message: AgentMessage): AgentMessage {
+  return {
+    role: message.role,
+    content: message.content,
+    reasoning_content: message.reasoning_content,
+    tool_call_id: message.tool_call_id,
+    tool_calls: Array.isArray(message.tool_calls)
+      ? message.tool_calls.map((toolCall) => ({
+          id: toolCall.id,
+          type: toolCall.type,
+          function: {
+            name: toolCall.function.name,
+            arguments: toolCall.function.arguments
+          }
+        }))
+      : undefined
   };
 }
 
@@ -1967,6 +2033,15 @@ function setExamStatus(text: string): void {
   examStatusEl.textContent = text;
 }
 
+function clearTemporarySolveStatusTimer(): void {
+  if (temporarySolveStatusTimeoutId === null) {
+    return;
+  }
+
+  window.clearTimeout(temporarySolveStatusTimeoutId);
+  temporarySolveStatusTimeoutId = null;
+}
+
 function isComposingEnter(event: KeyboardEvent): boolean {
   return event.isComposing || event.keyCode === 229;
 }
@@ -1995,6 +2070,355 @@ function estimateTokenUsage(text: string): number {
   }
 
   return Math.max(0, Math.round(tokens));
+}
+
+function normalizeExcelCellValue(value: unknown): string {
+  if (value === null || typeof value === "undefined") {
+    return "";
+  }
+
+  return String(value)
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function clipText(value: string, maxLength: number): string {
+  if (value.length <= maxLength) {
+    return value;
+  }
+
+  return `${value.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+function getExcelReferenceContext(): string | undefined {
+  return uploadedExcelReferenceText || undefined;
+}
+
+function getScopedExcelReferenceContext(queryText: string): string | undefined {
+  return buildScopedExcelReferenceContext(
+    uploadedExcelReferenceLookupText || uploadedExcelReferenceText,
+    queryText,
+    uploadedExcelReferenceText || uploadedExcelReferenceLookupText
+  );
+}
+
+function hasExcelReferenceContext(): boolean {
+  return Boolean(uploadedExcelReferenceText || uploadedExcelReferenceLookupText);
+}
+
+function setExcelMenuOpen(menu: "chat" | "agent", open: boolean): void {
+  if (menu === "chat") {
+    chatExcelMenuEl.hidden = !open;
+    chatExcelMenuToggleBtn.setAttribute("aria-expanded", String(open));
+  } else {
+    agentExcelMenuEl.hidden = !open;
+    agentExcelMenuToggleBtn.setAttribute("aria-expanded", String(open));
+  }
+
+  if (open) {
+    const otherMenu = menu === "chat" ? "agent" : "chat";
+    if (activeExcelMenu && activeExcelMenu !== menu) {
+      setExcelMenuOpen(otherMenu, false);
+    }
+    activeExcelMenu = menu;
+  } else if (activeExcelMenu === menu) {
+    activeExcelMenu = null;
+  }
+}
+
+function closeExcelMenus(): void {
+  setExcelMenuOpen("chat", false);
+  setExcelMenuOpen("agent", false);
+}
+
+function renderExcelReferenceState(): void {
+  const hasReference = Boolean(uploadedExcelReferenceText);
+
+  [chatExcelClearBtn, agentExcelClearBtn].forEach((button) => {
+    button.disabled = !hasReference;
+  });
+
+  updateChatContextMeter();
+  updateAgentContextMeter();
+}
+
+function clearExcelReference(): void {
+  uploadedExcelReferenceText = "";
+  uploadedExcelReferenceLookupText = "";
+  uploadedExcelReferenceName = "";
+  uploadedExcelReferenceMeta = "";
+  excelReferenceFileInput.value = "";
+  renderExcelReferenceState();
+  setSolveStatus("已清除 Excel 参考资料。", { durationMs: 5000 });
+}
+
+function appendExcelReferenceLine(
+  lines: string[],
+  line: string,
+  state: { chars: number; truncated: boolean },
+  maxChars = EXCEL_REFERENCE_MAX_CHARS
+): void {
+  if (state.truncated) {
+    return;
+  }
+
+  const normalized = line.trimEnd();
+  if (!normalized) {
+    return;
+  }
+
+  const nextChars = state.chars + normalized.length + 1;
+  if (nextChars > maxChars) {
+    state.truncated = true;
+    return;
+  }
+
+  lines.push(normalized);
+  state.chars = nextChars;
+}
+
+async function parseExcelReferenceFile(file: File): Promise<{
+  contextText: string;
+  lookupText: string;
+  metaText: string;
+}> {
+  const workbook = XLSX.read(await file.arrayBuffer(), { type: "array" });
+  const sheetNames = workbook.SheetNames.slice(0, EXCEL_REFERENCE_LOOKUP_MAX_SHEETS);
+  const contextLines: string[] = [`Excel file: ${file.name}`];
+  const contextBudgetState = { chars: contextLines[0].length, truncated: false };
+  const lookupLines: string[] = [`Excel file: ${file.name}`];
+  const lookupBudgetState = { chars: lookupLines[0].length, truncated: false };
+  let usedSheetCount = 0;
+  let usedRowCount = 0;
+
+  for (const [sheetIndex, sheetName] of sheetNames.entries()) {
+    const sheet = workbook.Sheets[sheetName];
+    if (!sheet) {
+      continue;
+    }
+
+    const rawRows = XLSX.utils.sheet_to_json(sheet, {
+      header: 1,
+      raw: false,
+      defval: "",
+      blankrows: false
+    });
+    const maxCols = Math.max(EXCEL_REFERENCE_MAX_COLS, EXCEL_REFERENCE_LOOKUP_MAX_COLS);
+    const rows = rawRows
+      .map((row) => (Array.isArray(row) ? row.slice(0, maxCols).map(normalizeExcelCellValue) : []))
+      .filter((row) => row.some(Boolean));
+
+    if (rows.length === 0) {
+      continue;
+    }
+
+    usedSheetCount += 1;
+    const includeInContext = sheetIndex < EXCEL_REFERENCE_MAX_SHEETS;
+    if (includeInContext) {
+      appendExcelReferenceLine(contextLines, "", contextBudgetState, EXCEL_REFERENCE_MAX_CHARS);
+      appendExcelReferenceLine(contextLines, `Sheet: ${sheetName}`, contextBudgetState, EXCEL_REFERENCE_MAX_CHARS);
+    }
+    appendExcelReferenceLine(lookupLines, "", lookupBudgetState, EXCEL_REFERENCE_LOOKUP_MAX_CHARS);
+    appendExcelReferenceLine(lookupLines, `Sheet: ${sheetName}`, lookupBudgetState, EXCEL_REFERENCE_LOOKUP_MAX_CHARS);
+
+    const contextHeaders = rows[0]
+      .slice(0, EXCEL_REFERENCE_MAX_COLS)
+      .map((cell, index) => cell || `Column ${index + 1}`);
+    const lookupHeaders = rows[0]
+      .slice(0, EXCEL_REFERENCE_LOOKUP_MAX_COLS)
+      .map((cell, index) => cell || `Column ${index + 1}`);
+    if (includeInContext) {
+      appendExcelReferenceLine(contextLines, `Columns: ${contextHeaders.join(" | ")}`, contextBudgetState, EXCEL_REFERENCE_MAX_CHARS);
+    }
+    appendExcelReferenceLine(lookupLines, `Columns: ${lookupHeaders.join(" | ")}`, lookupBudgetState, EXCEL_REFERENCE_LOOKUP_MAX_CHARS);
+
+    const contextRows = includeInContext
+      ? rows.slice(1, EXCEL_REFERENCE_MAX_ROWS_PER_SHEET + 1)
+      : [];
+    for (const row of contextRows) {
+      const cells = contextHeaders
+        .map((header, index) => {
+          const value = normalizeExcelCellValue(row[index]);
+          return value ? `${header}: ${clipText(value, 120)}` : "";
+        })
+        .filter(Boolean);
+
+      if (cells.length === 0) {
+        continue;
+      }
+
+      usedRowCount += 1;
+      appendExcelReferenceLine(contextLines, `- ${cells.join("; ")}`, contextBudgetState, EXCEL_REFERENCE_MAX_CHARS);
+      if (contextBudgetState.truncated) {
+        break;
+      }
+    }
+
+    const lookupRows = rows.slice(1, EXCEL_REFERENCE_LOOKUP_MAX_ROWS_PER_SHEET + 1);
+    for (const row of lookupRows) {
+      const cells = lookupHeaders
+        .map((header, index) => {
+          const value = normalizeExcelCellValue(row[index]);
+          return value ? `${header}: ${clipText(value, 200)}` : "";
+        })
+        .filter(Boolean);
+
+      if (cells.length === 0) {
+        continue;
+      }
+
+      appendExcelReferenceLine(lookupLines, `- ${cells.join("; ")}`, lookupBudgetState, EXCEL_REFERENCE_LOOKUP_MAX_CHARS);
+      if (lookupBudgetState.truncated) {
+        break;
+      }
+    }
+
+    if (includeInContext && rows.length - 1 > EXCEL_REFERENCE_MAX_ROWS_PER_SHEET) {
+      appendExcelReferenceLine(
+        contextLines,
+        `- Note: remaining ${rows.length - 1 - EXCEL_REFERENCE_MAX_ROWS_PER_SHEET} rows omitted for brevity.`,
+        contextBudgetState,
+        EXCEL_REFERENCE_MAX_CHARS
+      );
+    }
+
+    if (rows.length - 1 > EXCEL_REFERENCE_LOOKUP_MAX_ROWS_PER_SHEET) {
+      appendExcelReferenceLine(
+        lookupLines,
+        `- Note: remaining ${rows.length - 1 - EXCEL_REFERENCE_LOOKUP_MAX_ROWS_PER_SHEET} rows omitted from local lookup index.`,
+        lookupBudgetState,
+        EXCEL_REFERENCE_LOOKUP_MAX_CHARS
+      );
+    }
+
+    if (contextBudgetState.truncated && lookupBudgetState.truncated) {
+      break;
+    }
+  }
+
+  if (usedSheetCount === 0) {
+    throw new Error("Excel 文件中没有可读取的有效数据");
+  }
+
+  if (contextBudgetState.truncated) {
+    contextLines.push("Note: workbook content was truncated to fit the context window.");
+  }
+
+  if (lookupBudgetState.truncated) {
+    lookupLines.push("Note: workbook lookup index was truncated due to local size limits.");
+  }
+
+  return {
+    contextText: contextLines.join("\n"),
+    lookupText: lookupLines.join("\n"),
+    metaText: `${file.name} · ${usedSheetCount} 个工作表 · ${usedRowCount} 行参考数据`
+  };
+}
+
+function isSupportedReferenceFile(file: File): boolean {
+  const lowerName = file.name.trim().toLowerCase();
+  return (
+    lowerName.endsWith(".xlsx") ||
+    lowerName.endsWith(".xls") ||
+    lowerName.endsWith(".csv")
+  );
+}
+
+async function handleExcelReferenceFileSelected(file: File | null): Promise<void> {
+  if (!file) {
+    return;
+  }
+
+  if (!isSupportedReferenceFile(file)) {
+    setSolveStatus("仅支持上传 .xlsx、.xls、.csv 参考文件。");
+    return;
+  }
+
+  try {
+    const parsed = await parseExcelReferenceFile(file);
+    uploadedExcelReferenceText = parsed.contextText;
+    uploadedExcelReferenceLookupText = parsed.lookupText;
+    uploadedExcelReferenceName = file.name;
+    uploadedExcelReferenceMeta = parsed.metaText;
+    renderExcelReferenceState();
+    setSolveStatus(`已载入 Excel：${parsed.metaText}`);
+  } catch (error) {
+    clearExcelReference();
+    setSolveStatus(error instanceof Error ? error.message : "Excel 解析失败");
+  }
+}
+
+function hasDraggedFiles(event: DragEvent): boolean {
+  return Array.from(event.dataTransfer?.types ?? []).includes("Files");
+}
+
+function getFirstSupportedDraggedFile(fileList: FileList | null | undefined): File | null {
+  if (!fileList) {
+    return null;
+  }
+
+  for (let index = 0; index < fileList.length; index += 1) {
+    const file = fileList.item(index);
+    if (file && isSupportedReferenceFile(file)) {
+      return file;
+    }
+  }
+
+  return null;
+}
+
+function bindExcelReferenceDropTarget(element: HTMLElement): void {
+  const setDragover = (active: boolean) => {
+    element.classList.toggle("is-excel-dragover", active);
+  };
+
+  element.addEventListener("dragenter", (event) => {
+    if (!hasDraggedFiles(event)) {
+      return;
+    }
+
+    event.preventDefault();
+    closeExcelMenus();
+    setDragover(true);
+  });
+
+  element.addEventListener("dragover", (event) => {
+    if (!hasDraggedFiles(event)) {
+      return;
+    }
+
+    event.preventDefault();
+    if (event.dataTransfer) {
+      event.dataTransfer.dropEffect = "copy";
+    }
+    setDragover(true);
+  });
+
+  element.addEventListener("dragleave", (event) => {
+    const nextTarget = event.relatedTarget;
+    if (nextTarget instanceof Node && element.contains(nextTarget)) {
+      return;
+    }
+
+    setDragover(false);
+  });
+
+  element.addEventListener("drop", (event) => {
+    if (!hasDraggedFiles(event)) {
+      return;
+    }
+
+    event.preventDefault();
+    setDragover(false);
+
+    const file = getFirstSupportedDraggedFile(event.dataTransfer?.files);
+    if (!file) {
+      setSolveStatus("仅支持拖入 .xlsx、.xls、.csv 参考文件。");
+      return;
+    }
+
+    void handleExcelReferenceFileSelected(file);
+  });
 }
 
 function getContextBudget(fallback: number): number {
@@ -2026,13 +2450,14 @@ function setContextMeter(
 
 function updateChatContextMeter(): void {
   const config = toChatConfig();
+  const referenceContext = getExcelReferenceContext() ?? "";
   const pageContext = contextEl.textContent?.trim() ?? "";
   const messageText = chatState.messages
     .map((message) => `${message.role}\n${message.content}\n${message.reasoning_content ?? ""}`)
     .join("\n");
   const draftText = chatInput.value.trim();
   const systemPrompt = config.systemPrompt?.trim() ?? "";
-  const usedTokens = estimateTokenUsage([systemPrompt, pageContext, messageText, draftText].filter(Boolean).join("\n"));
+  const usedTokens = estimateTokenUsage([systemPrompt, referenceContext, pageContext, messageText, draftText].filter(Boolean).join("\n"));
   setContextMeter(chatContextMeterEl, usedTokens, getContextBudget(DEFAULT_CHAT_CONTEXT_BUDGET));
 }
 
@@ -2057,8 +2482,9 @@ function updateAgentContextMeter(): void {
   const config = toAgentConfig();
   const historyText = buildAgentContextText(agentEntries);
   const draftText = agentInput.value.trim();
+  const referenceContext = getExcelReferenceContext() ?? "";
   const systemPrompt = config.systemPrompt?.trim() ?? "";
-  const usedTokens = estimateTokenUsage([systemPrompt, historyText, draftText].filter(Boolean).join("\n"));
+  const usedTokens = estimateTokenUsage([systemPrompt, referenceContext, historyText, draftText].filter(Boolean).join("\n"));
   setContextMeter(agentContextMeterEl, usedTokens, getContextBudget(DEFAULT_AGENT_CONTEXT_BUDGET));
 }
 
@@ -2949,8 +3375,9 @@ async function sendChatMessageWithContent(
   options?: { includePageContext?: boolean; includeHistory?: boolean; systemPromptOverride?: string }
 ): Promise<boolean> {
   const includePageContext = options?.includePageContext ?? true;
-  const includeHistory = options?.includeHistory ?? true;
+  const includeHistory = resolveReferenceConversationHistory(hasExcelReferenceContext(), options?.includeHistory);
   const baseConfig = toChatConfig();
+  const referenceContext = getScopedExcelReferenceContext(input);
   dispatchChat({ type: "SEND_USER_MESSAGE", content: input });
 
   const outboundMessages = includeHistory
@@ -2975,6 +3402,7 @@ async function sendChatMessageWithContent(
           ? { ...baseConfig, systemPrompt: options.systemPromptOverride }
           : baseConfig,
         messages: outboundMessages,
+        referenceContext,
         pageContext: includePageContext ? (contextEl.textContent || undefined) : undefined,
         thinkingEnabled: chatThinkingEnabled
       })
@@ -3167,6 +3595,7 @@ function buildExamPrompt(questions: ExamQuestion[]): string {
 function buildExamSystemPrompt(): string {
   return [
     "你是考试答题助手。",
+    getExcelReferenceContext() ? "如果提供了 Excel 参考资料，优先依据 Excel 内容作答。" : "",
     "请基于下列题目给出最可能答案，只输出答案，不要解释。",
     "输出格式严格如下：",
     "- 单选题: 1. A",
@@ -3174,20 +3603,40 @@ function buildExamSystemPrompt(): string {
     "- 判断题: 3. A",
     "只输出每题答案行，不要输出其它内容。",
     "如果不确定也要给出最可能选项。"
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 function getActiveMainTabId(): string | null {
   return document.querySelector<HTMLButtonElement>(".tab-btn.active")?.dataset.tab ?? null;
 }
 
-function setSolveStatus(text: string): void {
-  if (getActiveMainTabId() === "tabAgent" && agentComposerMode === "chat") {
+function setSolveStatus(text: string, options?: { durationMs?: number }): void {
+  clearTemporarySolveStatusTimer();
+  const useAgentStatus = getActiveMainTabId() === "tabAgent" && agentComposerMode === "chat";
+
+  if (useAgentStatus) {
     setAgentStatus(text);
+  } else {
+    setExamStatus(text);
+  }
+
+  if (!options?.durationMs) {
     return;
   }
 
-  setExamStatus(text);
+  temporarySolveStatusTimeoutId = window.setTimeout(() => {
+    temporarySolveStatusTimeoutId = null;
+    if (useAgentStatus) {
+      if (agentStatusEl.textContent === text) {
+        setAgentStatus("");
+      }
+      return;
+    }
+
+    if (examStatusEl.textContent === text) {
+      setExamStatus("");
+    }
+  }, options.durationMs);
 }
 
 async function askAndAutoFill(options?: { source?: "manual" | "auto" }): Promise<void> {
@@ -3691,6 +4140,8 @@ function handleAgentEvent(event: AgentProgressEvent): void {
     } else {
       agentEntries.push({ type: "assistant", content: event.payload.delta, timestamp: Date.now() });
     }
+    const assistantMessage = getOrCreateLastAssistantRawMessage();
+    assistantMessage.content = `${assistantMessage.content ?? ""}${event.payload.delta}`;
     renderAgent();
     scheduleAgentPersist();
     return;
@@ -3703,6 +4154,8 @@ function handleAgentEvent(event: AgentProgressEvent): void {
     } else {
       agentEntries.push({ type: "thinking", content: event.payload.delta, timestamp: Date.now(), expanded: true });
     }
+    const assistantMessage = getOrCreateLastAssistantRawMessage();
+    assistantMessage.reasoning_content = `${assistantMessage.reasoning_content ?? ""}${event.payload.delta}`;
     renderAgent();
     scheduleAgentPersist();
     return;
@@ -3733,6 +4186,28 @@ function handleAgentEvent(event: AgentProgressEvent): void {
         }
       });
     }
+    if (event.payload.arguments !== "(streaming...)") {
+      const assistantMessage = getOrCreateLastAssistantRawMessage();
+      const toolCalls = assistantMessage.tool_calls ?? [];
+      const existingToolCall = toolCalls.find((toolCall) => toolCall.id === event.payload.toolCallId);
+      if (existingToolCall) {
+        existingToolCall.function.name = event.payload.name;
+        existingToolCall.function.arguments = event.payload.arguments;
+      } else {
+        toolCalls.push({
+          id: event.payload.toolCallId,
+          type: "function",
+          function: {
+            name: event.payload.name,
+            arguments: event.payload.arguments
+          }
+        });
+      }
+      assistantMessage.tool_calls = toolCalls;
+      if (assistantMessage.content === "") {
+        assistantMessage.content = null;
+      }
+    }
     renderAgent();
     return;
   }
@@ -3748,6 +4223,19 @@ function handleAgentEvent(event: AgentProgressEvent): void {
       entry.toolCall.finishedAt = Date.now();
       entry.toolCall.expanded = false;
     }
+    const existingToolMsg = agentRawMessages.find(
+      (message) => message.role === "tool" && message.tool_call_id === event.payload.toolCallId
+    );
+    if (existingToolMsg) {
+      existingToolMsg.content = event.payload.result;
+    } else {
+      agentRawMessages.push({
+        role: "tool",
+        tool_call_id: event.payload.toolCallId,
+        content: event.payload.result
+      });
+    }
+    syncLoadedToolCategoryFromResult(event.payload.toolCallId, event.payload.isError);
     renderAgent();
     scheduleAgentPersist();
     return;
@@ -3770,7 +4258,9 @@ function handleAgentEvent(event: AgentProgressEvent): void {
   if (event.type === "AGENT_ERROR") {
     agentPending = false;
     activeAgentRequestId = null;
-    agentEntries.push({ type: "assistant", content: `⚠️ ${event.payload.error}`, timestamp: Date.now() });
+    const errorMessage = `⚠️ ${event.payload.error}`;
+    agentEntries.push({ type: "assistant", content: errorMessage, timestamp: Date.now() });
+    agentRawMessages.push({ role: "assistant", content: errorMessage });
     renderAgent();
     void persistActiveAgentSession();
     return;
@@ -3783,6 +4273,8 @@ function handleExternalAgentRunStarted(event: ExternalAgentRunStartedEvent): voi
 
   if (existing) {
     activeAgentSessionId = existing.id;
+    agentRawMessages = (existing.messages ?? []).map(cloneAgentMessage);
+    agentLoadedToolCategories = new Set(existing.loadedToolCategories ?? []);
     agentEntries = (existing.entries ?? []).map((entry, index) =>
       normalizeAgentEntry(entry, existing.updatedAt + index)
     );
@@ -3792,17 +4284,20 @@ function handleExternalAgentRunStarted(event: ExternalAgentRunStartedEvent): voi
       title: event.payload.userMessage.slice(0, 30) || "外部命令",
       createdAt: event.payload.createdAt || now,
       updatedAt: now,
-      messages: [],
+      messages: [{ role: "user", content: event.payload.userMessage }],
       entries: [
         {
           type: "user",
           content: event.payload.userMessage,
           timestamp: event.payload.createdAt || now
         }
-      ]
+      ],
+      loadedToolCategories: []
     };
     agentSessions = [session, ...agentSessions.filter((s) => s.id !== session.id)];
     activeAgentSessionId = session.id;
+    agentRawMessages = session.messages.map(cloneAgentMessage);
+    agentLoadedToolCategories = new Set();
     agentEntries = session.entries.map((entry, index) => normalizeAgentEntry(entry, session.updatedAt + index));
   }
 
@@ -3816,33 +4311,45 @@ function handleExternalAgentRunStarted(event: ExternalAgentRunStartedEvent): voi
   scheduleAgentPersist();
 }
 
-function buildAgentHistoryMessages(entries: AgentEntry[]): AgentMessage[] {
-  const history: AgentMessage[] = [];
-
-  for (const entry of entries) {
-    if (entry.type !== "user" && entry.type !== "assistant") {
-      continue;
-    }
-
-    const content = entry.content.trim();
-    if (!content) {
-      continue;
-    }
-
-    history.push({
-      role: entry.type,
-      content
-    });
+function getOrCreateLastAssistantRawMessage(): AgentMessage {
+  const last = agentRawMessages[agentRawMessages.length - 1];
+  if (last?.role === "assistant" && !last.tool_call_id) {
+    return last;
   }
 
-  return history;
+  const created: AgentMessage = {
+    role: "assistant",
+    content: "",
+    reasoning_content: undefined,
+    tool_calls: undefined
+  };
+  agentRawMessages.push(created);
+  return created;
 }
 
-function buildAgentChatMessages(entries: AgentEntry[]): ChatMessage[] {
-  return buildAgentHistoryMessages(entries)
+function syncLoadedToolCategoryFromResult(toolCallId: string, isError: boolean): void {
+  if (isError) return;
+  const toolEntry = agentEntries.find((entry) => entry.type === "tool" && entry.toolCall?.id === toolCallId);
+  if (!toolEntry?.toolCall || toolEntry.toolCall.name !== "load_tool_category") {
+    return;
+  }
+
+  try {
+    const parsed = JSON.parse(toolEntry.toolCall.arguments || "{}") as { category?: unknown };
+    if (typeof parsed.category === "string" && parsed.category.trim()) {
+      agentLoadedToolCategories.add(parsed.category.trim());
+    }
+  } catch {
+    // ignored
+  }
+}
+
+function buildAgentChatMessages(): ChatMessage[] {
+  return agentRawMessages
     .filter((message): message is AgentMessage & { role: "user" | "assistant" | "system" } => (
       message.role === "user" || message.role === "assistant" || message.role === "system"
     ))
+    .filter((message) => typeof message.content === "string" && message.content.trim().length > 0)
     .map((message) => ({
       role: message.role,
       content: message.content ?? "",
@@ -3853,6 +4360,7 @@ function buildAgentChatMessages(entries: AgentEntry[]): ChatMessage[] {
 function buildTrimmedAgentChatMessages(input: {
   messages: ChatMessage[];
   config: LLMConfig;
+  referenceContext?: string;
   pageContext?: string;
   systemPromptOverride?: string;
 }): { messages: ChatMessage[]; trimmed: boolean } {
@@ -3865,6 +4373,7 @@ function buildTrimmedAgentChatMessages(input: {
     budgetTokens,
     estimatePayload: (messages) => ({
       systemPrompt: input.systemPromptOverride ?? input.config.systemPrompt,
+      referenceContext: input.referenceContext ?? "",
       pageContext: input.pageContext ?? "",
       messages
     })
@@ -3888,8 +4397,11 @@ async function sendAgentMessage(): Promise<void> {
     return;
   }
 
-  const history = buildAgentHistoryMessages(agentEntries);
+  const includeHistory = resolveReferenceConversationHistory(hasExcelReferenceContext());
+  const history = includeHistory ? agentRawMessages.map(cloneAgentMessage) : [];
+  const referenceContext = getScopedExcelReferenceContext(input);
   agentEntries.push({ type: "user", content: input, timestamp: Date.now() });
+  agentRawMessages.push({ role: "user", content: input });
   agentPending = true;
   renderAgent();
   scheduleAgentPersist();
@@ -3906,7 +4418,9 @@ async function sendAgentMessage(): Promise<void> {
         tabId,
         config: toAgentConfig(),
         userMessage: input,
+        referenceContext,
         history,
+        initialLoadedToolCategories: [...agentLoadedToolCategories],
         maxIterations: 100
       }
     });
@@ -3914,21 +4428,25 @@ async function sendAgentMessage(): Promise<void> {
     if (!response?.ok) {
       agentPending = false;
       activeAgentRequestId = null;
+      const errorMessage = `Error: ${Array.isArray(response?.errors) ? response.errors.join(", ") : "Agent request failed"}`;
       agentEntries.push({
         type: "assistant",
-        content: `Error: ${Array.isArray(response?.errors) ? response.errors.join(", ") : "Agent request failed"}`,
+        content: errorMessage,
         timestamp: Date.now()
       });
+      agentRawMessages.push({ role: "assistant", content: errorMessage });
       renderAgent();
     }
   } catch (error) {
     agentPending = false;
     activeAgentRequestId = null;
+    const errorMessage = `Error: ${error instanceof Error ? error.message : "Unknown error"}`;
     agentEntries.push({
       type: "assistant",
-      content: `Error: ${error instanceof Error ? error.message : "Unknown error"}`,
+      content: errorMessage,
       timestamp: Date.now()
     });
+    agentRawMessages.push({ role: "assistant", content: errorMessage });
     renderAgent();
   }
 }
@@ -3947,10 +4465,12 @@ async function sendAgentChatMessageWithContent(
   options?: { includePageContext?: boolean; includeHistory?: boolean; systemPromptOverride?: string }
 ): Promise<boolean> {
   const includePageContext = options?.includePageContext ?? false;
-  const includeHistory = options?.includeHistory ?? true;
+  const includeHistory = resolveReferenceConversationHistory(hasExcelReferenceContext(), options?.includeHistory);
   const baseConfig = toAgentConfig();
+  const referenceContext = getScopedExcelReferenceContext(input);
 
   agentEntries.push({ type: "user", content: input, timestamp: Date.now() });
+  agentRawMessages.push({ role: "user", content: input });
   agentPending = true;
   renderAgent();
   scheduleAgentPersist();
@@ -3967,13 +4487,14 @@ async function sendAgentChatMessageWithContent(
 
   try {
     const rawMessages = includeHistory
-      ? buildAgentChatMessages(agentEntries)
+      ? buildAgentChatMessages()
       : [{ role: "user", content: input } satisfies ChatMessage];
     const trimmedPayload = buildTrimmedAgentChatMessages({
       messages: rawMessages,
       config: options?.systemPromptOverride
         ? { ...baseConfig, systemPrompt: options.systemPromptOverride }
         : baseConfig,
+      referenceContext,
       pageContext: includePageContext ? (contextEl.textContent || undefined) : undefined,
       systemPromptOverride: options?.systemPromptOverride
     });
@@ -3988,6 +4509,7 @@ async function sendAgentChatMessageWithContent(
           ? { ...baseConfig, systemPrompt: options.systemPromptOverride }
           : baseConfig,
         messages: trimmedPayload.messages,
+        referenceContext,
         pageContext: includePageContext ? (contextEl.textContent || undefined) : undefined,
         thinkingEnabled: chatThinkingEnabled
       })
@@ -3997,7 +4519,9 @@ async function sendAgentChatMessageWithContent(
       const message = Array.isArray(response?.errors)
         ? response.errors.join(", ")
         : "LLM stream request failed";
-      agentEntries.push({ type: "assistant", content: `Error: ${message}`, timestamp: Date.now() });
+      const errorMessage = `Error: ${message}`;
+      agentEntries.push({ type: "assistant", content: errorMessage, timestamp: Date.now() });
+      agentRawMessages.push({ role: "assistant", content: errorMessage });
       agentPending = false;
       activeAgentChatStreamRequestId = null;
       agentStreamThinkingEnabledByRequestId.delete(requestId);
@@ -4011,11 +4535,13 @@ async function sendAgentChatMessageWithContent(
       return false;
     }
   } catch (error) {
+    const errorMessage = `Error: ${error instanceof Error ? error.message : "Unknown error"}`;
     agentEntries.push({
       type: "assistant",
-      content: `Error: ${error instanceof Error ? error.message : "Unknown error"}`,
+      content: errorMessage,
       timestamp: Date.now()
     });
+    agentRawMessages.push({ role: "assistant", content: errorMessage });
     agentPending = false;
     activeAgentChatStreamRequestId = null;
     agentStreamThinkingEnabledByRequestId.delete(requestId);
@@ -4104,7 +4630,8 @@ function ensureActiveAgentSession(): AgentSession {
     createdAt: now,
     updatedAt: now,
     messages: [],
-    entries: []
+    entries: [],
+    loadedToolCategories: []
   };
 
   agentSessions = [created, ...agentSessions];
@@ -4121,6 +4648,8 @@ function renderAgentSessions(): void {
     btn.title = new Date(session.updatedAt).toLocaleString();
     btn.addEventListener("click", () => {
       activeAgentSessionId = session.id;
+      agentRawMessages = (session.messages ?? []).map(cloneAgentMessage);
+      agentLoadedToolCategories = new Set(session.loadedToolCategories ?? []);
       agentEntries = (session.entries ?? []).map((entry, index) =>
         normalizeAgentEntry(entry, session.updatedAt + index)
       );
@@ -4171,14 +4700,15 @@ async function persistActiveAgentSession(): Promise<void> {
     ...session,
     title: createAgentSessionTitle(),
     updatedAt: now,
-    messages: buildAgentHistoryMessages(agentEntries),
+    messages: agentRawMessages.map(cloneAgentMessage),
     entries: agentEntries.map((e) => ({
       type: e.type,
       content: e.content,
       timestamp: e.timestamp,
       expanded: e.expanded,
       toolCall: e.toolCall ? { ...e.toolCall } : undefined
-    }))
+    })),
+    loadedToolCategories: [...agentLoadedToolCategories].sort()
   };
 
   agentSessions = [updated, ...agentSessions.filter((s) => s.id !== updated.id)].sort(
@@ -4205,11 +4735,15 @@ async function loadAgentSessions(): Promise<void> {
   agentSessions = (response.data as AgentSession[]).map(normalizeAgentSession);
   if (agentSessions.length > 0) {
     activeAgentSessionId = agentSessions[0].id;
+    agentRawMessages = (agentSessions[0].messages ?? []).map(cloneAgentMessage);
+    agentLoadedToolCategories = new Set(agentSessions[0].loadedToolCategories ?? []);
     agentEntries = (agentSessions[0].entries ?? []).map((entry, index) =>
       normalizeAgentEntry(entry, agentSessions[0].updatedAt + index)
     );
   } else {
     activeAgentSessionId = null;
+    agentRawMessages = [];
+    agentLoadedToolCategories = new Set();
     agentEntries = [];
   }
 
@@ -4221,6 +4755,8 @@ async function loadAgentSessions(): Promise<void> {
 function newAgentSession(): void {
   activeAgentSessionId = null;
   agentEntries = [];
+  agentRawMessages = [];
+  agentLoadedToolCategories = new Set();
   activeAgentRequestId = null;
   activeAgentChatStreamRequestId = null;
   agentPending = false;
@@ -4238,11 +4774,15 @@ async function deleteAgentSession(): Promise<void> {
   agentSessions = agentSessions.filter((s) => s.id !== sessionId);
   if (agentSessions.length > 0) {
     activeAgentSessionId = agentSessions[0].id;
+    agentRawMessages = (agentSessions[0].messages ?? []).map(cloneAgentMessage);
+    agentLoadedToolCategories = new Set(agentSessions[0].loadedToolCategories ?? []);
     agentEntries = (agentSessions[0].entries ?? []).map((entry, index) =>
       normalizeAgentEntry(entry, agentSessions[0].updatedAt + index)
     );
   } else {
     activeAgentSessionId = null;
+    agentRawMessages = [];
+    agentLoadedToolCategories = new Set();
     agentEntries = [];
   }
 
@@ -4264,6 +4804,8 @@ async function clearAgentSessions(): Promise<void> {
   agentSessions = [];
   activeAgentSessionId = null;
   agentEntries = [];
+  agentRawMessages = [];
+  agentLoadedToolCategories = new Set();
   activeAgentRequestId = null;
   activeAgentChatStreamRequestId = null;
   agentPending = false;
@@ -5072,6 +5614,51 @@ byId<HTMLButtonElement>("loadContext").addEventListener("click", () => {
   void loadPageContext();
 });
 
+chatExcelMenuToggleBtn.addEventListener("click", (event) => {
+  event.stopPropagation();
+  setExcelMenuOpen("chat", chatExcelMenuEl.hidden);
+});
+
+agentExcelMenuToggleBtn.addEventListener("click", (event) => {
+  event.stopPropagation();
+  setExcelMenuOpen("agent", agentExcelMenuEl.hidden);
+});
+
+chatExcelMenuEl.addEventListener("click", (event) => {
+  event.stopPropagation();
+});
+
+agentExcelMenuEl.addEventListener("click", (event) => {
+  event.stopPropagation();
+});
+
+chatExcelUploadBtn.addEventListener("click", () => {
+  closeExcelMenus();
+  excelReferenceFileInput.click();
+});
+
+agentExcelUploadBtn.addEventListener("click", () => {
+  closeExcelMenus();
+  excelReferenceFileInput.click();
+});
+
+chatExcelClearBtn.addEventListener("click", () => {
+  closeExcelMenus();
+  clearExcelReference();
+});
+
+agentExcelClearBtn.addEventListener("click", () => {
+  closeExcelMenus();
+  clearExcelReference();
+});
+
+excelReferenceFileInput.addEventListener("change", () => {
+  void handleExcelReferenceFileSelected(excelReferenceFileInput.files?.[0] ?? null);
+});
+
+bindExcelReferenceDropTarget(agentComposerRootEl);
+bindExcelReferenceDropTarget(agentDropComposerRootEl);
+
 chatActionBtn.addEventListener("click", () => {
   if (chatState.pending || activeStreamRequestId) {
     void stopChatMessage();
@@ -5100,11 +5687,18 @@ document.addEventListener("click", (event) => {
   if (!agentModelMenuRootEl.contains(event.target as Node)) {
     setAgentModelMenuOpen(false);
   }
+  if (
+    !chatExcelMenuRootEl.contains(event.target as Node) &&
+    !agentExcelMenuRootEl.contains(event.target as Node)
+  ) {
+    closeExcelMenus();
+  }
 });
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
     setAgentModelMenuOpen(false);
+    closeExcelMenus();
   }
 });
 
@@ -5293,6 +5887,7 @@ renderAgentComposerMode();
 void loadConfig();
 updateApiKeyVisibilityButton();
 autoResizeTextarea(chatInput);
+renderExcelReferenceState();
 autoResizeTextarea(agentInput);
 void loadChatSessions();
 void loadAgentSessions();

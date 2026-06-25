@@ -88,11 +88,14 @@ export async function getAllMemories(
  */
 export function formatMemoriesForPrompt(entries: MemoryEntry[]): string {
   if (entries.length === 0) return "";
-  const lines = entries.map((e) => {
+  const sorted = [...entries].sort((a, b) => b.updatedAt - a.updatedAt);
+  const sample = sorted.slice(0, 5);
+  const lines = sample.map((e) => {
     const tagStr = e.tags.length > 0 ? ` [${e.tags.join(", ")}]` : "";
     return `- ${e.content}${tagStr}`;
   });
-  return `# 记忆（已保存的知识与偏好）\n以下是你之前保存的记忆条目，请在回答时参考这些信息：\n${lines.join("\n")}`;
+  const hiddenCount = Math.max(0, entries.length - sample.length);
+  return `# 记忆摘要\n你有 ${entries.length} 条已保存记忆。优先参考下面最相关/最新的样例；若仍需更多细节，请先加载 memory 工具后使用 search_memories 检索。\n${lines.join("\n")}${hiddenCount > 0 ? `\n- 还有 ${hiddenCount} 条未展开` : ""}`;
 }
 
 // ── Memory compression ──

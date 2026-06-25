@@ -9,12 +9,13 @@ import type {
   AgentProgressEvent,
   AgentRunConfig,
   ToolCall,
+  ToolDefinition,
   ToolResult
 } from "./agentTypes.js";
 import { AGENT_TOOL_DEFINITIONS, BACKGROUND_TOOLS, PAGE_TOOLS, CORE_TOOLS, TOOL_CATEGORIES, type ToolCategory } from "./agentTools.js";
 import { buildAgentSystemPrompt } from "./agentSystemPrompt.js";
 import { requestAgentStream } from "./agentLlmClient.js";
-import { getInputTokenBudget, trimArrayToEstimatedTokenBudget } from "./tokenBudget.js";
+import { getInputTokenBudget, trimGroupedArrayToEstimatedTokenBudget } from "./tokenBudget.js";
 import type { MemoryEntry } from "./agentMemory.js";
 import { formatMemoriesForPrompt } from "./agentMemory.js";
 import type { Skill } from "./agentSkills.js";
@@ -25,6 +26,7 @@ import type { ScriptSkill } from "./agentScriptSkill.js";
 import { formatScriptSkillsForPrompt, generateScriptSkillToolDefs, getScriptSkillToolNames } from "./agentScriptSkill.js";
 
 const DEFAULT_MAX_ITERATIONS = 100;
+const TOOL_RESULT_MODEL_OUTPUT_LIMIT = 1200;
 
 export interface AgentLoopDeps {
   /** Emit a progress event to the UI (sidepanel) */
@@ -133,7 +135,15 @@ export async function runAgentLoop(
   const scriptSkillToolNameSet = getScriptSkillToolNames(scriptSkills);
   const allToolDefs = [...AGENT_TOOL_DEFINITIONS, ...scriptSkillToolDefs];
   const currentToolDefs = allToolDefs.filter(t => CORE_TOOLS.has(t.function.name));
-  const loadedCategories = new Set<string>();
+  const loadedCategories = new Set<string>(
+    (config.initialLoadedToolCategories ?? []).filter((category) => typeof category === "string" && category)
+  );
+  hydrateToolDefinitionsForLoadedCategories({
+    currentToolDefs,
+    allToolDefs,
+    loadedCategories,
+    scriptSkillToolNameSet
+  });
 
 
   const promptContext = (pageContext || memoriesPrompt || skillsPrompt || tasksPrompt || scriptSkillsPrompt)
@@ -151,6 +161,16 @@ export async function runAgentLoop(
     role: "system",
     content: buildAgentSystemPrompt(promptContext)
   });
+
+  if (config.referenceContext?.trim()) {
+    messages.push({
+      role: "system",
+      content: [
+        "Reference workbook context (prioritize this when the user's request is related):",
+        config.referenceContext.trim()
+      ].join("\n")
+    });
+  }
 
   // Restore history if any
   if (config.history && config.history.length > 0) {
@@ -187,7 +207,7 @@ export async function runAgentLoop(
     // 1. Call LLM with tools (streaming)
     let streamResult;
     try {
-      const requestMessages = trimArrayToEstimatedTokenBudget({
+      const requestMessages = trimGroupedArrayToEstimatedTokenBudget({
         items: messages,
         headCount: messages[0]?.role === "system" ? 1 : 0,
         budgetTokens: getInputTokenBudget({
@@ -197,7 +217,8 @@ export async function runAgentLoop(
         estimatePayload: (trimmedMessages) => ({
           messages: trimmedMessages,
           tools: currentToolDefs
-        })
+        }),
+        groupTailItems: groupAgentMessagesByTurn
       });
 
       streamResult = await requestAgentStream(
@@ -300,21 +321,12 @@ export async function runAgentLoop(
             result = { toolCallId: tc.id, toolName, output: `Category '${category}' is already loaded.`, isError: false };
           } else {
             loadedCategories.add(category);
-            const toolsToAdd = TOOL_CATEGORIES[category as ToolCategory];
-            for (const t of toolsToAdd) {
-              const def = allToolDefs.find(def => def.function.name === t);
-              if (def && !currentToolDefs.some(d => d.function.name === t)) {
-                currentToolDefs.push(def);
-              }
-            }
-            if (category === "script_skill") {
-              const dynDefs = allToolDefs.filter(d => scriptSkillToolNameSet.has(d.function.name));
-              for (const def of dynDefs) {
-                if (!currentToolDefs.some(d => d.function.name === def.function.name)) {
-                  currentToolDefs.push(def);
-                }
-              }
-            }
+            hydrateToolDefinitionsForLoadedCategories({
+              currentToolDefs,
+              allToolDefs,
+              loadedCategories,
+              scriptSkillToolNameSet
+            });
             result = {
               toolCallId: tc.id,
               toolName,
@@ -367,7 +379,7 @@ export async function runAgentLoop(
       messages.push({
         role: "tool",
         tool_call_id: tc.id,
-        content: result.output
+        content: result.modelOutput ?? summarizeToolOutputForModel(result)
       });
     }
 
@@ -382,6 +394,130 @@ export async function runAgentLoop(
       error: `Agent reached maximum iterations (${maxIter}). Stopping.`
     }
   });
+}
+
+function hydrateToolDefinitionsForLoadedCategories(input: {
+  currentToolDefs: ToolDefinition[];
+  allToolDefs: ToolDefinition[];
+  loadedCategories: Set<string>;
+  scriptSkillToolNameSet: Set<string>;
+}): void {
+  for (const category of input.loadedCategories) {
+    const toolsToAdd = TOOL_CATEGORIES[category as ToolCategory];
+    if (!toolsToAdd) continue;
+    for (const toolName of toolsToAdd) {
+      const def = input.allToolDefs.find((candidate) => candidate.function.name === toolName);
+      if (def && !input.currentToolDefs.some((candidate) => candidate.function.name === toolName)) {
+        input.currentToolDefs.push(def);
+      }
+    }
+    if (category === "script_skill") {
+      for (const def of input.allToolDefs) {
+        if (
+          input.scriptSkillToolNameSet.has(def.function.name) &&
+          !input.currentToolDefs.some((candidate) => candidate.function.name === def.function.name)
+        ) {
+          input.currentToolDefs.push(def);
+        }
+      }
+    }
+  }
+}
+
+function summarizeToolOutputForModel(result: ToolResult): string {
+  const prefix = result.isError ? `[tool:${result.toolName}] error` : `[tool:${result.toolName}] ok`;
+  const raw = typeof result.output === "string" ? result.output.trim() : "";
+  if (!raw) {
+    return `${prefix}: (empty result)`;
+  }
+
+  const compact = raw.replace(/\s+/g, " ").trim();
+  const parsed = tryParseJson(raw);
+  if (parsed !== null) {
+    const jsonSummary = summarizeJsonValue(parsed);
+    return `${prefix}: ${truncateForModel(jsonSummary, TOOL_RESULT_MODEL_OUTPUT_LIMIT)}`;
+  }
+
+  if (compact.length <= TOOL_RESULT_MODEL_OUTPUT_LIMIT) {
+    return `${prefix}: ${compact}`;
+  }
+
+  const head = compact.slice(0, 800);
+  const tail = compact.slice(-250);
+  return `${prefix}: ${head} ... [truncated ${compact.length - 1050} chars] ... ${tail}`;
+}
+
+function tryParseJson(input: string): unknown | null {
+  try {
+    return JSON.parse(input);
+  } catch {
+    return null;
+  }
+}
+
+function summarizeJsonValue(value: unknown): string {
+  if (Array.isArray(value)) {
+    const preview = value.slice(0, 3).map((item) => summarizeJsonValue(item));
+    return `JSON array(length=${value.length}) ${preview.join(" | ")}`;
+  }
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record);
+    const preview = keys.slice(0, 6).map((key) => `${key}=${summarizeJsonPrimitive(record[key])}`);
+    return `JSON object(keys=${keys.length}) ${preview.join(", ")}`;
+  }
+  return summarizeJsonPrimitive(value);
+}
+
+function summarizeJsonPrimitive(value: unknown): string {
+  if (typeof value === "string") {
+    return truncateForModel(value.replace(/\s+/g, " ").trim(), 160);
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  if (value === null) {
+    return "null";
+  }
+  if (Array.isArray(value)) {
+    return `array(${value.length})`;
+  }
+  if (value && typeof value === "object") {
+    return `object(${Object.keys(value as Record<string, unknown>).length})`;
+  }
+  return typeof value;
+}
+
+function truncateForModel(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  return `${text.slice(0, Math.max(0, limit - 24))} ... [truncated ${text.length - limit} chars]`;
+}
+
+function groupAgentMessagesByTurn(messages: AgentMessage[]): AgentMessage[][] {
+  const groups: AgentMessage[][] = [];
+  let currentGroup: AgentMessage[] = [];
+
+  for (const message of messages) {
+    if (message.role === "user") {
+      if (currentGroup.length > 0) {
+        groups.push(currentGroup);
+      }
+      currentGroup = [message];
+      continue;
+    }
+
+    if (currentGroup.length === 0) {
+      currentGroup = [message];
+    } else {
+      currentGroup.push(message);
+    }
+  }
+
+  if (currentGroup.length > 0) {
+    groups.push(currentGroup);
+  }
+
+  return groups;
 }
 
 function safeParseArgs(argsStr: string): Record<string, unknown> {

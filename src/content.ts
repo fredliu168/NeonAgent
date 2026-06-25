@@ -494,6 +494,33 @@ let xAutoBlockSpaUnlisten: (() => void) | null = null;
 let xAutoBlockLastSweepSignature = "";
 let xAutoBlockRunToken = 0;
 const xAutoBlockHandledAccounts = new Set<string>();
+const mouseInteractionState: {
+  active: boolean;
+  button: number;
+  buttons: number;
+  clientX: number;
+  clientY: number;
+  source: HTMLElement | null;
+} = {
+  active: false,
+  button: 0,
+  buttons: 0,
+  clientX: 0,
+  clientY: 0,
+  source: null
+};
+type ConsoleLogRecord = {
+  level: "log" | "info" | "warn" | "error";
+  message: string;
+  timestamp: number;
+};
+const consoleLogBuffer: ConsoleLogRecord[] = [];
+const pageErrorBuffer: Array<{
+  type: "error" | "unhandledrejection";
+  message: string;
+  timestamp: number;
+}> = [];
+let consoleCaptureInstalled = false;
 type XModelRiskDecision = {
   decision: "block" | "skip" | "unknown";
   category: "adult" | "marketing" | "normal" | "unknown";
@@ -2661,9 +2688,83 @@ function getChromeRuntime(): typeof chrome.runtime | null {
   return chrome.runtime;
 }
 
+type SiteActionMemoryRecord = {
+  id: string;
+  host: string;
+  action: "click";
+  query: string;
+  role: string;
+  selector: string;
+  tagName?: string;
+  label?: string;
+  successCount: number;
+  createdAt: number;
+  updatedAt: number;
+};
+
 function isExtensionContextInvalidated(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /Extension context invalidated/i.test(message);
+}
+
+async function getSiteActionMemories(input: {
+  host: string;
+  query: string;
+  role?: string;
+  limit?: number;
+}): Promise<SiteActionMemoryRecord[]> {
+  const runtime = getChromeRuntime();
+  if (!runtime?.sendMessage) {
+    return [];
+  }
+
+  try {
+    const response = await runtime.sendMessage({
+      type: "GET_SITE_ACTION_MEMORIES",
+      payload: {
+        host: input.host,
+        query: input.query,
+        role: input.role,
+        action: "click",
+        limit: input.limit ?? 5
+      }
+    }) as { ok?: boolean; data?: SiteActionMemoryRecord[] };
+
+    return response?.ok && Array.isArray(response.data) ? response.data : [];
+  } catch {
+    return [];
+  }
+}
+
+async function recordSiteActionMemory(input: {
+  host: string;
+  query: string;
+  role?: string;
+  selector: string;
+  tagName?: string;
+  label?: string;
+}): Promise<void> {
+  const runtime = getChromeRuntime();
+  if (!runtime?.sendMessage) {
+    return;
+  }
+
+  try {
+    await runtime.sendMessage({
+      type: "RECORD_SITE_ACTION_MEMORY",
+      payload: {
+        host: input.host,
+        query: input.query,
+        role: input.role,
+        action: "click",
+        selector: input.selector,
+        tagName: input.tagName,
+        label: input.label
+      }
+    });
+  } catch {
+    // ignored
+  }
 }
 
 async function requestTranslationsBatch(texts: string[]): Promise<string[]> {
@@ -3466,6 +3567,484 @@ function agentQuerySelector(args: Record<string, unknown>): string {
   return `Found ${elements.length} element(s):\n${results.join("\n")}`;
 }
 
+type InteractiveRole =
+  | "any"
+  | "button"
+  | "link"
+  | "input"
+  | "menuitem"
+  | "option"
+  | "tab"
+  | "checkbox"
+  | "radio";
+
+type InteractiveCandidate = {
+  element: HTMLElement;
+  selector: string;
+  tagName: string;
+  role: string;
+  text: string;
+  ariaLabel: string;
+  title: string;
+  placeholder: string;
+  dataTestId: string;
+  href: string;
+  visible: boolean;
+  disabled: boolean;
+  score: number;
+  reasons: string[];
+};
+
+const INTERACTIVE_ELEMENT_SELECTOR = [
+  "button",
+  "a[href]",
+  "input:not([type='hidden'])",
+  "textarea",
+  "select",
+  "summary",
+  "[role='button']",
+  "[role='link']",
+  "[role='menuitem']",
+  "[role='option']",
+  "[role='tab']",
+  "[role='checkbox']",
+  "[role='radio']",
+  "[data-testid]",
+  "[aria-label]",
+  "[title]",
+  "[placeholder]"
+].join(", ");
+
+function escapeCssIdentifier(value: string): string {
+  if (typeof CSS !== "undefined" && typeof CSS.escape === "function") {
+    return CSS.escape(value);
+  }
+  return value.replace(/[^a-zA-Z0-9_-]/g, "\\$&");
+}
+
+function escapeCssAttributeValue(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function isElementVisible(element: HTMLElement): boolean {
+  const style = window.getComputedStyle(element);
+  if (
+    style.display === "none" ||
+    style.visibility === "hidden" ||
+    style.visibility === "collapse" ||
+    style.opacity === "0"
+  ) {
+    return false;
+  }
+
+  const rect = element.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+
+function inferInteractiveRole(element: HTMLElement): string {
+  const explicitRole = (element.getAttribute("role") || "").trim().toLowerCase();
+  if (explicitRole) {
+    return explicitRole;
+  }
+
+  const tag = element.tagName.toLowerCase();
+  if (tag === "a") return "link";
+  if (tag === "button") return "button";
+  if (tag === "textarea" || tag === "select") return "input";
+  if (tag === "input") {
+    const inputType = (element.getAttribute("type") || "text").toLowerCase();
+    if (inputType === "checkbox") return "checkbox";
+    if (inputType === "radio") return "radio";
+    return "input";
+  }
+  return tag;
+}
+
+function getInteractiveTextFields(element: HTMLElement): {
+  text: string;
+  ariaLabel: string;
+  title: string;
+  placeholder: string;
+  dataTestId: string;
+  href: string;
+  haystack: string;
+} {
+  const input = element as HTMLInputElement;
+  const text = normalizeText(element.innerText || element.textContent || "");
+  const ariaLabel = normalizeText(element.getAttribute("aria-label") || "");
+  const title = normalizeText(element.getAttribute("title") || "");
+  const placeholder = normalizeText(element.getAttribute("placeholder") || "");
+  const value = normalizeText(typeof input.value === "string" ? input.value : "");
+  const name = normalizeText(element.getAttribute("name") || "");
+  const alt = normalizeText(element.getAttribute("alt") || "");
+  const dataTestId = normalizeText(
+    element.getAttribute("data-testid") ||
+    element.getAttribute("data-test") ||
+    element.getAttribute("data-qa") ||
+    ""
+  );
+  const id = normalizeText(element.id || "");
+  const href = normalizeText(element.getAttribute("href") || "");
+  const ariaDescription = normalizeText(element.getAttribute("aria-description") || "");
+  const labels = [text, ariaLabel, title, placeholder, value, name, alt, dataTestId, id, href, ariaDescription]
+    .filter(Boolean);
+
+  return {
+    text,
+    ariaLabel,
+    title,
+    placeholder,
+    dataTestId,
+    href,
+    haystack: labels.join(" ").toLowerCase()
+  };
+}
+
+function buildInteractiveSelector(element: HTMLElement): string {
+  const tag = element.tagName.toLowerCase();
+  const id = element.id.trim();
+  if (id) {
+    return `${tag}#${escapeCssIdentifier(id)}`;
+  }
+
+  const dataTestId = element.getAttribute("data-testid");
+  if (dataTestId) {
+    return `${tag}[data-testid="${escapeCssAttributeValue(dataTestId)}"]`;
+  }
+
+  const dataTest = element.getAttribute("data-test");
+  if (dataTest) {
+    return `${tag}[data-test="${escapeCssAttributeValue(dataTest)}"]`;
+  }
+
+  const dataQa = element.getAttribute("data-qa");
+  if (dataQa) {
+    return `${tag}[data-qa="${escapeCssAttributeValue(dataQa)}"]`;
+  }
+
+  const ariaLabel = element.getAttribute("aria-label");
+  if (ariaLabel) {
+    return `${tag}[aria-label="${escapeCssAttributeValue(ariaLabel)}"]`;
+  }
+
+  const name = element.getAttribute("name");
+  if (name) {
+    return `${tag}[name="${escapeCssAttributeValue(name)}"]`;
+  }
+
+  const title = element.getAttribute("title");
+  if (title) {
+    return `${tag}[title="${escapeCssAttributeValue(title)}"]`;
+  }
+
+  const type = element.getAttribute("type");
+  const parent = element.parentElement;
+  if (parent) {
+    const siblings = Array.from(parent.children).filter((node) => node.tagName === element.tagName);
+    const nth = siblings.indexOf(element) + 1;
+    const typeSegment = type ? `[type="${escapeCssAttributeValue(type)}"]` : "";
+    return `${tag}${typeSegment}:nth-of-type(${Math.max(1, nth)})`;
+  }
+
+  return tag;
+}
+
+function tryResolveElementBySelector(selector: string): HTMLElement | null {
+  try {
+    return document.querySelector<HTMLElement>(selector);
+  } catch {
+    return null;
+  }
+}
+
+function getInteractiveLabel(candidate: Pick<InteractiveCandidate, "text" | "ariaLabel" | "title" | "placeholder" | "dataTestId">): string {
+  return candidate.text || candidate.ariaLabel || candidate.title || candidate.placeholder || candidate.dataTestId || "";
+}
+
+function roleMatches(elementRole: string, requestedRole: InteractiveRole): boolean {
+  if (requestedRole === "any") {
+    return true;
+  }
+
+  if (requestedRole === "input") {
+    return elementRole === "input" || elementRole === "textbox" || elementRole === "combobox";
+  }
+
+  return elementRole === requestedRole;
+}
+
+function scoreInteractiveCandidate(
+  fields: ReturnType<typeof getInteractiveTextFields>,
+  query: string,
+  requestedRole: InteractiveRole,
+  elementRole: string,
+  visible: boolean,
+  disabled: boolean,
+  exact: boolean
+): { score: number; reasons: string[] } {
+  const normalizedQuery = normalizeText(query).toLowerCase();
+  const tokens = normalizedQuery.split(/\s+/).filter(Boolean);
+  const exactFields = [fields.text, fields.ariaLabel, fields.title, fields.placeholder, fields.dataTestId]
+    .map((value) => value.toLowerCase())
+    .filter(Boolean);
+  const haystack = fields.haystack;
+  const reasons: string[] = [];
+  let score = 0;
+
+  if (exactFields.includes(normalizedQuery)) {
+    score += 120;
+    reasons.push("exact_label");
+  } else if (exact && !exactFields.some((value) => value.includes(normalizedQuery))) {
+    return { score: -1, reasons: ["not_exact"] };
+  }
+
+  if (fields.text && fields.text.toLowerCase().includes(normalizedQuery)) {
+    score += 70;
+    reasons.push("text_match");
+  }
+  if (fields.ariaLabel && fields.ariaLabel.toLowerCase().includes(normalizedQuery)) {
+    score += 65;
+    reasons.push("aria_match");
+  }
+  if (fields.title && fields.title.toLowerCase().includes(normalizedQuery)) {
+    score += 45;
+    reasons.push("title_match");
+  }
+  if (fields.placeholder && fields.placeholder.toLowerCase().includes(normalizedQuery)) {
+    score += 35;
+    reasons.push("placeholder_match");
+  }
+  if (fields.dataTestId && fields.dataTestId.toLowerCase().includes(normalizedQuery)) {
+    score += 30;
+    reasons.push("testid_match");
+  }
+
+  for (const token of tokens) {
+    if (haystack.includes(token)) {
+      score += 12;
+      reasons.push(`token:${token}`);
+    }
+  }
+
+  if (roleMatches(elementRole, requestedRole)) {
+    score += requestedRole === "any" ? 5 : 30;
+    reasons.push(`role:${elementRole}`);
+  }
+
+  if (visible) {
+    score += 20;
+    reasons.push("visible");
+  }
+
+  if (!disabled) {
+    score += 10;
+    reasons.push("enabled");
+  }
+
+  return { score, reasons };
+}
+
+function findInteractiveCandidates(args: Record<string, unknown>): {
+  query: string;
+  role: InteractiveRole;
+  limit: number;
+  matches: InteractiveCandidate[];
+} | { error: string } {
+  const query = typeof args.query === "string" ? args.query.trim() : "";
+  if (!query) {
+    return { error: "Error: query is required" };
+  }
+
+  const role = (
+    args.role === "button" ||
+    args.role === "link" ||
+    args.role === "input" ||
+    args.role === "menuitem" ||
+    args.role === "option" ||
+    args.role === "tab" ||
+    args.role === "checkbox" ||
+    args.role === "radio"
+  ) ? args.role : "any";
+  const limit = typeof args.limit === "number" ? Math.max(1, Math.min(20, Math.round(args.limit))) : 8;
+  const includeHidden = args.includeHidden === true;
+  const exact = args.exact === true;
+
+  const elements = Array.from(document.querySelectorAll<HTMLElement>(INTERACTIVE_ELEMENT_SELECTOR));
+  const deduped = Array.from(new Set(elements));
+  const matches = deduped
+    .map((element) => {
+      const visible = isElementVisible(element);
+      if (!includeHidden && !visible) {
+        return null;
+      }
+
+      const elementRole = inferInteractiveRole(element);
+      if (!roleMatches(elementRole, role)) {
+        return null;
+      }
+
+      const fields = getInteractiveTextFields(element);
+      if (!fields.haystack) {
+        return null;
+      }
+
+      const disabled = element.hasAttribute("disabled") || element.getAttribute("aria-disabled") === "true";
+      const { score, reasons } = scoreInteractiveCandidate(fields, query, role, elementRole, visible, disabled, exact);
+      if (score <= 0) {
+        return null;
+      }
+
+      return {
+        element,
+        selector: buildInteractiveSelector(element),
+        tagName: element.tagName.toLowerCase(),
+        role: elementRole,
+        text: fields.text,
+        ariaLabel: fields.ariaLabel,
+        title: fields.title,
+        placeholder: fields.placeholder,
+        dataTestId: fields.dataTestId,
+        href: fields.href,
+        visible,
+        disabled,
+        score,
+        reasons
+      } satisfies InteractiveCandidate;
+    })
+    .filter((item): item is InteractiveCandidate => !!item)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+
+  return { query, role, limit, matches };
+}
+
+function agentFindInteractiveElements(args: Record<string, unknown>): string {
+  const result = findInteractiveCandidates(args);
+  if ("error" in result) {
+    return result.error;
+  }
+
+  return JSON.stringify({
+    query: result.query,
+    role: result.role,
+    count: result.matches.length,
+    matches: result.matches.map((item, index) => ({
+      index,
+      selector: item.selector,
+      score: item.score,
+      tagName: item.tagName,
+      role: item.role,
+      text: item.text,
+      ariaLabel: item.ariaLabel,
+      title: item.title,
+      placeholder: item.placeholder,
+      dataTestId: item.dataTestId,
+      href: item.href,
+      visible: item.visible,
+      disabled: item.disabled,
+      reasons: item.reasons
+    }))
+  });
+}
+
+async function agentSmartClick(args: Record<string, unknown>): Promise<string> {
+  const query = typeof args.query === "string" ? args.query.trim() : "";
+  if (!query) {
+    return "Error: query is required";
+  }
+
+  const role = (
+    args.role === "button" ||
+    args.role === "link" ||
+    args.role === "input" ||
+    args.role === "menuitem" ||
+    args.role === "option" ||
+    args.role === "tab" ||
+    args.role === "checkbox" ||
+    args.role === "radio"
+  ) ? args.role : "any";
+  const index = typeof args.index === "number" ? Math.max(0, Math.round(args.index)) : 0;
+
+  const siteMatches = await getSiteActionMemories({
+    host: location.hostname,
+    query,
+    role,
+    limit: Math.max(3, index + 1)
+  });
+  const memoryMatch = siteMatches[index];
+  if (memoryMatch?.selector) {
+    const rememberedElement = tryResolveElementBySelector(memoryMatch.selector);
+    if (rememberedElement && (args.includeHidden === true || isElementVisible(rememberedElement))) {
+      const anchor = rememberedElement.closest("a");
+      if (anchor && anchor.getAttribute("target") === "_blank") {
+        anchor.removeAttribute("target");
+      }
+      rememberedElement.click();
+      void recordSiteActionMemory({
+        host: location.hostname,
+        query,
+        role,
+        selector: memoryMatch.selector,
+        tagName: rememberedElement.tagName.toLowerCase(),
+        label: normalizeText(rememberedElement.innerText || rememberedElement.textContent || "")
+      });
+      return JSON.stringify({
+        clicked: true,
+        query,
+        selector: memoryMatch.selector,
+        tagName: rememberedElement.tagName.toLowerCase(),
+        role,
+        text: normalizeText(rememberedElement.innerText || rememberedElement.textContent || ""),
+        score: memoryMatch.successCount,
+        reasons: ["site_memory_hit"]
+      });
+    }
+  }
+
+  const ranked = findInteractiveCandidates({
+    ...args,
+    role,
+    limit: Math.max(3, index + 1)
+  });
+  if ("error" in ranked) {
+    return ranked.error;
+  }
+
+  if (ranked.matches.length === 0) {
+    return `No interactive elements matched query: ${query}`;
+  }
+  if (index >= ranked.matches.length) {
+    return `Index ${index} out of range (found ${ranked.matches.length} ranked matches for query: ${query})`;
+  }
+
+  const target = ranked.matches[index];
+  const anchor = target.element.closest("a");
+  if (anchor && anchor.getAttribute("target") === "_blank") {
+    anchor.removeAttribute("target");
+  }
+
+  target.element.click();
+  void recordSiteActionMemory({
+    host: location.hostname,
+    query,
+    role,
+    selector: target.selector,
+    tagName: target.tagName,
+    label: getInteractiveLabel(target)
+  });
+  return JSON.stringify({
+    clicked: true,
+    query,
+    selector: target.selector,
+    tagName: target.tagName,
+    role: target.role,
+    text: target.text,
+    ariaLabel: target.ariaLabel,
+    score: target.score,
+    reasons: target.reasons
+  });
+}
+
 function agentWriteTranslationToPage(args: Record<string, unknown>): string {
   const selector = typeof args.selector === "string" ? args.selector : "";
   const text = typeof args.text === "string" ? args.text : "";
@@ -3698,6 +4277,122 @@ function resolveCanvasTarget(
   return { canvas, rect: canvas.getBoundingClientRect() };
 }
 
+function resolveElementTarget(
+  selector: string,
+  index: number
+): { element: HTMLElement; rect: DOMRect | ReturnType<HTMLElement["getBoundingClientRect"]> } | { error: string } {
+  const elements = Array.from(document.querySelectorAll<HTMLElement>(selector));
+  if (elements.length === 0) {
+    return { error: `No elements found for selector: ${selector}` };
+  }
+  if (index >= elements.length) {
+    return { error: `Index ${index} out of range (found ${elements.length})` };
+  }
+
+  const element = elements[index];
+  return { element, rect: element.getBoundingClientRect() };
+}
+
+function resolveElementCoordinates(
+  rect: { width: number; height: number },
+  x: number,
+  y: number,
+  coordinateMode: "css" | "ratio"
+): { cssX: number; cssY: number } | { error: string } {
+  const cssX = coordinateMode === "ratio" ? rect.width * x : x;
+  const cssY = coordinateMode === "ratio" ? rect.height * y : y;
+
+  if (cssX < 0 || cssY < 0 || cssX > rect.width || cssY > rect.height) {
+    return {
+      error: `Point (${cssX.toFixed(1)}, ${cssY.toFixed(1)}) is outside element bounds ${rect.width.toFixed(1)}x${rect.height.toFixed(1)}`
+    };
+  }
+
+  return { cssX, cssY };
+}
+
+function resolveViewportCoordinates(
+  x: number,
+  y: number,
+  coordinateMode: "css" | "ratio"
+): { clientX: number; clientY: number } | { error: string } {
+  const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+  const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+  const clientX = coordinateMode === "ratio" ? viewportWidth * x : x;
+  const clientY = coordinateMode === "ratio" ? viewportHeight * y : y;
+
+  if (clientX < 0 || clientY < 0 || clientX > viewportWidth || clientY > viewportHeight) {
+    return {
+      error: `Point (${clientX.toFixed(1)}, ${clientY.toFixed(1)}) is outside viewport bounds ${viewportWidth}x${viewportHeight}`
+    };
+  }
+
+  return { clientX, clientY };
+}
+
+function pushLimitedRecord<T>(list: T[], record: T, max = 200): void {
+  list.push(record);
+  if (list.length > max) {
+    list.splice(0, list.length - max);
+  }
+}
+
+function serializeConsoleArgs(args: unknown[]): string {
+  return args.map((value) => {
+    if (typeof value === "string") {
+      return value;
+    }
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }).join(" ");
+}
+
+function installConsoleCapture(): void {
+  if (consoleCaptureInstalled) {
+    return;
+  }
+  consoleCaptureInstalled = true;
+
+  (["log", "info", "warn", "error"] as const).forEach((level) => {
+    const original = console[level];
+    console[level] = (...args: unknown[]) => {
+      pushLimitedRecord(consoleLogBuffer, {
+        level,
+        message: serializeConsoleArgs(args),
+        timestamp: Date.now()
+      });
+      original.apply(console, args as never[]);
+    };
+  });
+
+  window.addEventListener("error", (event) => {
+    const message = event.error instanceof Error
+      ? event.error.stack || event.error.message
+      : event.message || "Unknown error";
+    pushLimitedRecord(pageErrorBuffer, {
+      type: "error",
+      message,
+      timestamp: Date.now()
+    });
+  }, true);
+
+  window.addEventListener("unhandledrejection", (event) => {
+    const reason = event.reason instanceof Error
+      ? event.reason.stack || event.reason.message
+      : typeof event.reason === "string"
+        ? event.reason
+        : serializeConsoleArgs([event.reason]);
+    pushLimitedRecord(pageErrorBuffer, {
+      type: "unhandledrejection",
+      message: reason,
+      timestamp: Date.now()
+    });
+  });
+}
+
 function resolveCanvasCoordinates(
   canvas: HTMLCanvasElement,
   rect: { width: number; height: number },
@@ -3767,6 +4462,118 @@ function dispatchCanvasMouseSequence(
   }
   canvas.dispatchEvent(new MouseEvent("mouseup", releaseInit));
   canvas.dispatchEvent(new MouseEvent("click", releaseInit));
+}
+
+function dispatchPointerAndMouseEvent(
+  target: EventTarget,
+  type: "move" | "down" | "up",
+  eventInit: MouseEventInit
+): void {
+  const pointerType = type === "move" ? "pointermove" : type === "down" ? "pointerdown" : "pointerup";
+  const mouseType = type === "move" ? "mousemove" : type === "down" ? "mousedown" : "mouseup";
+  if (typeof PointerEvent === "function") {
+    target.dispatchEvent(new PointerEvent(pointerType, eventInit));
+  }
+  target.dispatchEvent(new MouseEvent(mouseType, eventInit));
+}
+
+function dispatchMousePhase(
+  type: "move" | "down" | "up",
+  clientX: number,
+  clientY: number,
+  button: number,
+  buttons: number,
+  preferredTarget?: EventTarget | null
+): EventTarget {
+  const eventInit: MouseEventInit = {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    clientX,
+    clientY,
+    button,
+    buttons,
+    detail: 1
+  };
+  const liveTarget = preferredTarget
+    ?? document.elementFromPoint(clientX, clientY)
+    ?? mouseInteractionState.source
+    ?? document.body
+    ?? document.documentElement;
+
+  dispatchPointerAndMouseEvent(liveTarget, type, eventInit);
+  dispatchPointerAndMouseEvent(document, type, eventInit);
+  return liveTarget;
+}
+
+async function dispatchDragSequence(
+  source: HTMLElement,
+  startClientX: number,
+  startClientY: number,
+  endClientX: number,
+  endClientY: number,
+  button: number,
+  steps: number,
+  durationMs: number
+): Promise<void> {
+  const safeSteps = Math.max(1, Math.floor(steps));
+  const stepDelay = safeSteps > 0 ? Math.max(0, durationMs) / safeSteps : 0;
+  source.focus?.();
+  const buttons = getCanvasButtonMask(button);
+  dispatchMousePhase("move", startClientX, startClientY, button, buttons, source);
+  dispatchMousePhase("down", startClientX, startClientY, button, buttons, source);
+
+  for (let index = 1; index <= safeSteps; index += 1) {
+    if (stepDelay > 0) {
+      await delay(stepDelay);
+    }
+    const progress = index / safeSteps;
+    const clientX = startClientX + ((endClientX - startClientX) * progress);
+    const clientY = startClientY + ((endClientY - startClientY) * progress);
+    dispatchMousePhase("move", clientX, clientY, button, buttons, source);
+  }
+
+  dispatchMousePhase("up", endClientX, endClientY, button, 0, source);
+}
+
+function resolveMouseClientPoint(args: Record<string, unknown>): {
+  target: HTMLElement | null;
+  clientX: number;
+  clientY: number;
+  coordinateMode: "css" | "ratio";
+} | { error: string } {
+  const selector = typeof args.selector === "string" ? args.selector : "";
+  const index = typeof args.index === "number" ? args.index : 0;
+  const coordinateMode = args.coordinateMode === "ratio" ? "ratio" : "css";
+  const x = typeof args.x === "number" ? args.x : NaN;
+  const y = typeof args.y === "number" ? args.y : NaN;
+
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    return { error: "Error: x and y are required" };
+  }
+
+  if (selector) {
+    const target = resolveElementTarget(selector, index);
+    if ("error" in target) return { error: target.error };
+    const point = resolveElementCoordinates(target.rect, x, y, coordinateMode);
+    if ("error" in point) return point;
+    return {
+      target: target.element,
+      clientX: target.rect.left + point.cssX,
+      clientY: target.rect.top + point.cssY,
+      coordinateMode
+    };
+  }
+
+  const viewportPoint = resolveViewportCoordinates(x, y, coordinateMode);
+  if ("error" in viewportPoint) return viewportPoint;
+  const liveTarget = document.elementFromPoint(viewportPoint.clientX, viewportPoint.clientY) as HTMLElement | null;
+  return {
+    target: liveTarget,
+    clientX: viewportPoint.clientX,
+    clientY: viewportPoint.clientY,
+    coordinateMode
+  };
 }
 
 function agentQueryCanvas(args: Record<string, unknown>): string {
@@ -3859,6 +4666,45 @@ function agentClickCanvas(args: Record<string, unknown>): string {
   return `Clicked canvas ${selector}[${index}] at (${point.cssX.toFixed(1)}, ${point.cssY.toFixed(1)}) using ${coordinateMode} coordinates`;
 }
 
+async function agentDragCanvas(args: Record<string, unknown>): Promise<string> {
+  const selector = typeof args.selector === "string" ? args.selector : "canvas";
+  const index = typeof args.index === "number" ? args.index : 0;
+  const startX = typeof args.startX === "number" ? args.startX : NaN;
+  const startY = typeof args.startY === "number" ? args.startY : NaN;
+  const endX = typeof args.endX === "number" ? args.endX : NaN;
+  const endY = typeof args.endY === "number" ? args.endY : NaN;
+  const coordinateMode = args.coordinateMode === "ratio" ? "ratio" : "css";
+  const button = typeof args.button === "number" ? args.button : 0;
+  const steps = typeof args.steps === "number" ? args.steps : 12;
+  const durationMs = typeof args.durationMs === "number" ? args.durationMs : 300;
+
+  if (!Number.isFinite(startX) || !Number.isFinite(startY) || !Number.isFinite(endX) || !Number.isFinite(endY)) {
+    return "Error: startX, startY, endX and endY are required";
+  }
+
+  const target = resolveCanvasTarget(selector, index);
+  if ("error" in target) return target.error;
+
+  const { canvas, rect } = target;
+  const startPoint = resolveCanvasCoordinates(canvas, rect, startX, startY, coordinateMode);
+  if ("error" in startPoint) return startPoint.error;
+  const endPoint = resolveCanvasCoordinates(canvas, rect, endX, endY, coordinateMode);
+  if ("error" in endPoint) return endPoint.error;
+
+  await dispatchDragSequence(
+    canvas,
+    rect.left + startPoint.cssX,
+    rect.top + startPoint.cssY,
+    rect.left + endPoint.cssX,
+    rect.top + endPoint.cssY,
+    button,
+    steps,
+    durationMs
+  );
+
+  return `Dragged canvas ${selector}[${index}] from (${startPoint.cssX.toFixed(1)}, ${startPoint.cssY.toFixed(1)}) to (${endPoint.cssX.toFixed(1)}, ${endPoint.cssY.toFixed(1)}) using ${coordinateMode} coordinates`;
+}
+
 function agentClickCanvasCell(args: Record<string, unknown>): string {
   const selector = typeof args.selector === "string" ? args.selector : "canvas";
   const index = typeof args.index === "number" ? args.index : 0;
@@ -3931,6 +4777,198 @@ function agentClickElement(args: Record<string, unknown>): string {
   return `Clicked <${tag}> ${text ? `"${text}"` : `at index ${index}`}`;
 }
 
+function agentHoverElement(args: Record<string, unknown>): string {
+  const selector = typeof args.selector === "string" ? args.selector : "";
+  const index = typeof args.index === "number" ? args.index : 0;
+  const coordinateMode = args.coordinateMode === "ratio" ? "ratio" : "css";
+  if (!selector) return "Error: selector is required";
+
+  const target = resolveElementTarget(selector, index);
+  if ("error" in target) return target.error;
+  const { element, rect } = target;
+  const x = typeof args.x === "number" ? args.x : (coordinateMode === "ratio" ? 0.5 : rect.width / 2);
+  const y = typeof args.y === "number" ? args.y : (coordinateMode === "ratio" ? 0.5 : rect.height / 2);
+  const point = resolveElementCoordinates(rect, x, y, coordinateMode);
+  if ("error" in point) return point.error;
+
+  const clientX = rect.left + point.cssX;
+  const clientY = rect.top + point.cssY;
+  const eventInit: MouseEventInit = {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    clientX,
+    clientY,
+    button: 0,
+    buttons: 0,
+    detail: 1
+  };
+  if (typeof PointerEvent === "function") {
+    element.dispatchEvent(new PointerEvent("pointermove", eventInit));
+    element.dispatchEvent(new PointerEvent("pointerover", eventInit));
+    element.dispatchEvent(new PointerEvent("pointerenter", eventInit));
+  }
+  element.dispatchEvent(new MouseEvent("mousemove", eventInit));
+  element.dispatchEvent(new MouseEvent("mouseover", eventInit));
+  element.dispatchEvent(new MouseEvent("mouseenter", eventInit));
+  return `Hovered ${selector}[${index}] at (${point.cssX.toFixed(1)}, ${point.cssY.toFixed(1)}) using ${coordinateMode} coordinates`;
+}
+
+function agentGetElementRect(args: Record<string, unknown>): string {
+  const selector = typeof args.selector === "string" ? args.selector : "";
+  const index = typeof args.index === "number" ? args.index : 0;
+  if (!selector) return "Error: selector is required";
+
+  const target = resolveElementTarget(selector, index);
+  if ("error" in target) return target.error;
+  const { element, rect } = target;
+  return JSON.stringify({
+    selector,
+    index,
+    tagName: element.tagName.toLowerCase(),
+    id: element.id || "",
+    className: typeof element.className === "string" ? element.className : "",
+    text: (element.innerText || element.textContent || "").trim().slice(0, 120),
+    rect: {
+      left: Number(rect.left.toFixed(2)),
+      top: Number(rect.top.toFixed(2)),
+      width: Number(rect.width.toFixed(2)),
+      height: Number(rect.height.toFixed(2)),
+      right: Number(rect.right.toFixed(2)),
+      bottom: Number(rect.bottom.toFixed(2))
+    },
+    viewport: {
+      width: window.innerWidth,
+      height: window.innerHeight,
+      devicePixelRatio: window.devicePixelRatio || 1
+    }
+  });
+}
+
+function agentMouseDown(args: Record<string, unknown>): string {
+  const resolved = resolveMouseClientPoint(args);
+  if ("error" in resolved) return resolved.error;
+  const button = typeof args.button === "number" ? args.button : 0;
+  const buttons = getCanvasButtonMask(button);
+  const actualTarget = dispatchMousePhase("move", resolved.clientX, resolved.clientY, button, buttons, resolved.target);
+  dispatchMousePhase("down", resolved.clientX, resolved.clientY, button, buttons, actualTarget);
+  mouseInteractionState.active = true;
+  mouseInteractionState.button = button;
+  mouseInteractionState.buttons = buttons;
+  mouseInteractionState.clientX = resolved.clientX;
+  mouseInteractionState.clientY = resolved.clientY;
+  mouseInteractionState.source = actualTarget instanceof HTMLElement ? actualTarget : resolved.target;
+  return `Mouse down at (${resolved.clientX.toFixed(1)}, ${resolved.clientY.toFixed(1)})`;
+}
+
+function agentMouseMove(args: Record<string, unknown>): string {
+  const button = mouseInteractionState.active
+    ? mouseInteractionState.button
+    : (typeof args.button === "number" ? args.button : 0);
+  const buttons = mouseInteractionState.active
+    ? mouseInteractionState.buttons
+    : (typeof args.buttons === "number" ? args.buttons : 0);
+
+  let clientX = mouseInteractionState.clientX;
+  let clientY = mouseInteractionState.clientY;
+  let preferredTarget: HTMLElement | null = mouseInteractionState.source;
+
+  if (typeof args.x === "number" && typeof args.y === "number") {
+    const resolved = resolveMouseClientPoint(args);
+    if ("error" in resolved) return resolved.error;
+    clientX = resolved.clientX;
+    clientY = resolved.clientY;
+    preferredTarget = resolved.target;
+  } else if (typeof args.deltaX === "number" || typeof args.deltaY === "number") {
+    clientX += typeof args.deltaX === "number" ? args.deltaX : 0;
+    clientY += typeof args.deltaY === "number" ? args.deltaY : 0;
+    preferredTarget = (document.elementFromPoint(clientX, clientY) as HTMLElement | null) ?? preferredTarget;
+  } else {
+    return "Error: provide x/y or deltaX/deltaY";
+  }
+
+  dispatchMousePhase("move", clientX, clientY, button, buttons, preferredTarget);
+  mouseInteractionState.clientX = clientX;
+  mouseInteractionState.clientY = clientY;
+  mouseInteractionState.source = preferredTarget;
+  return `Mouse moved to (${clientX.toFixed(1)}, ${clientY.toFixed(1)})`;
+}
+
+function agentMouseUp(args: Record<string, unknown>): string {
+  const button = mouseInteractionState.active
+    ? mouseInteractionState.button
+    : (typeof args.button === "number" ? args.button : 0);
+  let clientX = mouseInteractionState.clientX;
+  let clientY = mouseInteractionState.clientY;
+  let preferredTarget: HTMLElement | null = mouseInteractionState.source;
+
+  if (typeof args.x === "number" && typeof args.y === "number") {
+    const resolved = resolveMouseClientPoint(args);
+    if ("error" in resolved) return resolved.error;
+    clientX = resolved.clientX;
+    clientY = resolved.clientY;
+    preferredTarget = resolved.target;
+  } else if (typeof args.deltaX === "number" || typeof args.deltaY === "number") {
+    clientX += typeof args.deltaX === "number" ? args.deltaX : 0;
+    clientY += typeof args.deltaY === "number" ? args.deltaY : 0;
+    preferredTarget = (document.elementFromPoint(clientX, clientY) as HTMLElement | null) ?? preferredTarget;
+  }
+
+  dispatchMousePhase("up", clientX, clientY, button, 0, preferredTarget);
+  mouseInteractionState.active = false;
+  mouseInteractionState.buttons = 0;
+  mouseInteractionState.clientX = clientX;
+  mouseInteractionState.clientY = clientY;
+  mouseInteractionState.source = preferredTarget;
+  return `Mouse up at (${clientX.toFixed(1)}, ${clientY.toFixed(1)})`;
+}
+
+async function agentDragElement(args: Record<string, unknown>): Promise<string> {
+  const selector = typeof args.selector === "string" ? args.selector : "";
+  const index = typeof args.index === "number" ? args.index : 0;
+  const coordinateMode = args.coordinateMode === "ratio" ? "ratio" : "css";
+  const button = typeof args.button === "number" ? args.button : 0;
+  const steps = typeof args.steps === "number" ? args.steps : 12;
+  const durationMs = typeof args.durationMs === "number" ? args.durationMs : 300;
+  if (!selector) return "Error: selector is required";
+
+  const target = resolveElementTarget(selector, index);
+  if ("error" in target) return target.error;
+
+  const { element, rect } = target;
+  const startX = typeof args.startX === "number" ? args.startX : (coordinateMode === "ratio" ? 0.5 : rect.width / 2);
+  const startY = typeof args.startY === "number" ? args.startY : (coordinateMode === "ratio" ? 0.5 : rect.height / 2);
+  const resolvedStart = resolveElementCoordinates(rect, startX, startY, coordinateMode);
+  if ("error" in resolvedStart) return resolvedStart.error;
+
+  let resolvedEnd: { cssX: number; cssY: number } | { error: string };
+  if (typeof args.endX === "number" && typeof args.endY === "number") {
+    resolvedEnd = resolveElementCoordinates(rect, args.endX, args.endY, coordinateMode);
+  } else if (typeof args.deltaX === "number" || typeof args.deltaY === "number") {
+    resolvedEnd = {
+      cssX: resolvedStart.cssX + (typeof args.deltaX === "number" ? args.deltaX : 0),
+      cssY: resolvedStart.cssY + (typeof args.deltaY === "number" ? args.deltaY : 0)
+    };
+  } else {
+    return "Error: provide endX/endY or deltaX/deltaY";
+  }
+
+  if ("error" in resolvedEnd) return resolvedEnd.error;
+
+  await dispatchDragSequence(
+    element,
+    rect.left + resolvedStart.cssX,
+    rect.top + resolvedStart.cssY,
+    rect.left + resolvedEnd.cssX,
+    rect.top + resolvedEnd.cssY,
+    button,
+    steps,
+    durationMs
+  );
+
+  return `Dragged ${selector}[${index}] from (${resolvedStart.cssX.toFixed(1)}, ${resolvedStart.cssY.toFixed(1)}) to (${resolvedEnd.cssX.toFixed(1)}, ${resolvedEnd.cssY.toFixed(1)}) using ${coordinateMode} coordinates`;
+}
+
 function agentTypeText(args: Record<string, unknown>): string {
   const selector = typeof args.selector === "string" ? args.selector : "";
   const text = typeof args.text === "string" ? args.text : "";
@@ -3952,6 +4990,51 @@ function agentTypeText(args: Record<string, unknown>): string {
   el.dispatchEvent(new Event("input", { bubbles: true }));
   el.dispatchEvent(new Event("change", { bubbles: true }));
   return `Typed "${text.slice(0, 50)}" into <${el.tagName.toLowerCase()}>`;
+}
+
+function agentSetCheckbox(args: Record<string, unknown>): string {
+  const selector = typeof args.selector === "string" ? args.selector : "";
+  const index = typeof args.index === "number" ? args.index : 0;
+  const checked = args.checked !== false;
+  if (!selector) return "Error: selector is required";
+
+  const elements = document.querySelectorAll<HTMLInputElement>(selector);
+  if (elements.length === 0) return `No checkbox elements found for selector: ${selector}`;
+  if (index >= elements.length) return `Index ${index} out of range (found ${elements.length})`;
+
+  const el = elements[index];
+  if (el.type !== "checkbox") {
+    return `Error: target ${selector}[${index}] is not a checkbox`;
+  }
+
+  if (el.checked !== checked) {
+    el.checked = checked;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+  return `Checkbox ${selector}[${index}] set to ${checked}`;
+}
+
+function agentSetRadio(args: Record<string, unknown>): string {
+  const selector = typeof args.selector === "string" ? args.selector : "";
+  const index = typeof args.index === "number" ? args.index : 0;
+  if (!selector) return "Error: selector is required";
+
+  const elements = document.querySelectorAll<HTMLInputElement>(selector);
+  if (elements.length === 0) return `No radio elements found for selector: ${selector}`;
+  if (index >= elements.length) return `Index ${index} out of range (found ${elements.length})`;
+
+  const el = elements[index];
+  if (el.type !== "radio") {
+    return `Error: target ${selector}[${index}] is not a radio`;
+  }
+
+  if (!el.checked) {
+    el.checked = true;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+  return `Radio ${selector}[${index}] selected`;
 }
 
 function agentSelectOption(args: Record<string, unknown>): string {
@@ -4008,6 +5091,142 @@ function agentScrollPage(args: Record<string, unknown>): string {
     default:
       return `Unknown direction: ${direction}`;
   }
+}
+
+function agentScrollElement(args: Record<string, unknown>): string {
+  const selector = typeof args.selector === "string" ? args.selector : "";
+  const index = typeof args.index === "number" ? args.index : 0;
+  const direction = typeof args.direction === "string" ? args.direction : "down";
+  const pixels = typeof args.pixels === "number" ? args.pixels : 300;
+  if (!selector) return "Error: selector is required";
+
+  const target = resolveElementTarget(selector, index);
+  if ("error" in target) return target.error;
+  const { element } = target;
+
+  switch (direction) {
+    case "up":
+      element.scrollBy({ top: -pixels, behavior: "auto" });
+      return `Scrolled ${selector}[${index}] up ${pixels}px`;
+    case "down":
+      element.scrollBy({ top: pixels, behavior: "auto" });
+      return `Scrolled ${selector}[${index}] down ${pixels}px`;
+    case "left":
+      element.scrollBy({ left: -pixels, behavior: "auto" });
+      return `Scrolled ${selector}[${index}] left ${pixels}px`;
+    case "right":
+      element.scrollBy({ left: pixels, behavior: "auto" });
+      return `Scrolled ${selector}[${index}] right ${pixels}px`;
+    case "top":
+      element.scrollTo({ top: 0, behavior: "auto" });
+      return `Scrolled ${selector}[${index}] to top`;
+    case "bottom":
+      element.scrollTo({ top: element.scrollHeight, behavior: "auto" });
+      return `Scrolled ${selector}[${index}] to bottom`;
+    default:
+      return `Unknown direction: ${direction}`;
+  }
+}
+
+function agentUploadFile(args: Record<string, unknown>): string {
+  const selector = typeof args.selector === "string" ? args.selector : "";
+  const index = typeof args.index === "number" ? args.index : 0;
+  const fileName = typeof args.fileName === "string" && args.fileName.trim() ? args.fileName.trim() : "upload.txt";
+  const mimeType = typeof args.mimeType === "string" && args.mimeType.trim() ? args.mimeType.trim() : "text/plain";
+  const textContent = typeof args.textContent === "string" ? args.textContent : null;
+  const base64Content = typeof args.base64Content === "string" ? args.base64Content : null;
+  if (!selector) return "Error: selector is required";
+  if (textContent === null && base64Content === null) {
+    return "Error: provide textContent or base64Content";
+  }
+
+  const elements = document.querySelectorAll<HTMLInputElement>(selector);
+  if (elements.length === 0) return `No file inputs found for selector: ${selector}`;
+  if (index >= elements.length) return `Index ${index} out of range (found ${elements.length})`;
+
+  const el = elements[index];
+  if (el.type !== "file") {
+    return `Error: target ${selector}[${index}] is not a file input`;
+  }
+  if (typeof DataTransfer !== "function" || typeof File !== "function") {
+    return "Error: browser does not support DataTransfer/File for scripted upload";
+  }
+
+  let bytes: Uint8Array;
+  if (base64Content !== null) {
+    const normalized = base64Content.includes(",") ? base64Content.split(",").pop() ?? "" : base64Content;
+    const decoded = atob(normalized);
+    bytes = new Uint8Array(decoded.length);
+    for (let i = 0; i < decoded.length; i += 1) {
+      bytes[i] = decoded.charCodeAt(i);
+    }
+  } else {
+    bytes = new TextEncoder().encode(textContent ?? "");
+  }
+
+  const filePart = bytes as unknown as BlobPart;
+  const file = new File([filePart], fileName, { type: mimeType });
+  const dataTransfer = new DataTransfer();
+  dataTransfer.items.add(file);
+  el.files = dataTransfer.files;
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  return `Uploaded synthetic file "${fileName}" to ${selector}[${index}]`;
+}
+
+function agentExtractTable(args: Record<string, unknown>): string {
+  const selector = typeof args.selector === "string" ? args.selector : "table";
+  const index = typeof args.index === "number" ? args.index : 0;
+  const tables = document.querySelectorAll<HTMLTableElement>(selector);
+  if (tables.length === 0) return `No table elements found for selector: ${selector}`;
+  if (index >= tables.length) return `Index ${index} out of range (found ${tables.length})`;
+
+  const table = tables[index];
+  const rows = Array.from(table.rows).map((row) =>
+    Array.from(row.cells).map((cell) => (cell.innerText || cell.textContent || "").trim())
+  );
+  if (rows.length === 0) {
+    return JSON.stringify({ selector, index, headers: [], rows: [] });
+  }
+
+  const headerCells = Array.from(table.querySelectorAll<HTMLTableCellElement>("thead th")).map((cell) => (cell.innerText || cell.textContent || "").trim());
+  const fallbackHeaders = rows[0].map((_, columnIndex) => `column_${columnIndex + 1}`);
+  const inferredHeaders = headerCells.length > 0
+    ? headerCells
+    : rows[0].some((cell) => cell)
+      ? rows[0]
+      : fallbackHeaders;
+  const dataRows = headerCells.length > 0 ? rows : rows.slice(1);
+  const normalizedHeaders = inferredHeaders.map((header, columnIndex) => header || fallbackHeaders[columnIndex]);
+  const objects = dataRows.map((row) => {
+    const record: Record<string, string> = {};
+    normalizedHeaders.forEach((header, columnIndex) => {
+      record[header] = row[columnIndex] ?? "";
+    });
+    return record;
+  });
+
+  return JSON.stringify({
+    selector,
+    index,
+    headers: normalizedHeaders,
+    rows: objects
+  });
+}
+
+function agentGetConsoleLogs(args: Record<string, unknown>): string {
+  const limit = typeof args.limit === "number" ? Math.max(1, args.limit) : 50;
+  const level = typeof args.level === "string" ? args.level : "";
+  const includeErrors = args.includeErrors !== false;
+  const logs = consoleLogBuffer
+    .filter((entry) => !level || entry.level === level)
+    .slice(-limit);
+
+  const payload = {
+    logs,
+    pageErrors: includeErrors ? pageErrorBuffer.slice(-limit) : []
+  };
+  return JSON.stringify(payload);
 }
 
 function agentExecuteScript(args: Record<string, unknown>): string {
@@ -4183,6 +5402,98 @@ function agentWaitForElement(args: Record<string, unknown>): Promise<string> {
         resolve(`Timeout waiting for element: ${selector} (${timeout}ms)`);
       }
     }, timeout);
+  });
+}
+
+function agentWaitForDisappear(args: Record<string, unknown>): Promise<string> {
+  const selector = typeof args.selector === "string" ? args.selector : "";
+  const timeout = typeof args.timeout === "number" ? args.timeout : 5000;
+  if (!selector) return Promise.resolve("Error: selector is required");
+
+  const isGone = (): boolean => !document.querySelector(selector);
+  if (isGone()) {
+    return Promise.resolve(`Element disappeared: ${selector}`);
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (message: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      observer.disconnect();
+      resolve(message);
+    };
+    const observer = new MutationObserver(() => {
+      if (isGone()) {
+        finish(`Element disappeared: ${selector}`);
+      }
+    });
+    const timer = setTimeout(() => {
+      finish(`Timeout waiting for disappear: ${selector} (${timeout}ms)`);
+    }, timeout);
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true
+    });
+  });
+}
+
+function agentWaitForText(args: Record<string, unknown>): Promise<string> {
+  const text = typeof args.text === "string" ? args.text.trim() : "";
+  const selector = typeof args.selector === "string" ? args.selector : "";
+  const timeout = typeof args.timeout === "number" ? args.timeout : 5000;
+  const exact = args.exact === true;
+  if (!text) return Promise.resolve("Error: text is required");
+
+  const getTargetText = (): string => {
+    const root = selector
+      ? document.querySelector<HTMLElement>(selector)
+      : document.body;
+    return root ? (root.innerText || root.textContent || "") : "";
+  };
+
+  const matches = (): boolean => {
+    const haystack = getTargetText();
+    return exact ? haystack.trim() === text : haystack.includes(text);
+  };
+
+  if (matches()) {
+    return Promise.resolve(`Text found${selector ? ` in ${selector}` : ""}: ${text}`);
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (message: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      observer.disconnect();
+      resolve(message);
+    };
+    const observer = new MutationObserver(() => {
+      if (matches()) {
+        finish(`Text found${selector ? ` in ${selector}` : ""}: ${text}`);
+      }
+    });
+    const timer = setTimeout(() => {
+      finish(`Timeout waiting for text${selector ? ` in ${selector}` : ""}: ${text} (${timeout}ms)`);
+    }, timeout);
+
+    const root = selector
+      ? document.querySelector<HTMLElement>(selector)
+      : document.body;
+    if (!root) {
+      finish(`No element found for selector: ${selector}`);
+      return;
+    }
+
+    observer.observe(root, {
+      childList: true,
+      subtree: true,
+      characterData: true
+    });
   });
 }
 
@@ -4512,14 +5823,36 @@ function executeAgentTool(
       return agentReadPageContent(args);
     case "query_selector":
       return agentQuerySelector(args);
+    case "find_interactive_elements":
+      return agentFindInteractiveElements(args);
+    case "smart_click":
+      return agentSmartClick(args);
     case "click_element":
       return agentClickElement(args);
+    case "set_checkbox":
+      return agentSetCheckbox(args);
+    case "set_radio":
+      return agentSetRadio(args);
+    case "hover_element":
+      return agentHoverElement(args);
+    case "get_element_rect":
+      return agentGetElementRect(args);
+    case "mouse_down":
+      return agentMouseDown(args);
+    case "mouse_move":
+      return agentMouseMove(args);
+    case "mouse_up":
+      return agentMouseUp(args);
+    case "drag_element":
+      return agentDragElement(args);
     case "query_canvas":
       return agentQueryCanvas(args);
     case "inspect_canvas_pixel":
       return agentInspectCanvasPixel(args);
     case "click_canvas":
       return agentClickCanvas(args);
+    case "drag_canvas":
+      return agentDragCanvas(args);
     case "click_canvas_cell":
       return agentClickCanvasCell(args);
     case "translate_current_page":
@@ -4542,12 +5875,24 @@ function executeAgentTool(
       return agentSelectOption(args);
     case "scroll_page":
       return agentScrollPage(args);
+    case "scroll_element":
+      return agentScrollElement(args);
+    case "upload_file":
+      return agentUploadFile(args);
     case "execute_script":
       return agentExecuteScript(args);
     case "inspect_visibility_detection":
       return agentInspectVisibilityDetection(args);
     case "wait_for_element":
       return agentWaitForElement(args);
+    case "wait_for_disappear":
+      return agentWaitForDisappear(args);
+    case "wait_for_text":
+      return agentWaitForText(args);
+    case "extract_table":
+      return agentExtractTable(args);
+    case "get_console_logs":
+      return agentGetConsoleLogs(args);
     case "get_form_data":
       return agentGetFormData(args);
     case "press_key":
@@ -4685,6 +6030,7 @@ function createContentMessageHandler(options?: {
 }
 
 if (typeof chrome !== "undefined" && chrome.runtime?.onMessage) {
+  installConsoleCapture();
   chrome.runtime.onMessage.addListener(createContentMessageHandler());
 
   void (async () => {

@@ -395,14 +395,21 @@ export function getScriptSkillToolNames(skills: ScriptSkill[]): Set<string> {
  */
 export function formatScriptSkillsForPrompt(skills: ScriptSkill[]): string {
   if (skills.length === 0) return "";
-  const lines = skills.map((s) => {
+  const prioritized = [...skills].sort((a, b) => {
+    const usageDelta = b.usageCount - a.usageCount;
+    if (usageDelta !== 0) return usageDelta;
+    return b.updatedAt - a.updatedAt;
+  });
+  const sample = prioritized.slice(0, 5);
+  const lines = sample.map((s) => {
     const toolNames = s.tools.map((t) => t.name).join(", ");
     const tagStr = s.tags.length > 0 ? ` [${s.tags.join(", ")}]` : "";
     const usage = s.usageCount > 0 ? ` (已使用 ${s.usageCount} 次)` : "";
     const source = s.sourceUrl ? ` (来源: ${s.sourceUrl})` : "";
     return `- **${s.name}** (id: ${s.id}): ${s.description}${tagStr}${usage}${source}\n  提供工具: ${toolNames}`;
   });
-  return `# 已安装的脚本技能\n以下是已安装的脚本技能，它们提供了额外的工具，你可以直接调用这些工具：\n${lines.join("\n")}`;
+  const hiddenCount = Math.max(0, skills.length - sample.length);
+  return `# 脚本技能摘要（已安装的脚本技能）\n你有 ${skills.length} 个已安装脚本技能。下面仅展示常用项；若需要完整列表，请先加载 script_skill 工具后调用 list_script_skills。\n${lines.join("\n")}${hiddenCount > 0 ? `\n- 还有 ${hiddenCount} 个脚本技能未展开` : ""}`;
 }
 
 // ── ClawHub Import Helper ──

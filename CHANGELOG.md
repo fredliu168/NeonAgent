@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is loosely based on Keep a Changelog, with versions tracked alongside Git tags such as `v0.1.2`.
 
+## [0.1.19] - 2026-06-25
+
+### Added
+- Added semantic interactive-element discovery and `smart_click`, plus site-level action memory so repeated button clicks on the same site can reuse previously successful selectors.
+- Added page and element screenshot analysis tools so the agent can inspect visible UI regions with the configured vision-capable model.
+- Added Excel reference-file import for ask/agent flows, including drag-and-drop upload and scoped reference-context injection during requests.
+
+### Changed
+- Updated agent session persistence to keep raw assistant/tool message history and loaded tool categories, making resumed sessions more faithful to the original tool state.
+- Updated build output to bundle the `xlsx` runtime in release artifacts for the new Excel reference workflow.
+
+### Fixed
+- Fixed streamed agent history capture so thinking text, tool calls, and tool results are persisted and can be reused after refresh or later turns.
+
 ## [0.1.14] - 2026-06-09
 
 ### Fixed

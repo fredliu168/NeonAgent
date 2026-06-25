@@ -36,6 +36,7 @@ export interface ToolResult {
   toolCallId: string;
   toolName: string;
   output: string;
+  modelOutput?: string;
   isError: boolean;
 }
 
@@ -46,7 +47,9 @@ export interface AgentRunConfig {
   tabId: number;
   config: LLMConfig;
   userMessage: string;
+  referenceContext?: string;
   history?: AgentMessage[];
+  initialLoadedToolCategories?: string[];
   maxIterations?: number;
   toolTimeout?: number;
 }
@@ -135,6 +138,7 @@ export interface AgentSession {
   updatedAt: number;
   messages: AgentMessage[];
   entries: AgentSessionEntry[];
+  loadedToolCategories?: string[];
 }
 
 // ── Streaming Parser Types ──

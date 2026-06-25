@@ -69,6 +69,78 @@ export const AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: "function",
     function: {
+      name: "find_interactive_elements",
+      description:
+        "按文本、aria-label、title、placeholder、data-testid 等语义信息查找页面上的按钮、链接、输入框、菜单项等交互元素，并按相关度排序返回。适合先定位“提交”“保存”“下一步”这类按钮，再决定后续操作。",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "要查找的目标描述或按钮文案，例如“提交”“保存草稿”“下一步”"
+          },
+          role: {
+            type: "string",
+            enum: ["any", "button", "link", "input", "menuitem", "option", "tab", "checkbox", "radio"],
+            description: "可选。限制交互元素类型，默认 any"
+          },
+          limit: {
+            type: "integer",
+            description: "最多返回多少个候选，默认 8"
+          },
+          includeHidden: {
+            type: "boolean",
+            description: "是否包含不可见元素，默认 false"
+          },
+          exact: {
+            type: "boolean",
+            description: "是否优先只保留与 query 完全一致的文本/标签，默认 false"
+          }
+        },
+        required: ["query"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "smart_click",
+      description:
+        "按文本、aria-label、title、placeholder、data-testid 等语义信息自动查找最可能的交互元素并点击。会优先复用当前站点上历史成功的按钮定位记录，适合处理“点击提交/保存/下一步/登录”这类明确目标，减少反复试 CSS 选择器。",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "要点击的目标描述或按钮文案，例如“提交”“保存”“继续”“登录”"
+          },
+          role: {
+            type: "string",
+            enum: ["any", "button", "link", "input", "menuitem", "option", "tab", "checkbox", "radio"],
+            description: "可选。限制交互元素类型，默认 any"
+          },
+          index: {
+            type: "integer",
+            description: "在排序结果中点击第几个候选（从 0 开始），默认 0"
+          },
+          includeHidden: {
+            type: "boolean",
+            description: "是否允许匹配不可见元素，默认 false"
+          },
+          exact: {
+            type: "boolean",
+            description: "是否优先只保留与 query 完全一致的文本/标签，默认 false"
+          }
+        },
+        required: ["query"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "click_element",
       description:
         "点击页面上匹配 CSS 选择器的元素。如果有多个匹配，通过 index 指定第几个（从 0 开始）。",
@@ -82,6 +154,317 @@ export const AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
           index: {
             type: "integer",
             description: "匹配到多个元素时的索引（从 0 开始），默认 0"
+          }
+        },
+        required: ["selector"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "set_checkbox",
+      description: "直接设置复选框的勾选状态，并触发 input/change 事件。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "checkbox 元素的 CSS 选择器"
+          },
+          index: {
+            type: "integer",
+            description: "匹配到多个元素时的索引（从 0 开始），默认 0"
+          },
+          checked: {
+            type: "boolean",
+            description: "目标勾选状态，默认 true"
+          }
+        },
+        required: ["selector"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "set_radio",
+      description: "直接选中单选框，并触发 input/change 事件。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "radio 元素的 CSS 选择器"
+          },
+          index: {
+            type: "integer",
+            description: "匹配到多个元素时的索引（从 0 开始），默认 0"
+          }
+        },
+        required: ["selector"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "hover_element",
+      description:
+        "悬停到页面元素上，可触发浮层、工具提示、悬浮按钮或下拉菜单。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "目标元素的 CSS 选择器"
+          },
+          index: {
+            type: "integer",
+            description: "匹配到多个元素时的索引（从 0 开始），默认 0"
+          },
+          x: {
+            type: "number",
+            description: "悬停点横坐标；coordinateMode='css' 时为元素内 CSS 像素，ratio 时为 0 到 1 的比例"
+          },
+          y: {
+            type: "number",
+            description: "悬停点纵坐标；coordinateMode='css' 时为元素内 CSS 像素，ratio 时为 0 到 1 的比例"
+          },
+          coordinateMode: {
+            type: "string",
+            enum: ["css", "ratio"],
+            description: "坐标模式：css=元素内 CSS 像素，ratio=相对比例，默认 css"
+          }
+        },
+        required: ["selector"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_element_rect",
+      description:
+        "返回页面元素的位置和尺寸信息，包括 left/top/width/height/right/bottom。适合后续点击、拖动、截图定位。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "目标元素的 CSS 选择器"
+          },
+          index: {
+            type: "integer",
+            description: "匹配到多个元素时的索引（从 0 开始），默认 0"
+          }
+        },
+        required: ["selector"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "mouse_down",
+      description:
+        "在指定元素或视口坐标处按下鼠标，不自动松开。适合与 mouse_move、mouse_up 组合完成复杂拖动。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "可选。目标元素的 CSS 选择器；不传则按视口坐标定位"
+          },
+          index: {
+            type: "integer",
+            description: "匹配到多个元素时的索引（从 0 开始），默认 0"
+          },
+          x: {
+            type: "number",
+            description: "横坐标；如果传 selector，则是元素内坐标；否则是视口坐标"
+          },
+          y: {
+            type: "number",
+            description: "纵坐标；如果传 selector，则是元素内坐标；否则是视口坐标"
+          },
+          coordinateMode: {
+            type: "string",
+            enum: ["css", "ratio"],
+            description: "坐标模式：css=像素，ratio=相对比例，默认 css"
+          },
+          button: {
+            type: "integer",
+            description: "鼠标按键，0=左键，1=中键，2=右键，默认 0"
+          }
+        },
+        required: ["x", "y"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "mouse_move",
+      description:
+        "移动鼠标到新的位置。可传绝对坐标 x/y，也可传 deltaX/deltaY 做相对移动；若之前已 mouse_down，会保持按下状态。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "可选。目标元素的 CSS 选择器；不传则按视口坐标定位"
+          },
+          index: {
+            type: "integer",
+            description: "匹配到多个元素时的索引（从 0 开始），默认 0"
+          },
+          x: {
+            type: "number",
+            description: "绝对横坐标"
+          },
+          y: {
+            type: "number",
+            description: "绝对纵坐标"
+          },
+          deltaX: {
+            type: "number",
+            description: "相对横向位移（CSS 像素）"
+          },
+          deltaY: {
+            type: "number",
+            description: "相对纵向位移（CSS 像素）"
+          },
+          coordinateMode: {
+            type: "string",
+            enum: ["css", "ratio"],
+            description: "坐标模式：css=像素，ratio=相对比例，默认 css"
+          },
+          button: {
+            type: "integer",
+            description: "未处于按下状态时使用的鼠标按键，默认 0"
+          },
+          buttons: {
+            type: "integer",
+            description: "未处于按下状态时使用的 buttons 位掩码，默认 0"
+          }
+        },
+        required: [],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "mouse_up",
+      description:
+        "在当前位置或指定位置松开鼠标。可与 mouse_down、mouse_move 组合完成跨元素拖放。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "可选。目标元素的 CSS 选择器；不传则按视口坐标定位"
+          },
+          index: {
+            type: "integer",
+            description: "匹配到多个元素时的索引（从 0 开始），默认 0"
+          },
+          x: {
+            type: "number",
+            description: "绝对横坐标"
+          },
+          y: {
+            type: "number",
+            description: "绝对纵坐标"
+          },
+          deltaX: {
+            type: "number",
+            description: "相对横向位移（CSS 像素）"
+          },
+          deltaY: {
+            type: "number",
+            description: "相对纵向位移（CSS 像素）"
+          },
+          coordinateMode: {
+            type: "string",
+            enum: ["css", "ratio"],
+            description: "坐标模式：css=像素，ratio=相对比例，默认 css"
+          },
+          button: {
+            type: "integer",
+            description: "未处于按下状态时使用的鼠标按键，默认 0"
+          }
+        },
+        required: [],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "drag_element",
+      description:
+        "拖动页面上的普通 DOM 元素。可提供起点和终点，也可提供 deltaX/deltaY 做相对拖动。适合滑块、拖拽排序、拖动把手等交互测试。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "目标元素的 CSS 选择器"
+          },
+          index: {
+            type: "integer",
+            description: "匹配到多个元素时的索引（从 0 开始），默认 0"
+          },
+          startX: {
+            type: "number",
+            description: "拖动起点横坐标；coordinateMode='css' 时为元素内 CSS 像素，ratio 时为 0 到 1 的比例。默认元素中心"
+          },
+          startY: {
+            type: "number",
+            description: "拖动起点纵坐标；coordinateMode='css' 时为元素内 CSS 像素，ratio 时为 0 到 1 的比例。默认元素中心"
+          },
+          endX: {
+            type: "number",
+            description: "拖动终点横坐标；coordinateMode='css' 时为元素内 CSS 像素，ratio 时为 0 到 1 的比例"
+          },
+          endY: {
+            type: "number",
+            description: "拖动终点纵坐标；coordinateMode='css' 时为元素内 CSS 像素，ratio 时为 0 到 1 的比例"
+          },
+          deltaX: {
+            type: "number",
+            description: "相对起点的横向位移（CSS 像素）；与 deltaY 一起可替代 endX/endY"
+          },
+          deltaY: {
+            type: "number",
+            description: "相对起点的纵向位移（CSS 像素）；与 deltaX 一起可替代 endX/endY"
+          },
+          coordinateMode: {
+            type: "string",
+            enum: ["css", "ratio"],
+            description: "坐标模式：css=元素内 CSS 像素，ratio=相对比例，默认 css"
+          },
+          steps: {
+            type: "integer",
+            description: "拖动过程分成多少步，默认 12"
+          },
+          durationMs: {
+            type: "integer",
+            description: "拖动总耗时（毫秒），默认 300"
+          },
+          button: {
+            type: "integer",
+            description: "鼠标按键，0=左键，1=中键，2=右键，默认 0"
           }
         },
         required: ["selector"],
@@ -184,6 +567,62 @@ export const AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
           }
         },
         required: ["x", "y"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "drag_canvas",
+      description:
+        "按坐标拖动 Canvas 内的某个点到另一个点。适合普通 canvas 交互测试，例如拖动画布控件、进度把手或绘图起止点。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "Canvas 的 CSS 选择器，默认 'canvas'"
+          },
+          index: {
+            type: "integer",
+            description: "匹配到多个 Canvas 时的索引（从 0 开始），默认 0"
+          },
+          startX: {
+            type: "number",
+            description: "起点横坐标；coordinateMode='css' 时为 CSS 像素，ratio 时为 0 到 1 的比例"
+          },
+          startY: {
+            type: "number",
+            description: "起点纵坐标；coordinateMode='css' 时为 CSS 像素，ratio 时为 0 到 1 的比例"
+          },
+          endX: {
+            type: "number",
+            description: "终点横坐标；coordinateMode='css' 时为 CSS 像素，ratio 时为 0 到 1 的比例"
+          },
+          endY: {
+            type: "number",
+            description: "终点纵坐标；coordinateMode='css' 时为 CSS 像素，ratio 时为 0 到 1 的比例"
+          },
+          coordinateMode: {
+            type: "string",
+            enum: ["css", "ratio"],
+            description: "坐标模式：css=CSS 像素，ratio=相对比例，默认 css"
+          },
+          steps: {
+            type: "integer",
+            description: "拖动过程分成多少步，默认 12"
+          },
+          durationMs: {
+            type: "integer",
+            description: "拖动总耗时（毫秒），默认 300"
+          },
+          button: {
+            type: "integer",
+            description: "鼠标按键，0=左键，1=中键，2=右键，默认 0"
+          }
+        },
+        required: ["startX", "startY", "endX", "endY"],
         additionalProperties: false
       }
     }
@@ -541,6 +980,45 @@ export const AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: "function",
     function: {
+      name: "upload_file",
+      description:
+        "向 <input type='file'> 注入一个合成文件。当前支持 textContent 或 base64Content 构造文件内容，适合自动化测试上传流程。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "文件输入框的 CSS 选择器"
+          },
+          index: {
+            type: "integer",
+            description: "匹配到多个文件输入框时的索引（从 0 开始），默认 0"
+          },
+          fileName: {
+            type: "string",
+            description: "生成的文件名，默认 upload.txt"
+          },
+          mimeType: {
+            type: "string",
+            description: "MIME 类型，默认 text/plain"
+          },
+          textContent: {
+            type: "string",
+            description: "直接作为文件文本内容"
+          },
+          base64Content: {
+            type: "string",
+            description: "base64 编码的文件内容，也接受 data URL"
+          }
+        },
+        required: ["selector"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "select_option",
       description:
         "在 <select> 下拉框中选择一个选项，可以通过 value 或 label（显示文字）匹配。",
@@ -593,6 +1071,38 @@ export const AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
           }
         },
         required: [],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "scroll_element",
+      description:
+        "滚动指定元素容器，可向上/下/左/右滚动指定像素，或直接滚到容器顶部/底部。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "要滚动的元素的 CSS 选择器"
+          },
+          index: {
+            type: "integer",
+            description: "匹配到多个元素时的索引（从 0 开始），默认 0"
+          },
+          direction: {
+            type: "string",
+            enum: ["up", "down", "left", "right", "top", "bottom"],
+            description: "滚动方向，默认 down"
+          },
+          pixels: {
+            type: "integer",
+            description: "滚动像素数，仅 up/down/left/right 时有效，默认 300"
+          }
+        },
+        required: ["selector"],
         additionalProperties: false
       }
     }
@@ -660,6 +1170,60 @@ export const AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: "function",
     function: {
+      name: "analyze_page_screenshot",
+      description:
+        "截取当前可见网页区域的截图，并用当前配置的模型做视觉识别与总结。可附加 prompt 说明识别目标，也可用 selector 提示模型关注页面中的某个元素区域。",
+      parameters: {
+        type: "object",
+        properties: {
+          prompt: {
+            type: "string",
+            description: "告诉模型你想从截图里识别什么，例如“读取表格主要字段”或“总结这个弹窗内容”"
+          },
+          selector: {
+            type: "string",
+            description: "可选。页面元素 CSS 选择器，用作视觉焦点提示"
+          },
+          index: {
+            type: "integer",
+            description: "selector 匹配多个元素时的索引（从 0 开始），默认 0"
+          }
+        },
+        required: [],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "analyze_element_screenshot",
+      description:
+        "截取当前可见网页中的指定元素区域，并用当前模型做视觉识别。比整页截图更聚焦，适合识别弹窗、表格、卡片或局部图表。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "目标元素的 CSS 选择器"
+          },
+          index: {
+            type: "integer",
+            description: "匹配到多个元素时的索引（从 0 开始），默认 0"
+          },
+          prompt: {
+            type: "string",
+            description: "告诉模型你想从这个元素截图里识别什么"
+          }
+        },
+        required: ["selector"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "wait_for_element",
       description:
         "等待页面上出现匹配指定 CSS 选择器的元素。用于页面加载或动态内容出现后再操作。",
@@ -676,6 +1240,60 @@ export const AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
           }
         },
         required: ["selector"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "wait_for_disappear",
+      description:
+        "等待页面上匹配指定 CSS 选择器的元素消失。适合等 loading、弹窗、遮罩、toast 等消失后再继续操作。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "要等待消失的元素的 CSS 选择器"
+          },
+          timeout: {
+            type: "integer",
+            description: "最长等待毫秒数，默认 5000"
+          }
+        },
+        required: ["selector"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "wait_for_text",
+      description:
+        "等待页面或指定元素中出现某段文本。适合异步渲染、请求完成、消息提示出现后再继续操作。",
+      parameters: {
+        type: "object",
+        properties: {
+          text: {
+            type: "string",
+            description: "要等待出现的文本"
+          },
+          selector: {
+            type: "string",
+            description: "可选。只在该选择器匹配元素内查找文本"
+          },
+          timeout: {
+            type: "integer",
+            description: "最长等待毫秒数，默认 5000"
+          },
+          exact: {
+            type: "boolean",
+            description: "是否要求文本完全相等，默认 false（包含匹配）"
+          }
+        },
+        required: ["text"],
         additionalProperties: false
       }
     }
@@ -725,6 +1343,29 @@ export const AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: "function",
     function: {
+      name: "extract_table",
+      description:
+        "读取页面表格并提取为结构化 JSON。会尽量识别表头，并按列名输出每一行记录。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "表格的 CSS 选择器，默认 table"
+          },
+          index: {
+            type: "integer",
+            description: "匹配到多个表格时的索引（从 0 开始），默认 0"
+          }
+        },
+        required: [],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "press_key",
       description: "模拟键盘按键，如 Enter、Escape、Tab 等。",
       parameters: {
@@ -740,6 +1381,34 @@ export const AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
           }
         },
         required: ["key"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_console_logs",
+      description:
+        "返回插件在当前页面上下文中最近捕获到的 console 日志，以及 window error / unhandledrejection 记录，适合页面调试。",
+      parameters: {
+        type: "object",
+        properties: {
+          limit: {
+            type: "integer",
+            description: "最多返回多少条记录，默认 50"
+          },
+          level: {
+            type: "string",
+            enum: ["log", "info", "warn", "error"],
+            description: "按 console 级别过滤"
+          },
+          includeErrors: {
+            type: "boolean",
+            description: "是否包含页面 error / unhandledrejection，默认 true"
+          }
+        },
+        required: [],
         additionalProperties: false
       }
     }
@@ -1354,10 +2023,21 @@ export const PAGE_TOOLS = new Set([
   "get_page_info",
   "read_page_content",
   "query_selector",
+  "find_interactive_elements",
+  "smart_click",
   "click_element",
+  "set_checkbox",
+  "set_radio",
+  "hover_element",
+  "get_element_rect",
+  "mouse_down",
+  "mouse_move",
+  "mouse_up",
+  "drag_element",
   "query_canvas",
   "inspect_canvas_pixel",
   "click_canvas",
+  "drag_canvas",
   "click_canvas_cell",
   "translate_current_page",
   "write_translation_to_page",
@@ -1367,12 +2047,18 @@ export const PAGE_TOOLS = new Set([
   "update_bilingual_translation_on_page",
   "insert_text_block",
   "type_text",
+  "upload_file",
   "select_option",
   "scroll_page",
+  "scroll_element",
   "execute_script",
   "inspect_visibility_detection",
   "wait_for_element",
+  "wait_for_disappear",
+  "wait_for_text",
+  "extract_table",
   "get_form_data",
+  "get_console_logs",
   "list_api_traffic",
   "analyze_api_traffic",
   "wait_for_api_traffic",
@@ -1382,6 +2068,8 @@ export const PAGE_TOOLS = new Set([
 /** Tools that execute in the background service worker */
 export const BACKGROUND_TOOLS = new Set([
   "navigate",
+  "analyze_page_screenshot",
+  "analyze_element_screenshot",
   "wait_for_url",
   "get_current_time",
   "load_tool_category",
@@ -1394,7 +2082,7 @@ export const BACKGROUND_TOOLS = new Set([
 export type ToolCategory = "canvas" | "translation" | "traffic" | "memory" | "skill" | "script_skill" | "task";
 
 export const TOOL_CATEGORIES: Record<ToolCategory, string[]> = {
-  canvas: ["query_canvas", "inspect_canvas_pixel", "click_canvas", "click_canvas_cell"],
+  canvas: ["query_canvas", "inspect_canvas_pixel", "click_canvas", "drag_canvas", "click_canvas_cell"],
   translation: ["translate_current_page", "write_translation_to_page", "remove_translation_from_page", "update_translation_on_page", "write_bilingual_translation_to_page", "update_bilingual_translation_on_page", "insert_text_block"],
   traffic: ["list_api_traffic", "analyze_api_traffic", "wait_for_api_traffic"],
   memory: ["save_memory", "search_memories", "delete_memory"],
@@ -1404,7 +2092,8 @@ export const TOOL_CATEGORIES: Record<ToolCategory, string[]> = {
 };
 
 export const CORE_TOOLS = new Set([
-  "get_page_info", "read_page_content", "query_selector", "click_element",
-  "type_text", "wait_for_element", "wait_for_url", "navigate", "scroll_page", "execute_script",
+  "get_page_info", "read_page_content", "query_selector", "find_interactive_elements", "smart_click", "click_element",
+  "set_checkbox", "set_radio", "hover_element", "get_element_rect", "mouse_down", "mouse_move", "mouse_up", "drag_element",
+  "type_text", "upload_file", "wait_for_element", "wait_for_disappear", "wait_for_text", "wait_for_url", "navigate", "analyze_page_screenshot", "analyze_element_screenshot", "scroll_page", "scroll_element", "extract_table", "get_console_logs", "execute_script",
   "inspect_visibility_detection", "press_key", "get_form_data", "select_option", "get_current_time", "load_tool_category", "translate_current_page"
 ]);

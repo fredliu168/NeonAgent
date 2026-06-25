@@ -58,6 +58,13 @@ export function isRuntimeMessage(value: unknown): value is RuntimeMessage {
     }
 
     if (
+      typeof value.payload.referenceContext !== "undefined" &&
+      typeof value.payload.referenceContext !== "string"
+    ) {
+      return false;
+    }
+
+    if (
       typeof value.payload.pageContext !== "undefined" &&
       typeof value.payload.pageContext !== "string"
     ) {
@@ -92,6 +99,13 @@ export function isRuntimeMessage(value: unknown): value is RuntimeMessage {
     }
 
     if (!value.payload.messages.every(isChatMessage)) {
+      return false;
+    }
+
+    if (
+      typeof value.payload.referenceContext !== "undefined" &&
+      typeof value.payload.referenceContext !== "string"
+    ) {
       return false;
     }
 

@@ -191,7 +191,14 @@ export async function getAllScheduledTasks(
 export function formatScheduledTasksForPrompt(tasks: ScheduledTask[]): string | undefined {
   if (tasks.length === 0) return undefined;
 
-  const lines = tasks.map((t) => {
+  const prioritized = [...tasks].sort((a, b) => {
+    if (Number(a.enabled) !== Number(b.enabled)) {
+      return Number(b.enabled) - Number(a.enabled);
+    }
+    return (b.lastRunAt ?? 0) - (a.lastRunAt ?? 0);
+  });
+  const sample = prioritized.slice(0, 5);
+  const lines = sample.map((t) => {
     const status = t.enabled ? "✅" : "⏸️";
     const schedule = describeSchedule(t);
     const lastRun = t.lastRunAt
@@ -200,7 +207,8 @@ export function formatScheduledTasksForPrompt(tasks: ScheduledTask[]): string | 
     return `- ${status} **${t.name}** (id: ${t.id}): ${schedule} — ${lastRun}`;
   });
 
-  return `# 定时任务\n以下是你管理的定时任务列表：\n${lines.join("\n")}`;
+  const hiddenCount = Math.max(0, tasks.length - sample.length);
+  return `# 定时任务摘要\n你有 ${tasks.length} 个定时任务。下面仅展示优先级较高的任务；若需要完整列表，请先加载 task 工具后调用 list_scheduled_tasks。\n${lines.join("\n")}${hiddenCount > 0 ? `\n- 还有 ${hiddenCount} 个任务未展开` : ""}`;
 }
 
 /** Describe schedule in human-readable Chinese */

@@ -738,6 +738,28 @@ export async function requestAgentStream(
           callbacks?.onThinkingDelta?.(reasoningDelta);
         }
       }
+      if (delta.toolCalls) {
+        for (const tc of delta.toolCalls) {
+          let pending = pendingToolCalls.get(tc.index);
+          if (!pending) {
+            pending = {
+              index: tc.index,
+              id: tc.id ?? `tool_${tc.index}`,
+              name: tc.name ?? "",
+              arguments: ""
+            };
+            pendingToolCalls.set(tc.index, pending);
+            if (tc.id && tc.name) {
+              callbacks?.onToolCallStart?.(tc.index, tc.id, tc.name);
+            }
+          }
+          if (tc.id) pending.id = tc.id;
+          if (tc.name) pending.name = tc.name;
+          if (tc.argumentsDelta) {
+            pending.arguments += tc.argumentsDelta;
+          }
+        }
+      }
     }
   }
 

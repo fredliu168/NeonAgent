@@ -9,6 +9,7 @@ import type {
 export function createLLMRequestMessage(input: {
   config: LLMConfig;
   messages: ChatMessage[];
+  referenceContext?: string;
   pageContext?: string;
   thinkingEnabled?: boolean;
 }): LLMRequestPayload {
@@ -17,6 +18,7 @@ export function createLLMRequestMessage(input: {
     payload: {
       config: input.config,
       messages: input.messages,
+      referenceContext: input.referenceContext,
       pageContext: input.pageContext,
       thinkingEnabled: input.thinkingEnabled
     }
@@ -27,6 +29,7 @@ export function createLLMStreamRequestMessage(input: {
   requestId: string;
   config: LLMConfig;
   messages: ChatMessage[];
+  referenceContext?: string;
   pageContext?: string;
   thinkingEnabled?: boolean;
 }): LLMStreamRequestPayload {
@@ -36,6 +39,7 @@ export function createLLMStreamRequestMessage(input: {
       requestId: input.requestId,
       config: input.config,
       messages: input.messages,
+      referenceContext: input.referenceContext,
       pageContext: input.pageContext,
       thinkingEnabled: input.thinkingEnabled
     }

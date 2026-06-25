@@ -268,13 +268,20 @@ export async function importSkills(
  */
 export function formatSkillsForPrompt(skills: Skill[]): string {
   if (skills.length === 0) return "";
-  const lines = skills.map((s) => {
+  const prioritized = [...skills].sort((a, b) => {
+    const usageDelta = b.usageCount - a.usageCount;
+    if (usageDelta !== 0) return usageDelta;
+    return b.updatedAt - a.updatedAt;
+  });
+  const sample = prioritized.slice(0, 5);
+  const lines = sample.map((s) => {
     const tagStr = s.tags.length > 0 ? ` [${s.tags.join(", ")}]` : "";
     const usage = s.usageCount > 0 ? ` (已使用 ${s.usageCount} 次)` : "";
     const executable = s.steps.some((step) => step.type === "tool") ? " (包含可执行插件工具步骤，可用 run_skill 直接运行)" : "";
     return `- **${s.name}** (id: ${s.id}): ${s.description}${tagStr}${usage}${executable}`;
   });
-  return `# 已保存的技能\n以下是你之前学到的可复用技能，遇到相似任务时可直接调用：\n${lines.join("\n")}`;
+  const hiddenCount = Math.max(0, skills.length - sample.length);
+  return `# 技能摘要（已保存的技能）\n你有 ${skills.length} 个已保存技能。下面仅展示最常用/最近的技能；若需要完整列表，请先加载 skill 工具后调用 list_skills。\n${lines.join("\n")}${hiddenCount > 0 ? `\n- 还有 ${hiddenCount} 个技能未展开` : ""}`;
 }
 
 /**

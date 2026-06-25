@@ -64,6 +64,21 @@ export class ChatHistoryRepository {
 
 const AGENT_SESSIONS_KEY = "neonagent.agentSessions";
 const X_BLOCKED_ACCOUNTS_KEY = "neonagent.xBlockedAccounts";
+const SITE_ACTION_MEMORIES_KEY = "neonagent.siteActionMemories";
+
+export interface SiteActionMemoryEntry {
+  id: string;
+  host: string;
+  action: "click";
+  query: string;
+  role: string;
+  selector: string;
+  tagName?: string;
+  label?: string;
+  successCount: number;
+  createdAt: number;
+  updatedAt: number;
+}
 
 export class AgentHistoryRepository {
   constructor(private readonly storage: StorageLike) {}
@@ -146,5 +161,134 @@ export class XBlockedAccountRepository {
     records[idx] = updated;
     await this.storage.set(X_BLOCKED_ACCOUNTS_KEY, records);
     return updated;
+  }
+}
+
+export class SiteActionMemoryRepository {
+  constructor(private readonly storage: StorageLike) {}
+
+  async getEntries(): Promise<SiteActionMemoryEntry[]> {
+    const entries = await this.storage.get<SiteActionMemoryEntry[]>(SITE_ACTION_MEMORIES_KEY);
+    if (!Array.isArray(entries)) {
+      return [];
+    }
+
+    return entries
+      .filter((entry) =>
+        typeof entry?.id === "string" &&
+        typeof entry?.host === "string" &&
+        typeof entry?.query === "string" &&
+        typeof entry?.selector === "string"
+      )
+      .sort((a, b) => {
+        if (b.successCount !== a.successCount) {
+          return b.successCount - a.successCount;
+        }
+        return b.updatedAt - a.updatedAt;
+      });
+  }
+
+  async findMatches(input: {
+    host: string;
+    query: string;
+    role?: string;
+    action?: "click";
+    limit?: number;
+  }): Promise<SiteActionMemoryEntry[]> {
+    const host = input.host.trim().toLowerCase();
+    const query = input.query.trim().toLowerCase();
+    const role = (input.role || "any").trim().toLowerCase();
+    const action = input.action ?? "click";
+    const limit = Math.max(1, Math.min(10, input.limit ?? 5));
+    const entries = await this.getEntries();
+    const queryTokens = query.split(/\s+/).filter(Boolean);
+
+    return entries
+      .filter((entry) => {
+        if (entry.action !== action) return false;
+        if (entry.host.trim().toLowerCase() !== host) return false;
+        if (role !== "any" && entry.role.trim().toLowerCase() !== role) return false;
+        const entryQuery = entry.query.trim().toLowerCase();
+        if (entryQuery === query) return true;
+        return queryTokens.length > 0 && queryTokens.every((token) => entryQuery.includes(token));
+      })
+      .sort((a, b) => {
+        const aExact = a.query.trim().toLowerCase() === query ? 1 : 0;
+        const bExact = b.query.trim().toLowerCase() === query ? 1 : 0;
+        if (bExact !== aExact) {
+          return bExact - aExact;
+        }
+        if (b.successCount !== a.successCount) {
+          return b.successCount - a.successCount;
+        }
+        return b.updatedAt - a.updatedAt;
+      })
+      .slice(0, limit);
+  }
+
+  async recordSuccess(input: {
+    host: string;
+    query: string;
+    role?: string;
+    action?: "click";
+    selector: string;
+    tagName?: string;
+    label?: string;
+  }): Promise<SiteActionMemoryEntry> {
+    const entries = await this.getEntries();
+    const now = Date.now();
+    const host = input.host.trim().toLowerCase();
+    const query = input.query.trim().toLowerCase();
+    const role = (input.role || "any").trim().toLowerCase();
+    const action = input.action ?? "click";
+    const selector = input.selector.trim();
+
+    const existingIndex = entries.findIndex((entry) =>
+      entry.host === host &&
+      entry.query === query &&
+      entry.role === role &&
+      entry.action === action &&
+      entry.selector === selector
+    );
+
+    const nextEntry: SiteActionMemoryEntry = existingIndex >= 0
+      ? {
+          ...entries[existingIndex],
+          tagName: input.tagName?.trim() || entries[existingIndex].tagName,
+          label: input.label?.trim() || entries[existingIndex].label,
+          successCount: entries[existingIndex].successCount + 1,
+          updatedAt: now
+        }
+      : {
+          id: `site-action-${now}-${Math.random().toString(16).slice(2, 8)}`,
+          host,
+          action,
+          query,
+          role,
+          selector,
+          tagName: input.tagName?.trim() || "",
+          label: input.label?.trim() || "",
+          successCount: 1,
+          createdAt: now,
+          updatedAt: now
+        };
+
+    if (existingIndex >= 0) {
+      entries[existingIndex] = nextEntry;
+    } else {
+      entries.unshift(nextEntry);
+    }
+
+    const trimmed = entries
+      .sort((a, b) => {
+        if (b.successCount !== a.successCount) {
+          return b.successCount - a.successCount;
+        }
+        return b.updatedAt - a.updatedAt;
+      })
+      .slice(0, 300);
+
+    await this.storage.set(SITE_ACTION_MEMORIES_KEY, trimmed);
+    return nextEntry;
   }
 }

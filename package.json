@@ -1,12 +1,12 @@
 {
   "name": "neonagent",
-  "version": "0.1.18",
+  "version": "0.1.19",
   "private": true,
   "type": "module",
   "scripts": {
     "clean": "rm -rf dist",
     "build": "npm run clean && tsc -p tsconfig.build.json && npm run copy:static",
-    "copy:static": "mkdir -p dist/sidepanel dist/images && cp src/manifest.json dist/manifest.json && cp src/sidepanel/index.html dist/sidepanel/index.html && perl -0pi -e 's#src=\"../../dist/sidepanel/index.js\"#src=\"index.js\"#' dist/sidepanel/index.html && cp images/* dist/images/",
+    "copy:static": "mkdir -p dist/sidepanel dist/images dist/vendor && cp src/manifest.json dist/manifest.json && cp src/sidepanel/index.html dist/sidepanel/index.html && perl -0pi -e 's#src=\"../../dist/sidepanel/index.js\"#src=\"index.js\"#' dist/sidepanel/index.html && cp node_modules/xlsx/dist/xlsx.full.min.js dist/vendor/xlsx.full.min.js && cp images/* dist/images/",
     "generate-icons": "node scripts/generate-icons.mjs",
     "local-server": "node scripts/neonagent-local-server.mjs",
     "local-server:py": "python3 scripts/neonagent-local-server.py",
@@ -18,5 +18,8 @@
     "@types/chrome": "^0.0.292",
     "typescript": "^5.8.3",
     "vitest": "^2.1.8"
+  },
+  "dependencies": {
+    "xlsx": "^0.18.5"
   }
 }

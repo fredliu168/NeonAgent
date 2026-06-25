@@ -94,3 +94,46 @@ export function trimArrayToEstimatedTokenBudget<T>(input: {
 
   return [...head, ...keptTail];
 }
+
+export function trimGroupedArrayToEstimatedTokenBudget<T>(input: {
+  items: T[];
+  headCount?: number;
+  budgetTokens: number;
+  estimatePayload: (items: T[]) => unknown;
+  groupTailItems: (tailItems: T[]) => T[][];
+}): T[] {
+  const { items, budgetTokens, estimatePayload, groupTailItems } = input;
+  const headCount = Math.max(0, Math.min(items.length, input.headCount ?? 0));
+  if (items.length <= headCount) {
+    return items;
+  }
+
+  if (estimatePayloadTokens(estimatePayload(items)) <= budgetTokens) {
+    return items;
+  }
+
+  const head = items.slice(0, headCount);
+  const tail = items.slice(headCount);
+  const groupedTail = groupTailItems(tail).filter((group) => group.length > 0);
+
+  if (groupedTail.length === 0) {
+    return head;
+  }
+
+  const keptGroups: T[][] = [];
+
+  for (let index = groupedTail.length - 1; index >= 0; index -= 1) {
+    keptGroups.unshift(groupedTail[index]);
+    const candidate = [...head, ...keptGroups.flat()];
+    if (estimatePayloadTokens(estimatePayload(candidate)) > budgetTokens) {
+      keptGroups.shift();
+      break;
+    }
+  }
+
+  if (keptGroups.length === 0) {
+    keptGroups.push(groupedTail[groupedTail.length - 1]);
+  }
+
+  return [...head, ...keptGroups.flat()];
+}

@@ -1,10 +1,11 @@
 import { DEFAULT_CONFIG, validateConfig } from "./shared/config.js";
 import { chromeStorageAdapter } from "./shared/chromeStorageAdapter.js";
-import { ChatHistoryRepository, ConfigRepository, AgentHistoryRepository, XBlockedAccountRepository } from "./shared/storage.js";
+import { ChatHistoryRepository, ConfigRepository, AgentHistoryRepository, XBlockedAccountRepository, SiteActionMemoryRepository } from "./shared/storage.js";
 import { isRuntimeMessage } from "./shared/messageGuards.js";
 import {
   requestChatCompletion,
-  requestChatCompletionStream
+  requestChatCompletionStream,
+  requestVisionChatCompletion
 } from "./shared/llmClient.js";
 import { runAgentLoop } from "./shared/agentLoop.js";
 import type { AgentProgressEvent, AgentRunConfig, AgentSession, ToolResult } from "./shared/agentTypes.js";
@@ -548,6 +549,62 @@ function parseXAccountRiskDecision(content: string): XAccountRiskDecision {
   };
 }
 
+function buildScreenshotAnalysisPrompt(input: {
+  userPrompt: string;
+  pageTitle?: string;
+  pageUrl?: string;
+  focusHint?: string;
+}): string {
+  const lines = [
+    "You are analyzing a browser screenshot.",
+    "Describe only what is visible in the screenshot and answer the user's request concisely.",
+    "If some requested detail is not visible, say it is not visible instead of guessing."
+  ];
+
+  if (input.pageTitle) {
+    lines.push(`Page title: ${input.pageTitle}`);
+  }
+  if (input.pageUrl) {
+    lines.push(`Page URL: ${input.pageUrl}`);
+  }
+  if (input.focusHint) {
+    lines.push(`Focus hint: ${input.focusHint}`);
+  }
+
+  lines.push(`User request: ${input.userPrompt.trim()}`);
+  return lines.join("\n\n");
+}
+
+async function cropImageDataUrl(input: {
+  imageDataUrl: string;
+  rect: { left: number; top: number; width: number; height: number };
+}): Promise<string> {
+  const response = await fetch(input.imageDataUrl);
+  const blob = await response.blob();
+  const bitmap = await createImageBitmap(blob);
+
+  const left = Math.max(0, Math.floor(input.rect.left));
+  const top = Math.max(0, Math.floor(input.rect.top));
+  const width = Math.max(1, Math.floor(input.rect.width));
+  const height = Math.max(1, Math.floor(input.rect.height));
+  const cropWidth = Math.min(width, Math.max(1, bitmap.width - left));
+  const cropHeight = Math.min(height, Math.max(1, bitmap.height - top));
+
+  const canvas = new OffscreenCanvas(cropWidth, cropHeight);
+  const context = canvas.getContext("2d");
+  if (!context) {
+    throw new Error("OffscreenCanvas 2d context is unavailable");
+  }
+  context.drawImage(bitmap, left, top, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
+  const croppedBlob = await canvas.convertToBlob({ type: "image/png" });
+  const bytes = new Uint8Array(await croppedBlob.arrayBuffer());
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return `data:image/png;base64,${btoa(binary)}`;
+}
+
 function parseTranslationResponse(content: string, expectedCount: number): string[] {
   const trimmed = content.trim();
   let parsed: unknown;
@@ -756,6 +813,7 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
   const chatRepo = new ChatHistoryRepository(storage);
   const agentRepo = new AgentHistoryRepository(storage);
   const xBlockedAccountRepo = new XBlockedAccountRepository(storage);
+  const siteActionMemoryRepo = new SiteActionMemoryRepository(storage);
   const invokeLLM = deps.invokeLLM ?? requestChatCompletion;
   const invokeLLMStream = deps.invokeLLMStream ?? requestChatCompletionStream;
   const runAgent = deps.runAgent ?? runAgentLoop;
@@ -1263,6 +1321,175 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
       };
       return { toolCallId: "", toolName, output: JSON.stringify(info), isError: false };
+    }
+
+    if (toolName === "analyze_page_screenshot") {
+      const userPrompt = typeof args.prompt === "string" && args.prompt.trim()
+        ? args.prompt.trim()
+        : "请识别这张网页截图的主要内容，并简要总结关键信息。";
+      const selector = typeof args.selector === "string" && args.selector.trim()
+        ? args.selector.trim()
+        : "";
+      const selectorIndex = typeof args.index === "number" ? args.index : 0;
+
+      if (!activeConfig.baseUrl || !activeConfig.apiKey || !activeConfig.model) {
+        return { toolCallId: "", toolName, output: "Error: LLM config is incomplete", isError: true };
+      }
+      if (typeof chrome === "undefined" || !chrome.tabs?.get || !chrome.tabs?.captureVisibleTab) {
+        return { toolCallId: "", toolName, output: "Error: chrome.tabs screenshot API not available", isError: true };
+      }
+
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        const screenshotDataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+        let focusHint = "";
+
+        if (selector) {
+          try {
+            const rectResponse = await sendTabMessage(tabId, {
+              type: "AGENT_TOOL_EXECUTE",
+              payload: {
+                toolName: "get_element_rect",
+                arguments: {
+                  selector,
+                  index: selectorIndex
+                }
+              }
+            }) as { ok?: boolean; data?: string } | undefined;
+            if (rectResponse?.ok && typeof rectResponse.data === "string") {
+              focusHint = `Focus on selector ${selector}[${selectorIndex}] with metadata: ${rectResponse.data}`;
+            } else {
+              focusHint = `Focus on selector ${selector}[${selectorIndex}] if it is visible in the screenshot.`;
+            }
+          } catch {
+            focusHint = `Focus on selector ${selector}[${selectorIndex}] if it is visible in the screenshot.`;
+          }
+        }
+
+        const content = await requestVisionChatCompletion({
+          config: {
+            ...activeConfig,
+            maxTokens: Math.min(activeConfig.maxTokens, 1024),
+            agentMaxTokens: Math.min(activeConfig.agentMaxTokens, 1024)
+          },
+          prompt: buildScreenshotAnalysisPrompt({
+            userPrompt,
+            pageTitle: tab.title,
+            pageUrl: tab.url,
+            focusHint
+          }),
+          imageDataUrl: screenshotDataUrl,
+          systemPrompt: "You are a precise browser screenshot analyst.",
+          bodyExtras: getChatThinkingRequestBodyExtras(activeConfig, false)
+        });
+
+        return { toolCallId: "", toolName, output: content, isError: false };
+      } catch (error) {
+        return {
+          toolCallId: "",
+          toolName,
+          output: `Analyze page screenshot failed: ${error instanceof Error ? error.message : String(error)}`,
+          isError: true
+        };
+      }
+    }
+
+    if (toolName === "analyze_element_screenshot") {
+      const selector = typeof args.selector === "string" && args.selector.trim() ? args.selector.trim() : "";
+      const selectorIndex = typeof args.index === "number" ? args.index : 0;
+      const userPrompt = typeof args.prompt === "string" && args.prompt.trim()
+        ? args.prompt.trim()
+        : "请识别这个网页元素截图的主要内容，并简要总结关键信息。";
+
+      if (!selector) {
+        return { toolCallId: "", toolName, output: "Error: selector is required", isError: true };
+      }
+      if (!activeConfig.baseUrl || !activeConfig.apiKey || !activeConfig.model) {
+        return { toolCallId: "", toolName, output: "Error: LLM config is incomplete", isError: true };
+      }
+      if (typeof chrome === "undefined" || !chrome.tabs?.get || !chrome.tabs?.captureVisibleTab) {
+        return { toolCallId: "", toolName, output: "Error: chrome.tabs screenshot API not available", isError: true };
+      }
+
+      try {
+        const rectResponse = await sendTabMessage(tabId, {
+          type: "AGENT_TOOL_EXECUTE",
+          payload: {
+            toolName: "get_element_rect",
+            arguments: {
+              selector,
+              index: selectorIndex
+            }
+          }
+        }) as { ok?: boolean; data?: string } | undefined;
+        if (!rectResponse?.ok || typeof rectResponse.data !== "string") {
+          throw new Error(`Failed to resolve element rect for ${selector}[${selectorIndex}]`);
+        }
+
+        const rectPayload = JSON.parse(rectResponse.data) as {
+          rect?: { left?: number; top?: number; width?: number; height?: number };
+          viewport?: { width?: number; height?: number; devicePixelRatio?: number };
+          text?: string;
+          tagName?: string;
+        };
+        const rect = rectPayload.rect;
+        if (
+          !rect ||
+          typeof rect.left !== "number" ||
+          typeof rect.top !== "number" ||
+          typeof rect.width !== "number" ||
+          typeof rect.height !== "number"
+        ) {
+          throw new Error("Element rect response is invalid");
+        }
+
+        const tab = await chrome.tabs.get(tabId);
+        const screenshotDataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+        const viewportWidth = typeof rectPayload.viewport?.width === "number" && rectPayload.viewport.width > 0
+          ? rectPayload.viewport.width
+          : null;
+        const viewportHeight = typeof rectPayload.viewport?.height === "number" && rectPayload.viewport.height > 0
+          ? rectPayload.viewport.height
+          : null;
+        const dpr = typeof rectPayload.viewport?.devicePixelRatio === "number" && rectPayload.viewport.devicePixelRatio > 0
+          ? rectPayload.viewport.devicePixelRatio
+          : 1;
+        const croppedDataUrl = await cropImageDataUrl({
+          imageDataUrl: screenshotDataUrl,
+          rect: {
+            left: rect.left * dpr,
+            top: rect.top * dpr,
+            width: rect.width * dpr,
+            height: rect.height * dpr
+          }
+        });
+
+        const content = await requestVisionChatCompletion({
+          config: {
+            ...activeConfig,
+            maxTokens: Math.min(activeConfig.maxTokens, 1024),
+            agentMaxTokens: Math.min(activeConfig.agentMaxTokens, 1024)
+          },
+          prompt: buildScreenshotAnalysisPrompt({
+            userPrompt,
+            pageTitle: tab.title,
+            pageUrl: tab.url,
+            focusHint: `Element ${selector}[${selectorIndex}] <${rectPayload.tagName ?? "unknown"}> text preview: ${rectPayload.text ?? ""}; viewport=${viewportWidth ?? "unknown"}x${viewportHeight ?? "unknown"}; dpr=${dpr}`
+          }),
+          imageDataUrl: croppedDataUrl,
+          systemPrompt: "You are a precise browser screenshot analyst.",
+          bodyExtras: getChatThinkingRequestBodyExtras(activeConfig, false)
+        });
+
+        return { toolCallId: "", toolName, output: content, isError: false };
+      } catch (error) {
+        return {
+          toolCallId: "",
+          toolName,
+          output: `Analyze element screenshot failed: ${error instanceof Error ? error.message : String(error)}`,
+          isError: true
+        };
+      }
     }
 
     // ── Skill Tools ──
@@ -2613,6 +2840,64 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
         return;
       }
 
+      if (message.type === "GET_SITE_ACTION_MEMORIES") {
+        const payload = message.payload as {
+          host?: string;
+          query?: string;
+          role?: string;
+          action?: "click";
+          limit?: number;
+        } | undefined;
+        if (!payload?.host || !payload?.query) {
+          sendResponse({ ok: false, errors: ["host and query are required"] });
+          return;
+        }
+        try {
+          const matches = await siteActionMemoryRepo.findMatches({
+            host: payload.host,
+            query: payload.query,
+            role: payload.role,
+            action: payload.action,
+            limit: payload.limit
+          });
+          sendResponse({ ok: true, data: matches });
+        } catch (error) {
+          sendResponse({ ok: false, errors: [error instanceof Error ? error.message : "Failed to load site action memories"] });
+        }
+        return;
+      }
+
+      if (message.type === "RECORD_SITE_ACTION_MEMORY") {
+        const payload = message.payload as {
+          host?: string;
+          query?: string;
+          role?: string;
+          action?: "click";
+          selector?: string;
+          tagName?: string;
+          label?: string;
+        } | undefined;
+        if (!payload?.host || !payload?.query || !payload?.selector) {
+          sendResponse({ ok: false, errors: ["host, query and selector are required"] });
+          return;
+        }
+        try {
+          const entry = await siteActionMemoryRepo.recordSuccess({
+            host: payload.host,
+            query: payload.query,
+            role: payload.role,
+            action: payload.action,
+            selector: payload.selector,
+            tagName: payload.tagName,
+            label: payload.label
+          });
+          sendResponse({ ok: true, data: entry });
+        } catch (error) {
+          sendResponse({ ok: false, errors: [error instanceof Error ? error.message : "Failed to record site action memory"] });
+        }
+        return;
+      }
+
       if (message.type === "IMPORT_MEMORIES") {
         const payload = message.payload as { memories?: unknown[] } | undefined;
         if (!Array.isArray(payload?.memories)) {
@@ -2787,6 +3072,7 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
           const content = await invokeLLM({
             config: message.payload.config,
             messages: message.payload.messages,
+            referenceContext: message.payload.referenceContext,
             pageContext: message.payload.pageContext,
             bodyExtras: getChatThinkingRequestBodyExtras(
               message.payload.config,
@@ -2814,6 +3100,7 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
           for await (const chunk of invokeLLMStream({
             config: message.payload.config,
             messages: message.payload.messages,
+            referenceContext: message.payload.referenceContext,
             pageContext: message.payload.pageContext,
             bodyExtras: getChatThinkingRequestBodyExtras(
               message.payload.config,
