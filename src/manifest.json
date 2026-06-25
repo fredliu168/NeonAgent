@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
-  "name": "NeonAgent v0.1.19",
-  "version": "0.1.19",
+  "name": "NeonAgent v0.1.20",
+  "version": "0.1.20",
   "description": "A personal AI assistant and translation companion in your browser",
   "icons": {
     "16": "images/icon-16.png",

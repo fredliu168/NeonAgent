@@ -1,3 +1,5 @@
+import { sanitizeExamStemText } from "./shared/examQuestionText.js";
+
 type FeatureFlags = {
   unlockContextMenu: boolean;
   blockVisibilityDetection: boolean;
@@ -584,6 +586,28 @@ function hasInteractiveOptionNodes(node: HTMLElement): boolean {
   ).length >= 2;
 }
 
+function hasExamQuestionSignals(node: HTMLElement): boolean {
+  const text = normalizeText(node.innerText || "");
+  if (text.length < 8 || text.length > 8000) {
+    return false;
+  }
+
+  const hasOptionNodes = node.querySelectorAll(
+    ".question-attrs-wrap .a-radio, .question-attrs-wrap .a-checkbox, [data-option], [class*='option' i], .answer-item, li, label"
+  ).length >= 2 || hasInteractiveOptionNodes(node);
+  const hasQuestionStem =
+    /(?:^|\s)(?:第?\s*)?[0-9]{1,3}\s*[.、)）:：-]\s*/.test(text) ||
+    /(?:单选|多选|判断|题目|请选择|以下|下列)/.test(text);
+
+  return hasOptionNodes && (hasQuestionStem || countOptionMarkers(text) >= 2);
+}
+
+function dedupeExamQuestionRoots(nodes: HTMLElement[]): HTMLElement[] {
+  return nodes.filter(
+    (node) => !nodes.some((other) => other !== node && node.contains(other) && hasExamQuestionSignals(other))
+  );
+}
+
 function resolveExamQuestionRoots(): HTMLElement[] {
   const explicit = Array.from(
     document.querySelectorAll<HTMLElement>(
@@ -602,7 +626,6 @@ function resolveExamQuestionRoots(): HTMLElement[] {
         '[class*="subject" i]',
         '[class*="problem" i]',
         '[class*="quiz" i]',
-        '[class*="exam" i]',
         '[class*="ques" i]'
       ].join(",")
     )
@@ -619,17 +642,8 @@ function resolveExamQuestionRoots(): HTMLElement[] {
       ) && (countOptionMarkers(text) >= 2 || hasInteractiveOptionNodes(node));
     });
 
-  return uniqueElements([...explicit, ...generic, ...textLike])
-    .filter((node) => {
-      const text = normalizeText(node.innerText || "");
-      if (text.length < 8 || text.length > 8000) {
-        return false;
-      }
-      const hasOptionNodes = node.querySelectorAll(
-        ".question-attrs-wrap .a-radio, .question-attrs-wrap .a-checkbox, [data-option], [class*='option' i], .answer-item, li, label"
-      ).length >= 2 || hasInteractiveOptionNodes(node);
-      return hasOptionNodes || countOptionMarkers(text) >= 2;
-    })
+  return dedupeExamQuestionRoots(uniqueElements([...explicit, ...generic, ...textLike]))
+    .filter((node) => hasExamQuestionSignals(node))
     .slice(0, 60);
 }
 
@@ -688,28 +702,8 @@ function countOptionMarkers(rawText: string): number {
   return Array.from(normalizeText(rawText).matchAll(/(?:^|\s)[A-H](?:[.、:)）]|\s+)/gi)).length;
 }
 
-function cleanExamStem(rawText: string): string {
-  let text = normalizeText(rawText);
-
-  if (text.length > 220) {
-    const candidates = Array.from(text.matchAll(/(?:^|\s)\d{1,3}\s+([^\d\s][\s\S]*)/g))
-      .map((match) => normalizeText(match[1] ?? ""))
-      .filter((candidate) => /[\u4e00-\u9fffA-Za-z]/.test(candidate));
-    const last = candidates.at(-1);
-    if (last) {
-      text = last;
-    }
-  }
-
-  return normalizeText(text
-    .replace(/^\s*(?:第?\s*)?[0-9]{1,3}\s*[.、)）:：-]?\s*/, "")
-    .replace(/已完成\s*\d+\s*\/\s*\d+\s*题/gi, "")
-    .replace(/剩余[:：]?\s*\d{1,2}:\d{2}:\d{2}/gi, "")
-    .replace(/座位号[:：]?\s*\S+/gi, ""));
-}
-
 function stripQuestionNumber(rawText: string): string {
-  return cleanExamStem(rawText);
+  return sanitizeExamStemText(rawText);
 }
 
 function collectExamQuestionsFromText(rawText: string): ExamQuestion[] {

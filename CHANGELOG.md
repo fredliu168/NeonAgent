@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is loosely based on Keep a Changelog, with versions tracked alongside Git tags such as `v0.1.2`.
 
+## [0.1.20] - 2026-06-25
+
+### Fixed
+- Fixed one-click exam solving question extraction so exam shell text such as `本卷共...`、`已答/未答`、`我要交卷`、`正在作答`、`本题分数` and `待检查` is no longer misidentified as question stems.
+- Fixed exam-root detection so outer exam containers are skipped when they only wrap real question blocks, reducing duplicate and polluted extracted questions.
+- Added a regression test for noisy exam-title/stem cleanup to keep future extraction changes stable.
+
 ## [0.1.19] - 2026-06-25
 
 ### Added
