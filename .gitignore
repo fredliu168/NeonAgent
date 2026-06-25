@@ -1,5 +1,6 @@
 node_modules
 dist
+dist.zip
 coverage
 .DS_Store
 **/.DS_Store
