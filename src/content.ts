@@ -4034,11 +4034,8 @@ async function agentSmartClick(args: Record<string, unknown>): Promise<string> {
   if (memoryMatch?.selector) {
     const rememberedElement = tryResolveElementBySelector(memoryMatch.selector);
     if (rememberedElement && (args.includeHidden === true || isElementVisible(rememberedElement))) {
-      const anchor = rememberedElement.closest("a");
-      if (anchor && anchor.getAttribute("target") === "_blank") {
-        anchor.removeAttribute("target");
-      }
-      rememberedElement.click();
+      neutralizeAnchorBlankTarget(rememberedElement);
+      dispatchElementClickSequence(rememberedElement);
       void recordSiteActionMemory({
         host: location.hostname,
         query,
@@ -4077,12 +4074,8 @@ async function agentSmartClick(args: Record<string, unknown>): Promise<string> {
   }
 
   const target = ranked.matches[index];
-  const anchor = target.element.closest("a");
-  if (anchor && anchor.getAttribute("target") === "_blank") {
-    anchor.removeAttribute("target");
-  }
-
-  target.element.click();
+  neutralizeAnchorBlankTarget(target.element);
+  dispatchElementClickSequence(target.element);
   void recordSiteActionMemory({
     host: location.hostname,
     query,
@@ -4565,6 +4558,45 @@ function dispatchMousePhase(
   return liveTarget;
 }
 
+function dispatchElementClickSequence(
+  element: HTMLElement,
+  button = 0
+): { target: EventTarget; clientX: number; clientY: number } {
+  const rect = element.getBoundingClientRect();
+  const clientX = rect.left + (rect.width / 2);
+  const clientY = rect.top + (rect.height / 2);
+  const buttons = getCanvasButtonMask(button);
+  element.focus?.();
+  dispatchMousePhase("move", clientX, clientY, button, buttons, element);
+  const liveTarget = dispatchMousePhase("down", clientX, clientY, button, buttons, element);
+  dispatchMousePhase("up", clientX, clientY, button, 0, liveTarget);
+
+  const clickInit: MouseEventInit = {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    clientX,
+    clientY,
+    button,
+    buttons: 0,
+    detail: 1
+  };
+  if (typeof PointerEvent === "function") {
+    liveTarget.dispatchEvent(new PointerEvent("pointermove", clickInit));
+  }
+  liveTarget.dispatchEvent(new MouseEvent("click", clickInit));
+  document.dispatchEvent(new MouseEvent("click", clickInit));
+
+  return { target: liveTarget, clientX, clientY };
+}
+
+function neutralizeAnchorBlankTarget(element: HTMLElement): void {
+  const anchor = element.closest("a");
+  if (anchor && anchor.getAttribute("target") === "_blank") {
+    anchor.removeAttribute("target");
+  }
+}
+
 async function dispatchDragSequence(
   source: HTMLElement,
   startClientX: number,
@@ -4823,14 +4855,8 @@ function agentClickElement(args: Record<string, unknown>): string {
   if (index >= elements.length) return `Index ${index} out of range (found ${elements.length})`;
 
   const el = elements[index];
-  
-  // Prevent opening new tabs which causes the agent to lose context
-  const anchor = el.closest("a");
-  if (anchor && anchor.getAttribute("target") === "_blank") {
-    anchor.removeAttribute("target");
-  }
-
-  el.click();
+  neutralizeAnchorBlankTarget(el);
+  dispatchElementClickSequence(el);
   const tag = el.tagName.toLowerCase();
   const text = (el.innerText || "").slice(0, 50).trim();
   return `Clicked <${tag}> ${text ? `"${text}"` : `at index ${index}`}`;
