@@ -520,7 +520,8 @@ export const DEFAULT_CONFIG: LLMConfig = {
   localCommandToken: "",
   apiProviders: createDefaultApiProviders(),
   activeApiProviderId: CUSTOM_API_PROVIDER_ID,
-  thinkingFormat: "field"
+  thinkingFormat: "field",
+  solveButtonUnlocked: false
 };
 
 export function validateConfig(input: LLMConfig): ValidationResult {

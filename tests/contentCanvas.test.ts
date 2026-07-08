@@ -43,6 +43,7 @@ type MockElement = {
   appendChild?: ReturnType<typeof vi.fn>;
   click?: ReturnType<typeof vi.fn>;
   querySelector?: ReturnType<typeof vi.fn>;
+  querySelectorAll?: ReturnType<typeof vi.fn>;
   setAttribute: (name: string, value: string) => void;
   getAttribute: (name: string) => string | null;
   hasAttribute: (name: string) => boolean;
@@ -74,7 +75,11 @@ describe("content canvas tools", () => {
   let registeredHandler: RegisteredHandler | undefined;
   let canvas: MockCanvas;
   let paragraph: MockElement;
+  let questionTypeItem: MockElement;
   let container: MockElement;
+  let textarea: MockElement;
+  let sendButton: MockElement;
+  let form: MockElement;
   let insertedHosts: MockElement[];
   let mutationObservers: Array<{ observe: ReturnType<typeof vi.fn>; disconnect: ReturnType<typeof vi.fn> }>;
 
@@ -133,6 +138,39 @@ describe("content canvas tools", () => {
       })
     };
 
+    questionTypeItem = {
+      tagName: "DIV",
+      id: "",
+      className: "question-type-item",
+      innerText: "单选题\n示例内容",
+      textContent: "单选题 示例内容",
+      style: {},
+      isConnected: true,
+      dataset: {},
+      __attrs: new Map([
+        ["data-kind", "single"]
+      ]),
+      focus: vi.fn(),
+      dispatchEvent: vi.fn(() => true),
+      getBoundingClientRect: () => ({ left: 60, top: 80, width: 240, height: 48, bottom: 128 }),
+      closest: vi.fn(() => null),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      setAttribute(name: string, value: string) {
+        this.__attrs.set(name, value);
+      },
+      getAttribute(name: string) {
+        return this.__attrs.get(name) ?? null;
+      },
+      hasAttribute(name: string) {
+        return this.__attrs.has(name);
+      },
+      removeAttribute(name: string) {
+        this.__attrs.delete(name);
+      },
+      insertAdjacentElement: vi.fn()
+    };
+
     container = {
       tagName: "DIV",
       id: "",
@@ -166,6 +204,99 @@ describe("content canvas tools", () => {
       })
     };
 
+    sendButton = {
+      tagName: "BUTTON",
+      id: "send_button",
+      className: "",
+      innerText: "发送",
+      textContent: "发送",
+      style: {},
+      isConnected: true,
+      dataset: {},
+      __attrs: new Map(),
+      focus: vi.fn(),
+      dispatchEvent: vi.fn(() => true),
+      getBoundingClientRect: () => ({ left: 100, top: 120, width: 80, height: 32, bottom: 152 }),
+      closest: vi.fn(() => null),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      setAttribute(name: string, value: string) {
+        this.__attrs.set(name, value);
+      },
+      getAttribute(name: string) {
+        return this.__attrs.get(name) ?? null;
+      },
+      hasAttribute(name: string) {
+        return this.__attrs.has(name);
+      },
+      removeAttribute(name: string) {
+        this.__attrs.delete(name);
+      },
+      insertAdjacentElement: vi.fn()
+    };
+
+    form = {
+      tagName: "FORM",
+      id: "reply_form",
+      className: "",
+      innerText: "回复 发送",
+      textContent: "回复 发送",
+      style: {},
+      isConnected: true,
+      dataset: {},
+      __attrs: new Map(),
+      focus: vi.fn(),
+      dispatchEvent: vi.fn(() => true),
+      querySelectorAll: vi.fn(() => [sendButton]),
+      closest: vi.fn(() => null),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      setAttribute(name: string, value: string) {
+        this.__attrs.set(name, value);
+      },
+      getAttribute(name: string) {
+        return this.__attrs.get(name) ?? null;
+      },
+      hasAttribute(name: string) {
+        return this.__attrs.has(name);
+      },
+      removeAttribute(name: string) {
+        this.__attrs.delete(name);
+      },
+      insertAdjacentElement: vi.fn()
+    };
+
+    textarea = {
+      tagName: "TEXTAREA",
+      id: "reply_textarea",
+      className: "",
+      innerText: "",
+      textContent: "",
+      style: {},
+      isConnected: true,
+      dataset: {},
+      __attrs: new Map(),
+      focus: vi.fn(),
+      dispatchEvent: vi.fn(() => true),
+      getBoundingClientRect: () => ({ left: 40, top: 60, width: 300, height: 80, bottom: 140 }),
+      closest: vi.fn((selector: string) => selector === "form" ? form : null),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      setAttribute(name: string, value: string) {
+        this.__attrs.set(name, value);
+      },
+      getAttribute(name: string) {
+        return this.__attrs.get(name) ?? null;
+      },
+      hasAttribute(name: string) {
+        return this.__attrs.has(name);
+      },
+      removeAttribute(name: string) {
+        this.__attrs.delete(name);
+      },
+      insertAdjacentElement: vi.fn()
+    };
+
     class FakeMutationObserver {
       constructor(_callback: MutationCallback) {
         mutationObservers.push(this);
@@ -181,8 +312,14 @@ describe("content canvas tools", () => {
           if (selector === "canvas.board" || selector === "canvas") {
             return [canvas];
           }
+          if (selector === "textarea#reply_textarea") {
+            return [textarea];
+          }
           if (selector === "p") {
             return [paragraph];
+          }
+          if (selector === ".question-type-item") {
+            return [questionTypeItem];
           }
           if (selector === "div.ease.container") {
             return [container];
@@ -421,6 +558,83 @@ describe("content canvas tools", () => {
     expect(sendResponse).toHaveBeenCalledWith({
       ok: true,
       data: 'Clicked <p> "Hello world"'
+    });
+  });
+
+  it("collect_elements returns structured fields without executing arbitrary script", () => {
+    const sendResponse = vi.fn();
+
+    registeredHandler?.(
+      {
+        type: "AGENT_TOOL_EXECUTE",
+        payload: {
+          toolName: "collect_elements",
+          arguments: {
+            selector: ".question-type-item",
+            fields: ["text", "className", "attributes", "rect", "visible"],
+            limit: 10
+          }
+        }
+      },
+      {},
+      sendResponse
+    );
+
+    expect(sendResponse).toHaveBeenCalledWith({
+      ok: true,
+      data: expect.stringContaining("\"count\": 1")
+    });
+    const payload = JSON.parse(sendResponse.mock.calls[0][0].data as string) as {
+      items: Array<Record<string, unknown>>;
+    };
+    expect(payload.items[0]).toMatchObject({
+      className: "question-type-item",
+      text: "单选题 示例内容",
+      visible: true
+    });
+    expect(payload.items[0].attributes).toMatchObject({
+      "data-kind": "single"
+    });
+    expect(payload.items[0].rect).toMatchObject({
+      left: 60,
+      top: 80,
+      width: 240,
+      height: 48
+    });
+  });
+
+  it("submit_nearby_form_action clicks the nearby send button for a reply textarea", () => {
+    const sendResponse = vi.fn();
+
+    registeredHandler?.(
+      {
+        type: "AGENT_TOOL_EXECUTE",
+        payload: {
+          toolName: "submit_nearby_form_action",
+          arguments: {
+            selector: "textarea#reply_textarea",
+            actionHint: "发送 回复"
+          }
+        }
+      },
+      {},
+      sendResponse
+    );
+
+    const dispatchedTypes = sendButton.dispatchEvent?.mock.calls.map(([event]) => event.type);
+    expect(dispatchedTypes).toEqual([
+      "pointermove",
+      "mousemove",
+      "pointerdown",
+      "mousedown",
+      "pointerup",
+      "mouseup",
+      "pointermove",
+      "click"
+    ]);
+    expect(sendResponse).toHaveBeenCalledWith({
+      ok: true,
+      data: expect.stringContaining("\"method\":\"nearby_click\"")
     });
   });
 

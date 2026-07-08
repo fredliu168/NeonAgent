@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is loosely based on Keep a Changelog, with versions tracked alongside Git tags such as `v0.1.2`.
 
+## [0.1.21] - 2026-07-08
+
+### Added
+- Added a secret-code unlock control in the settings page for the one-click solve button (⚡). The solve button is hidden by default and only appears after entering the correct code (`1122`). Entering the code again hides the button. The unlock state is persisted in config.
+- Added `solveButtonUnlocked` field to `LLMConfig` to persist the unlock state across browser sessions.
+
+### Changed
+- Improved agent interactive-element lookup with a cached DOM snapshot, stricter interactive heuristics, associated-label matching, and more stable ancestor-aware selectors inspired by page-agent's indexed DOM approach.
+- Improved agent click reliability by scrolling targets into view, hit-testing the deepest clickable child at the pointer coordinates, and triggering native `.click()` activation after synthetic pointer events.
+- Added page-agent-style interaction feedback for agent actions, including target highlight boxes and a visible virtual cursor/click pulse during button clicks and mouse actions.
+- Updated page analysis flow so `find_interactive_elements` first highlights relevant button candidates on the page, and screenshot analysis previews a provided target selector before capture.
+- Added `collect_elements`, a CSP-safe structured DOM collection tool for extracting list items, attributes, text, visibility, and rect data without using `unsafe-eval`.
+- Updated the agent execution protocol to explicitly plan before tool use, split work into sub-tasks, verify each step with completion signals, and re-plan when a task stalls or fails.
+
+### Removed
+- Hidden the "x.com 自动拉黑营销/色情号" toggle, the "拉黑" resource panel, and the X blocked-accounts panel from the UI. The underlying config field is retained but no longer exposed.
+
 ## [0.1.20] - 2026-06-25
 
 ### Fixed

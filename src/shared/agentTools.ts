@@ -69,9 +69,44 @@ export const AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: "function",
     function: {
+      name: "collect_elements",
+      description:
+        "按 CSS 选择器批量收集页面元素的结构化信息，不执行任意脚本，因此不会受到页面 CSP 的 unsafe-eval 限制。适合获取列表项、题目块、按钮集合的文本、属性、坐标等字段。若结果已经给出可操作的 index、id、name、value 或 attributes，下一步应改用 click_element、set_radio、set_checkbox、type_text、smart_click 等执行工具，而不是对同一 selector 重复 collect。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "CSS 选择器"
+          },
+          fields: {
+            type: "array",
+            description: "要返回的字段列表；默认 text。支持 text, html, tagName, id, className, value, href, attributes, rect, visible",
+            items: {
+              type: "string",
+              enum: ["text", "html", "tagName", "id", "className", "value", "href", "attributes", "rect", "visible"]
+            }
+          },
+          limit: {
+            type: "integer",
+            description: "最多返回多少个元素，默认 20"
+          },
+          maxTextLength: {
+            type: "integer",
+            description: "text/html/value 等字符串字段的最大长度，默认 1000"
+          }
+        },
+        required: ["selector"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
       name: "find_interactive_elements",
       description:
-        "按文本、aria-label、title、placeholder、data-testid 等语义信息查找页面上的按钮、链接、输入框、菜单项等交互元素，并按相关度排序返回。适合先定位“提交”“保存”“下一步”这类按钮，再决定后续操作。",
+        "按文本、aria-label、title、placeholder、data-testid 等语义信息查找页面上的按钮、链接、输入框、菜单项等交互元素，并按相关度排序返回。调用时会在页面上临时高亮最相关的候选按钮，适合先定位“提交”“保存”“下一步”这类按钮，再决定后续操作。",
       parameters: {
         type: "object",
         properties: {
@@ -154,6 +189,37 @@ export const AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
           index: {
             type: "integer",
             description: "匹配到多个元素时的索引（从 0 开始），默认 0"
+          }
+        },
+        required: ["selector"],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "submit_nearby_form_action",
+      description:
+        "围绕某个输入框、textarea 或表单上下文，自动查找并执行附近的“发送 / 回复 / 提交 / 确认”动作。适合邮件回复、评论发送、表单提交等场景；找不到明显按钮时会尝试常见快捷键和表单提交。",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: {
+            type: "string",
+            description: "输入框、textarea 或表单附近元素的 CSS 选择器"
+          },
+          index: {
+            type: "integer",
+            description: "匹配多个元素时的索引（从 0 开始），默认 0"
+          },
+          actionHint: {
+            type: "string",
+            description: "可选。提交动作提示词，例如“发送”“回复”“提交”“确认”，默认自动使用发送/回复类关键词"
+          },
+          tryKeyboardShortcut: {
+            type: "boolean",
+            description: "找不到明显按钮时是否尝试 Ctrl+Enter / Meta+Enter / Enter，默认 true"
           }
         },
         required: ["selector"],
@@ -2023,9 +2089,11 @@ export const PAGE_TOOLS = new Set([
   "get_page_info",
   "read_page_content",
   "query_selector",
+  "collect_elements",
   "find_interactive_elements",
   "smart_click",
   "click_element",
+  "submit_nearby_form_action",
   "set_checkbox",
   "set_radio",
   "hover_element",
@@ -2092,7 +2160,7 @@ export const TOOL_CATEGORIES: Record<ToolCategory, string[]> = {
 };
 
 export const CORE_TOOLS = new Set([
-  "get_page_info", "read_page_content", "query_selector", "find_interactive_elements", "smart_click", "click_element",
+  "get_page_info", "read_page_content", "query_selector", "collect_elements", "find_interactive_elements", "smart_click", "click_element", "submit_nearby_form_action",
   "set_checkbox", "set_radio", "hover_element", "get_element_rect", "mouse_down", "mouse_move", "mouse_up", "drag_element",
   "type_text", "upload_file", "wait_for_element", "wait_for_disappear", "wait_for_text", "wait_for_url", "navigate", "analyze_page_screenshot", "analyze_element_screenshot", "scroll_page", "scroll_element", "extract_table", "get_console_logs", "execute_script",
   "inspect_visibility_detection", "press_key", "get_form_data", "select_option", "get_current_time", "load_tool_category", "translate_current_page"

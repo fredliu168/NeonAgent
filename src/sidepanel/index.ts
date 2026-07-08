@@ -81,7 +81,7 @@ const aggressiveVisibilityBypassInput = byId<HTMLInputElement>("aggressiveVisibi
 const blockFullscreenRequestsInput = byId<HTMLInputElement>("blockFullscreenRequests");
 const blockDevtoolsDetectionInput = byId<HTMLInputElement>("blockDevtoolsDetection");
 const autoSolveCurrentPageInput = byId<HTMLInputElement>("autoSolveCurrentPage");
-const autoBlockXSpamAccountsInput = byId<HTMLInputElement>("autoBlockXSpamAccounts");
+const autoBlockXSpamAccountsInput = document.getElementById("autoBlockXSpamAccounts") as HTMLInputElement | null;
 const localCommandEnabledInput = byId<HTMLInputElement>("localCommandEnabled");
 const localCommandWsUrlInput = byId<HTMLInputElement>("localCommandWsUrl");
 const localCommandTokenInput = byId<HTMLInputElement>("localCommandToken");
@@ -115,6 +115,9 @@ const chatScrollToBottomBtn = byId<HTMLButtonElement>("chatScrollToBottom");
 const examStatusEl = byId<HTMLDivElement>("examStatus");
 const chatSessionsEl = byId<HTMLDivElement>("chatSessions");
 const askAndAutoFillBtn = byId<HTMLButtonElement>("askAndAutoFill");
+const unlockSolveCodeInput = byId<HTMLInputElement>("unlockSolveCode");
+const unlockSolveButtonBtn = byId<HTMLButtonElement>("unlockSolveButton");
+const unlockSolveStatusEl = byId<HTMLDivElement>("unlockSolveStatus");
 const settingsSubtabButtons = Array.from(document.querySelectorAll<HTMLButtonElement>(".settings-subtab-btn"));
 const settingsSubtabPanels = Array.from(document.querySelectorAll<HTMLElement>(".settings-subtab-panel"));
 
@@ -149,8 +152,8 @@ const memoriesListEl = byId<HTMLDivElement>("memoriesList");
 const memoryImportFileEl = byId<HTMLInputElement>("memoryImportFile");
 const tasksPanelEl = byId<HTMLDivElement>("tasksPanel");
 const tasksListEl = byId<HTMLDivElement>("tasksList");
-const xBlockedAccountsPanelEl = byId<HTMLDivElement>("xBlockedAccountsPanel");
-const xBlockedAccountsListEl = byId<HTMLDivElement>("xBlockedAccountsList");
+const xBlockedAccountsPanelEl = document.getElementById("xBlockedAccountsPanel") as HTMLDivElement | null;
+const xBlockedAccountsListEl = document.getElementById("xBlockedAccountsList") as HTMLDivElement | null;
 
 let chatState = createInitialChatState();
 let activeStreamRequestId: string | null = null;
@@ -196,6 +199,8 @@ let uploadedExcelReferenceLookupText = "";
 let uploadedExcelReferenceName = "";
 let uploadedExcelReferenceMeta = "";
 let temporarySolveStatusTimeoutId: number | null = null;
+let solveButtonUnlocked = false;
+const SOLVE_UNLOCK_SECRET_CODE = "1122";
 
 function sanitizeApiProviderForUi(provider: ApiProvider, fallbackId: string): ApiProvider {
   const sanitizeModel = (value: string): string => value.replace(/^[\s\u0000-\u001F\u007F]+|[\s\u0000-\u001F\u007F]+$/g, "");
@@ -1720,6 +1725,63 @@ function setTranslationStatus(text: string, error = false): void {
   translationStatusEl.style.color = error ? "#b91c1c" : "#047857";
 }
 
+function setUnlockSolveStatus(text: string, error = false): void {
+  unlockSolveStatusEl.textContent = text;
+  unlockSolveStatusEl.style.color = error ? "#b91c1c" : "#047857";
+}
+
+function updateSolveButtonState(): void {
+  if (solveButtonUnlocked) {
+    askAndAutoFillBtn.disabled = false;
+    askAndAutoFillBtn.style.opacity = "1";
+    askAndAutoFillBtn.title = "解题";
+    unlockSolveCodeInput.value = "";
+    unlockSolveCodeInput.disabled = false;
+    unlockSolveButtonBtn.disabled = false;
+    unlockSolveButtonBtn.textContent = "隐藏";
+    setUnlockSolveStatus("已解锁，解题功能可用。再次输入暗号可隐藏。");
+  } else {
+    askAndAutoFillBtn.disabled = true;
+    askAndAutoFillBtn.style.opacity = "0.5";
+    askAndAutoFillBtn.title = "请先输入暗号解锁";
+    unlockSolveCodeInput.disabled = false;
+    unlockSolveButtonBtn.disabled = false;
+    unlockSolveButtonBtn.textContent = "解锁";
+    setUnlockSolveStatus("");
+  }
+  syncSolveButtonVisibility();
+}
+
+function syncSolveButtonVisibility(): void {
+  const isAgentMode = agentComposerMode === "agent";
+  const shouldShow = solveButtonUnlocked && !isAgentMode;
+  askAndAutoFillBtn.hidden = !shouldShow;
+  askAndAutoFillBtn.style.display = shouldShow ? "" : "none";
+}
+
+function handleUnlockSolve(): void {
+  const code = unlockSolveCodeInput.value.trim();
+  if (!code) {
+    setUnlockSolveStatus("请输入暗号", true);
+    return;
+  }
+
+  if (code !== SOLVE_UNLOCK_SECRET_CODE) {
+    setUnlockSolveStatus("暗号错误，请重新输入", true);
+    unlockSolveCodeInput.value = "";
+    return;
+  }
+
+  solveButtonUnlocked = !solveButtonUnlocked;
+  void saveConfig(
+    solveButtonUnlocked ? "解锁成功，解题功能已启用" : "已隐藏解题功能",
+    false
+  );
+  setUnlockSolveStatus(solveButtonUnlocked ? "解锁成功！" : "已隐藏解题功能");
+  unlockSolveCodeInput.value = "";
+  updateSolveButtonState();
+}
+
 interface LocalCommandStatus {
   enabled: boolean;
   state: "disabled" | "connecting" | "connected" | "reconnecting" | "error";
@@ -2652,14 +2714,15 @@ function toConfig(): LLMConfig {
     blockFullscreenRequests: blockFullscreenRequestsInput.checked,
     blockDevtoolsDetection: blockDevtoolsDetectionInput.checked,
     autoSolveCurrentPage: autoSolveCurrentPageInput.checked,
-    autoBlockXSpamAccounts: autoBlockXSpamAccountsInput.checked,
+    autoBlockXSpamAccounts: autoBlockXSpamAccountsInput?.checked ?? false,
     enableFloatingBall: DEFAULT_CONFIG.enableFloatingBall,
     localCommandEnabled: localCommandEnabledInput.checked,
     localCommandWsUrl: localCommandWsUrlInput.value.trim() || DEFAULT_CONFIG.localCommandWsUrl,
     localCommandToken: localCommandTokenInput.value,
     thinkingFormat: (thinkingFormatInput.value as "none" | "field" | "blocks") ?? DEFAULT_CONFIG.thinkingFormat,
     apiProviders: nextProviders,
-    activeApiProviderId: activeProvider?.id ?? activeApiProviderId
+    activeApiProviderId: activeProvider?.id ?? activeApiProviderId,
+    solveButtonUnlocked
   };
 }
 
@@ -2826,11 +2889,15 @@ async function loadConfig(): Promise<void> {
   blockFullscreenRequestsInput.checked = !!config.blockFullscreenRequests;
   blockDevtoolsDetectionInput.checked = !!config.blockDevtoolsDetection;
   autoSolveCurrentPageInput.checked = !!config.autoSolveCurrentPage;
-  autoBlockXSpamAccountsInput.checked = !!config.autoBlockXSpamAccounts;
+  if (autoBlockXSpamAccountsInput) {
+    autoBlockXSpamAccountsInput.checked = !!config.autoBlockXSpamAccounts;
+  }
   localCommandEnabledInput.checked = !!config.localCommandEnabled;
   localCommandWsUrlInput.value = config.localCommandWsUrl ?? DEFAULT_CONFIG.localCommandWsUrl;
   localCommandTokenInput.value = config.localCommandToken ?? DEFAULT_CONFIG.localCommandToken;
   thinkingFormatInput.value = config.thinkingFormat ?? DEFAULT_CONFIG.thinkingFormat;
+  solveButtonUnlocked = !!config.solveButtonUnlocked;
+  updateSolveButtonState();
   updateChatContextMeter();
   updateAgentContextMeter();
   await refreshLocalCommandStatus();
@@ -3306,7 +3373,9 @@ configImportFileEl.addEventListener("change", () => {
       blockFullscreenRequestsInput.checked = !!config.blockFullscreenRequests;
       blockDevtoolsDetectionInput.checked = !!config.blockDevtoolsDetection;
       autoSolveCurrentPageInput.checked = !!config.autoSolveCurrentPage;
-      autoBlockXSpamAccountsInput.checked = !!config.autoBlockXSpamAccounts;
+      if (autoBlockXSpamAccountsInput) {
+        autoBlockXSpamAccountsInput.checked = !!config.autoBlockXSpamAccounts;
+      }
       localCommandEnabledInput.checked = !!config.localCommandEnabled;
       localCommandWsUrlInput.value = config.localCommandWsUrl ?? DEFAULT_CONFIG.localCommandWsUrl;
       localCommandTokenInput.value = config.localCommandToken ?? DEFAULT_CONFIG.localCommandToken;
@@ -3647,6 +3716,11 @@ async function askAndAutoFill(options?: { source?: "manual" | "auto" }): Promise
     return;
   }
 
+  if (!solveButtonUnlocked) {
+    setSolveStatus("解题功能未解锁，请在设置中输入暗号。");
+    return;
+  }
+
   askAndAutoFillBtn.disabled = true;
   let activeSignature = "";
   try {
@@ -3698,6 +3772,7 @@ async function askAndAutoFill(options?: { source?: "manual" | "auto" }): Promise
       inFlightAutoSolveSignatures.delete(activeSignature);
     }
     askAndAutoFillBtn.disabled = false;
+    syncSolveButtonVisibility();
   }
 }
 
@@ -3911,7 +3986,9 @@ function showAgentPanel(panel: "memories" | "skills" | "tasks" | "xblocks" | nul
   memoriesPanelEl.hidden = panel !== "memories";
   skillsPanelEl.hidden = panel !== "skills";
   tasksPanelEl.hidden = panel !== "tasks";
-  xBlockedAccountsPanelEl.hidden = panel !== "xblocks";
+  if (xBlockedAccountsPanelEl) {
+    xBlockedAccountsPanelEl.hidden = panel !== "xblocks";
+  }
   agentPanelSelect.value = panel ?? "";
 }
 
@@ -3951,9 +4028,7 @@ function renderAgentComposerMode(): void {
   agentPanelSelect.hidden = !isAgentMode;
   agentPanelSelect.disabled = !isAgentMode;
   agentPanelSelect.style.display = isAgentMode ? "" : "none";
-  askAndAutoFillBtn.hidden = isAgentMode;
-  askAndAutoFillBtn.disabled = isAgentMode;
-  askAndAutoFillBtn.style.display = isAgentMode ? "none" : "";
+  syncSolveButtonVisibility();
   chatThinkingToggleBtn.hidden = isAgentMode;
   chatThinkingToggleBtn.disabled = isAgentMode;
   chatThinkingToggleBtn.style.display = isAgentMode ? "none" : "";
@@ -3984,6 +4059,9 @@ function renderAgent(): void {
   agentMessagesEl.innerHTML = "";
 
   for (const entry of agentEntries) {
+    if (isBlankAssistantEntry(entry)) {
+      continue;
+    }
     if (entry.type === "user") {
       const bubble = document.createElement("div");
       bubble.className = "msg msg-user";
@@ -4133,6 +4211,9 @@ function handleAgentEvent(event: AgentProgressEvent): void {
   }
 
   if (event.type === "AGENT_TEXT_DELTA") {
+    if (!event.payload.delta) {
+      return;
+    }
     // Append to last assistant entry or create new
     const last = agentEntries[agentEntries.length - 1];
     if (last?.type === "assistant") {
@@ -4148,6 +4229,9 @@ function handleAgentEvent(event: AgentProgressEvent): void {
   }
 
   if (event.type === "AGENT_THINKING_DELTA") {
+    if (!event.payload.delta) {
+      return;
+    }
     const last = agentEntries[agentEntries.length - 1];
     if (last?.type === "thinking") {
       last.content += event.payload.delta;
@@ -4249,6 +4333,7 @@ function handleAgentEvent(event: AgentProgressEvent): void {
   if (event.type === "AGENT_TURN_COMPLETE") {
     agentPending = false;
     activeAgentRequestId = null;
+    pruneTrailingEmptyAssistantState();
     setAgentIterationInfo(`完成 (${event.payload.iterations} 轮迭代)`);
     renderAgent();
     void persistActiveAgentSession();
@@ -4325,6 +4410,38 @@ function getOrCreateLastAssistantRawMessage(): AgentMessage {
   };
   agentRawMessages.push(created);
   return created;
+}
+
+function isBlankAssistantEntry(entry: AgentEntry): boolean {
+  return entry.type === "assistant" && entry.content.trim().length === 0;
+}
+
+function isBlankAssistantRawMessage(message: AgentMessage): boolean {
+  return (
+    message.role === "assistant" &&
+    typeof message.content === "string" &&
+    message.content.trim().length === 0 &&
+    (message.reasoning_content ?? "").trim().length === 0 &&
+    (message.tool_calls?.length ?? 0) === 0
+  );
+}
+
+function pruneTrailingEmptyAssistantState(): void {
+  while (agentEntries.length > 0) {
+    const lastEntry = agentEntries[agentEntries.length - 1];
+    if (!isBlankAssistantEntry(lastEntry)) {
+      break;
+    }
+    agentEntries.pop();
+  }
+
+  while (agentRawMessages.length > 0) {
+    const lastMessage = agentRawMessages[agentRawMessages.length - 1];
+    if (!isBlankAssistantRawMessage(lastMessage)) {
+      break;
+    }
+    agentRawMessages.pop();
+  }
 }
 
 function syncLoadedToolCategoryFromResult(toolCallId: string, isError: boolean): void {
@@ -4421,7 +4538,7 @@ async function sendAgentMessage(): Promise<void> {
         referenceContext,
         history,
         initialLoadedToolCategories: [...agentLoadedToolCategories],
-        maxIterations: 100
+        maxIterations: 300
       }
     });
 
@@ -4694,20 +4811,25 @@ function scheduleAgentPersist(): void {
 }
 
 async function persistActiveAgentSession(): Promise<void> {
+  pruneTrailingEmptyAssistantState();
   const session = ensureActiveAgentSession();
   const now = Date.now();
   const updated: AgentSession = {
     ...session,
     title: createAgentSessionTitle(),
     updatedAt: now,
-    messages: agentRawMessages.map(cloneAgentMessage),
-    entries: agentEntries.map((e) => ({
+    messages: agentRawMessages
+      .filter((message) => !isBlankAssistantRawMessage(message))
+      .map(cloneAgentMessage),
+    entries: agentEntries
+      .filter((entry) => !isBlankAssistantEntry(entry))
+      .map((e) => ({
       type: e.type,
       content: e.content,
       timestamp: e.timestamp,
       expanded: e.expanded,
       toolCall: e.toolCall ? { ...e.toolCall } : undefined
-    })),
+      })),
     loadedToolCategories: [...agentLoadedToolCategories].sort()
   };
 
@@ -5363,6 +5485,9 @@ function formatPanelTimestamp(timestamp?: number): string {
 }
 
 async function loadXBlockedAccountsList(): Promise<void> {
+  if (!xBlockedAccountsListEl) {
+    return;
+  }
   try {
     const response = await chrome.runtime.sendMessage({ type: "LIST_X_BLOCKED_ACCOUNTS" });
     if (!response?.ok) {
@@ -5376,6 +5501,9 @@ async function loadXBlockedAccountsList(): Promise<void> {
 }
 
 function renderXBlockedAccountsList(records: XBlockedAccountSummary[]): void {
+  if (!xBlockedAccountsListEl) {
+    return;
+  }
   xBlockedAccountsListEl.innerHTML = "";
   if (records.length === 0) {
     xBlockedAccountsListEl.innerHTML = '<div style="padding:8px;color:#94a3b8;font-size:11px;text-align:center;">暂无拉黑记录</div>';
@@ -5541,7 +5669,17 @@ localCommandEnabledInput.addEventListener("change", (event) => {
   void handleFeatureSwitchChange(event.currentTarget as HTMLElement, { refreshLocalCommandStatus: true });
 });
 
-[unlockContextMenuInput, blockVisibilityDetectionInput, aggressiveVisibilityBypassInput, blockFullscreenRequestsInput, blockDevtoolsDetectionInput, autoBlockXSpamAccountsInput].forEach((input) => {
+const featureSwitchInputs: HTMLInputElement[] = [
+  unlockContextMenuInput,
+  blockVisibilityDetectionInput,
+  aggressiveVisibilityBypassInput,
+  blockFullscreenRequestsInput,
+  blockDevtoolsDetectionInput
+];
+if (autoBlockXSpamAccountsInput) {
+  featureSwitchInputs.push(autoBlockXSpamAccountsInput);
+}
+featureSwitchInputs.forEach((input) => {
   input.addEventListener("change", (event) => {
     void handleFeatureSwitchChange(event.currentTarget as HTMLElement);
   });
@@ -5812,8 +5950,22 @@ byId<HTMLButtonElement>("refreshTasks").addEventListener("click", () => {
   void loadTasksList();
 });
 
-byId<HTMLButtonElement>("refreshXBlockedAccounts").addEventListener("click", () => {
-  void loadXBlockedAccountsList();
+const refreshXBlockedAccountsBtn = document.getElementById("refreshXBlockedAccounts") as HTMLButtonElement | null;
+if (refreshXBlockedAccountsBtn) {
+  refreshXBlockedAccountsBtn.addEventListener("click", () => {
+    void loadXBlockedAccountsList();
+  });
+}
+
+unlockSolveButtonBtn.addEventListener("click", () => {
+  handleUnlockSolve();
+});
+
+unlockSolveCodeInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    handleUnlockSolve();
+  }
 });
 
 agentInput.addEventListener("keydown", (e) => {

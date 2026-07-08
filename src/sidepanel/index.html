@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>NeonAgent v0.1.20</title>
+    <title>NeonAgent v0.1.21</title>
     <style>
       /* =========== Reset & Base =========== */
       *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -2062,7 +2062,6 @@
                 <option value="memories">记忆</option>
                 <option value="skills">技能</option>
                 <option value="tasks">定时</option>
-                <option value="xblocks">拉黑</option>
               </select>
               <div id="agentModelMenuRoot" class="chat-model-stack">
                 <button id="agentModelMenuButton" type="button" class="model-menu-trigger" aria-haspopup="menu" aria-expanded="false">Model</button>
@@ -2113,13 +2112,6 @@
             <button id="refreshTasks" class="btn-secondary" style="padding:2px 8px;font-size:11px;">刷新</button>
           </div>
           <div id="tasksList" class="tasks-list"></div>
-        </div>
-        <div id="xBlockedAccountsPanel" class="skills-panel" hidden>
-          <div class="skills-header">
-            <span class="skills-title">X 拉黑记录</span>
-            <button id="refreshXBlockedAccounts" class="btn-secondary" style="padding:2px 8px;font-size:11px;">刷新</button>
-          </div>
-          <div id="xBlockedAccountsList" class="skills-list"></div>
         </div>
       </div>
     </main>
@@ -2207,7 +2199,17 @@
             </div>
             <div class="setting-hint">NeonAgent 会主动连接这个本地服务，收到 Codex/OpenClaw 命令后直接执行智能体、工具或 Skill。</div>
 
-            <div class="switch-row">
+            <div class="switch-row" style="margin-top:16px;border-top:1px solid #e2e8f0;padding-top:12px;">
+              <label style="font-weight:600;color:#1e293b;">解锁答题功能</label>
+            </div>
+            <div style="display:flex;gap:6px;margin-top:6px;">
+              <input id="unlockSolveCode" type="password" placeholder="输入解锁暗号" style="flex:1;padding:7px 10px;border:1px solid #e2e8f0;border-radius:6px;font-size:12px;" />
+              <button id="unlockSolveButton" class="btn-primary" style="padding:6px 14px;font-size:12px;white-space:nowrap;">解锁</button>
+            </div>
+            <div id="unlockSolveStatus" class="setting-hint" style="margin:4px 0 0;"></div>
+            <div class="setting-hint">输入正确的暗号后可启用解题按钮（⚡）功能。</div>
+
+            <div class="switch-row" style="margin-top:16px;border-top:1px solid #e2e8f0;padding-top:12px;">
               <label><input id="unlockContextMenu" type="checkbox" /> 解除右键限制</label>
             </div>
             <div class="setting-hint">解除右键限制可能会影响网站功能，不用时请取消。</div>
@@ -2236,11 +2238,6 @@
               <label><input id="autoSolveCurrentPage" type="checkbox" /> 当前页面自动解题</label>
             </div>
             <div class="setting-hint">勾选后自动判断当前页面是否包含题目；检测到题目时调用一键解题，并在 ask 框显示过程与答案</div>
-
-            <div class="switch-row">
-              <label><input id="autoBlockXSpamAccounts" type="checkbox" /> x.com 自动拉黑营销/色情号</label>
-            </div>
-            <div class="setting-hint">仅在 x.com / twitter.com 生效；命中高风险规则后会直接执行拉黑，请谨慎开启。</div>
 
           </div>
         </section>
@@ -2319,7 +2316,7 @@
           </section>
 
           <section class="card" style="text-align:center;color:#94a3b8;font-size:11px;">
-            <p>NeonAgent v0.1.20</p>
+            <p>NeonAgent v0.1.21</p>
             <p style="margin-top:4px;">本工具仅供学习研究使用，严禁用于违反考试规则或非法用途。</p>
           </section>
         </div>

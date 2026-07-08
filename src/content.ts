@@ -509,6 +509,22 @@ const mouseInteractionState: {
   clientY: 0,
   source: null
 };
+type AgentInteractionOverlay = {
+  root: HTMLDivElement;
+  candidateLayer: HTMLDivElement;
+  trailLayer: HTMLDivElement;
+  cursor: HTMLDivElement;
+  cursorArrow: HTMLDivElement;
+  cursorDot: HTMLDivElement;
+  cursorRipple: HTMLDivElement;
+  targetBox: HTMLDivElement;
+};
+let agentInteractionOverlay: AgentInteractionOverlay | null = null;
+let agentInteractionOverlayHideTimer: ReturnType<typeof setTimeout> | null = null;
+let agentInteractionCandidateHideTimer: ReturnType<typeof setTimeout> | null = null;
+let agentInteractionCursorX = 0;
+let agentInteractionCursorY = 0;
+let agentInteractionAnimationTimers: Array<ReturnType<typeof setTimeout>> = [];
 type ConsoleLogRecord = {
   level: "log" | "info" | "warn" | "error";
   message: string;
@@ -567,6 +583,54 @@ function normalizeExamText(input: string): string {
   return input.replace(/\s+/g, " ").trim();
 }
 
+function stripLeadingQuestionNavigator(text: string): string {
+  const patterns = [
+    /^(?:题目[:：]\s*)?(?:\d{1,3}\s+){1,40}(?=(?:\[\s*(?:单选|多选|判断|简答|综合)\s*\]|(?:单选题|多选题|判断题|简答题|综合题)\s*\[\s*\d+\s*\]|交卷))/i,
+    /^(?:\[\s*(?:单选|多选|判断|简答|综合)\s*\]\s*)?(?:\[\s*\d+\s*\]\s*)?(?:(?:单选题|多选题|判断题|简答题|综合题)\s*\[\s*\d+\s*\]\s*){2,}交卷\s*/i,
+    /^(?:[A-H][.、:)）]?\s*(?:单选题|多选题|判断题|简答题|综合题)\s*\[\s*\d+\s*\]\s*){2,}/i
+  ];
+
+  let next = text;
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const pattern of patterns) {
+      const replaced = next.replace(pattern, "");
+      if (replaced !== next) {
+        next = normalizeExamText(replaced);
+        changed = true;
+      }
+    }
+  }
+
+  return next;
+}
+
+function isQuestionNavigatorOnly(text: string): boolean {
+  const normalized = normalizeExamText(text)
+    .replace(/^题目[:：]\s*/i, "")
+    .trim();
+
+  if (!normalized) {
+    return false;
+  }
+
+  return /^(?:(?:\d{1,3}|\[\s*(?:单选|多选|判断|简答|综合)\s*\]|\[\s*\d+\s*\]|(?:单选题|多选题|判断题|简答题|综合题)\s*\[\s*\d+\s*\]|交卷|[A-H][.、:)）]?)\s*)+$/i.test(normalized);
+}
+
+function isExamUiHint(text: string): boolean {
+  const normalized = normalizeExamText(text)
+    .replace(/^题目[:：]\s*/i, "")
+    .replace(/^\[\s*(?:单选|多选|判断|简答|综合)\s*\]\s*/i, "")
+    .trim();
+
+  if (!normalized) {
+    return false;
+  }
+
+  return /(?:推荐使用微信文件传输助手|文件传输助手传输答案照片|传输答案照片到电脑|上传答案照片|拍照上传答案|扫码上传答案)/i.test(normalized);
+}
+
 function sliceFromLastQuestionMarker(text: string): string {
   const markerRegex = /(^|\s)((?:第?\s*)?\d{1,3}\s*[.、)）:：-]\s*)/g;
   let lastStart = -1;
@@ -618,16 +682,20 @@ function sanitizeExamStemText(rawText: string): string {
   }
 
   text = sliceFromLastQuestionMarker(text);
+  text = stripLeadingQuestionNavigator(text);
   text = stripLeadingExamChrome(text);
 
-  return normalizeExamText(text
+  text = normalizeExamText(text
     .replace(/^\s*(?:第?\s*)?[0-9]{1,3}\s*[.、)）:：-]?\s*/, "")
+    .replace(/^题目[:：]\s*/i, "")
     .replace(/已完成\s*\d+\s*\/\s*\d+\s*题/gi, "")
     .replace(/剩余[:：]?\s*\d{1,2}:\d{2}:\d{2}/gi, "")
     .replace(/座位号[:：]?\s*\S+/gi, "")
     .replace(/^(?:单选题|多选题|判断题)\s*/i, "")
     .replace(/^(?:本卷共|已答[:：]?|未答[:：]?|我要交卷|正在作答[:：]?)/i, "")
   );
+
+  return isQuestionNavigatorOnly(text) || isExamUiHint(text) ? "" : text;
 }
 
 function uniqueElements(nodes: HTMLElement[]): HTMLElement[] {
@@ -1805,18 +1873,7 @@ function applyExamAnswersToPage(matches: ExamAnswerMatch[]): { applied: number }
         continue;
       }
 
-      // Click the wrapper element — most exam-site frameworks handle clicks on
-      // the wrapper (.a-radio / .a-checkbox), not on the hidden inner <input>.
-      target.click();
-
-      // If the underlying input is still not checked, force it and fire events
-      // so that frameworks (Vue / React / custom) pick up the state change.
-      const input = target.querySelector<HTMLInputElement>('input[type="radio"], input[type="checkbox"]');
-      if (input && !input.checked) {
-        input.checked = true;
-        input.dispatchEvent(new Event("input", { bubbles: true }));
-        input.dispatchEvent(new Event("change", { bubbles: true }));
-      }
+      applyExamOptionInteraction(target);
 
       applied += 1;
     }
@@ -3626,6 +3683,112 @@ function agentQuerySelector(args: Record<string, unknown>): string {
   return `Found ${elements.length} element(s):\n${results.join("\n")}`;
 }
 
+function agentCollectElements(args: Record<string, unknown>): string {
+  const selector = typeof args.selector === "string" ? args.selector : "";
+  if (!selector) {
+    return "Error: selector is required";
+  }
+
+  const allowedFields = new Set([
+    "text",
+    "html",
+    "tagName",
+    "id",
+    "className",
+    "value",
+    "href",
+    "attributes",
+    "rect",
+    "visible"
+  ]);
+  const requestedFields = Array.isArray(args.fields)
+    ? args.fields.filter((field): field is string => typeof field === "string" && allowedFields.has(field))
+    : ["text"];
+  const fields = requestedFields.length > 0 ? requestedFields : ["text"];
+  const limit = typeof args.limit === "number" ? Math.max(1, Math.min(100, Math.round(args.limit))) : 20;
+  const maxTextLength = typeof args.maxTextLength === "number"
+    ? Math.max(50, Math.min(10000, Math.round(args.maxTextLength)))
+    : 1000;
+
+  const elements = Array.from(document.querySelectorAll<HTMLElement>(selector)).slice(0, limit);
+  if (elements.length === 0) {
+    return `No elements found for selector: ${selector}`;
+  }
+
+  const results = elements.map((element, index) => {
+    const item: Record<string, unknown> = { index, selector };
+
+    for (const field of fields) {
+      switch (field) {
+        case "text":
+          item.text = normalizeText(element.innerText || element.textContent || "").slice(0, maxTextLength);
+          break;
+        case "html":
+          item.html = (element.innerHTML || "").slice(0, maxTextLength);
+          break;
+        case "tagName":
+          item.tagName = element.tagName.toLowerCase();
+          break;
+        case "id":
+          item.id = element.id || "";
+          break;
+        case "className":
+          item.className = typeof element.className === "string" ? element.className : "";
+          break;
+        case "value":
+          item.value = typeof (element as HTMLInputElement).value === "string"
+            ? (element as HTMLInputElement).value.slice(0, maxTextLength)
+            : "";
+          break;
+        case "href":
+          item.href = element.getAttribute("href") || "";
+          break;
+        case "attributes":
+          item.attributes = (
+            typeof element.getAttributeNames === "function"
+              ? element.getAttributeNames()
+              : Array.from((element as unknown as { __attrs?: Map<string, string> }).__attrs?.keys?.() ?? [])
+          ).reduce<Record<string, string>>((acc, name) => {
+            const value = element.getAttribute(name) ?? "";
+            acc[name] = value.slice(0, maxTextLength);
+            return acc;
+          }, {});
+          break;
+        case "rect": {
+          const rect = element.getBoundingClientRect();
+          const left = typeof rect.left === "number" ? rect.left : 0;
+          const top = typeof rect.top === "number" ? rect.top : 0;
+          const width = typeof rect.width === "number" ? rect.width : 0;
+          const height = typeof rect.height === "number" ? rect.height : 0;
+          const right = typeof rect.right === "number" ? rect.right : left + width;
+          const bottom = typeof rect.bottom === "number" ? rect.bottom : top + height;
+          item.rect = {
+            left: Number(left.toFixed(2)),
+            top: Number(top.toFixed(2)),
+            width: Number(width.toFixed(2)),
+            height: Number(height.toFixed(2)),
+            right: Number(right.toFixed(2)),
+            bottom: Number(bottom.toFixed(2))
+          };
+          break;
+        }
+        case "visible":
+          item.visible = isElementVisible(element);
+          break;
+      }
+    }
+
+    return item;
+  });
+
+  return JSON.stringify({
+    selector,
+    count: results.length,
+    fields,
+    items: results
+  }, null, 2);
+}
+
 type InteractiveRole =
   | "any"
   | "button"
@@ -3643,6 +3806,7 @@ type InteractiveCandidate = {
   tagName: string;
   role: string;
   text: string;
+  associatedLabel: string;
   ariaLabel: string;
   title: string;
   placeholder: string;
@@ -3654,25 +3818,43 @@ type InteractiveCandidate = {
   reasons: string[];
 };
 
-const INTERACTIVE_ELEMENT_SELECTOR = [
+const INTERACTIVE_ROLE_SET = new Set([
   "button",
-  "a[href]",
-  "input:not([type='hidden'])",
-  "textarea",
-  "select",
-  "summary",
-  "[role='button']",
-  "[role='link']",
-  "[role='menuitem']",
-  "[role='option']",
-  "[role='tab']",
-  "[role='checkbox']",
-  "[role='radio']",
-  "[data-testid]",
-  "[aria-label]",
-  "[title]",
-  "[placeholder]"
-].join(", ");
+  "link",
+  "menuitem",
+  "option",
+  "tab",
+  "checkbox",
+  "radio",
+  "textbox",
+  "combobox"
+]);
+const INTERACTIVE_TAG_SET = new Set(["button", "textarea", "select", "summary", "option"]);
+const INTERACTIVE_CACHE_ATTRIBUTE_FILTER = [
+  "role",
+  "href",
+  "tabindex",
+  "disabled",
+  "aria-disabled",
+  "aria-label",
+  "aria-description",
+  "title",
+  "placeholder",
+  "value",
+  "name",
+  "data-testid",
+  "data-test",
+  "data-qa",
+  "id",
+  "class",
+  "type",
+  "for",
+  "onclick",
+  "contenteditable"
+];
+let interactiveSnapshotVersion = 0;
+let interactiveSnapshotCache: { version: number; elements: HTMLElement[] } | null = null;
+let interactiveSnapshotObserver: MutationObserver | null = null;
 
 function escapeCssIdentifier(value: string): string {
   if (typeof CSS !== "undefined" && typeof CSS.escape === "function") {
@@ -3719,8 +3901,132 @@ function inferInteractiveRole(element: HTMLElement): string {
   return tag;
 }
 
+function ensureInteractiveSnapshotObserver(): void {
+  if (interactiveSnapshotObserver || typeof MutationObserver !== "function") {
+    return;
+  }
+
+  const root = document.documentElement ?? document.body;
+  if (!root) {
+    return;
+  }
+
+  interactiveSnapshotObserver = new MutationObserver(() => {
+    interactiveSnapshotVersion += 1;
+    interactiveSnapshotCache = null;
+  });
+  interactiveSnapshotObserver.observe(root, {
+    subtree: true,
+    childList: true,
+    characterData: true,
+    attributes: true,
+    attributeFilter: INTERACTIVE_CACHE_ATTRIBUTE_FILTER
+  });
+}
+
+function hasLocatorLikeAttributes(element: HTMLElement): boolean {
+  return Boolean(
+    element.getAttribute("data-testid") ||
+    element.getAttribute("data-test") ||
+    element.getAttribute("data-qa") ||
+    element.getAttribute("aria-label") ||
+    element.getAttribute("title") ||
+    element.getAttribute("placeholder") ||
+    element.getAttribute("name")
+  );
+}
+
+function isPotentialInteractiveElement(element: HTMLElement): boolean {
+  const tag = element.tagName.toLowerCase();
+  if (tag === "input") {
+    return (element.getAttribute("type") || "text").toLowerCase() !== "hidden";
+  }
+  if (tag === "a" && element.hasAttribute("href")) {
+    return true;
+  }
+  if (INTERACTIVE_TAG_SET.has(tag)) {
+    return true;
+  }
+
+  const role = (element.getAttribute("role") || "").trim().toLowerCase();
+  if (role && INTERACTIVE_ROLE_SET.has(role)) {
+    return true;
+  }
+
+  if (element.isContentEditable) {
+    return true;
+  }
+
+  const tabindex = element.getAttribute("tabindex");
+  if (tabindex !== null && Number.parseInt(tabindex, 10) >= 0) {
+    return true;
+  }
+
+  if (typeof (element as { onclick?: unknown }).onclick === "function") {
+    return true;
+  }
+
+  return hasLocatorLikeAttributes(element) && (
+    element.hasAttribute("onclick") ||
+    (window.getComputedStyle(element).cursor === "pointer")
+  );
+}
+
+function collectInteractiveElementsSnapshot(): HTMLElement[] {
+  ensureInteractiveSnapshotObserver();
+  if (interactiveSnapshotCache?.version === interactiveSnapshotVersion) {
+    return interactiveSnapshotCache.elements;
+  }
+
+  const root = document.body ?? document.documentElement;
+  if (!root) {
+    return [];
+  }
+
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
+    acceptNode(node) {
+      if (!(node instanceof HTMLElement)) {
+        return NodeFilter.FILTER_SKIP;
+      }
+      return isPotentialInteractiveElement(node)
+        ? NodeFilter.FILTER_ACCEPT
+        : NodeFilter.FILTER_SKIP;
+    }
+  });
+
+  const elements: HTMLElement[] = [];
+  const seen = new Set<HTMLElement>();
+  let current = walker.nextNode();
+  while (current) {
+    if (current instanceof HTMLElement && !seen.has(current)) {
+      seen.add(current);
+      elements.push(current);
+    }
+    current = walker.nextNode();
+  }
+
+  interactiveSnapshotCache = { version: interactiveSnapshotVersion, elements };
+  return elements;
+}
+
+function getAssociatedLabelText(element: HTMLElement): string {
+  if (!("labels" in element) || !Array.isArray(Array.from((element as HTMLInputElement).labels || []))) {
+    const elementId = element.id.trim();
+    if (elementId) {
+      const explicitLabel = document.querySelector(`label[for="${escapeCssAttributeValue(elementId)}"]`);
+      return normalizeText(explicitLabel?.textContent || "");
+    }
+    return normalizeText(element.closest("label")?.textContent || "");
+  }
+
+  const labels = Array.from((element as HTMLInputElement).labels || []);
+  const combined = labels.map((label) => normalizeText(label.textContent || "")).filter(Boolean).join(" ");
+  return normalizeText(combined);
+}
+
 function getInteractiveTextFields(element: HTMLElement): {
   text: string;
+  associatedLabel: string;
   ariaLabel: string;
   title: string;
   placeholder: string;
@@ -3730,6 +4036,7 @@ function getInteractiveTextFields(element: HTMLElement): {
 } {
   const input = element as HTMLInputElement;
   const text = normalizeText(element.innerText || element.textContent || "");
+  const associatedLabel = normalizeText(getAssociatedLabelText(element));
   const ariaLabel = normalizeText(element.getAttribute("aria-label") || "");
   const title = normalizeText(element.getAttribute("title") || "");
   const placeholder = normalizeText(element.getAttribute("placeholder") || "");
@@ -3745,11 +4052,12 @@ function getInteractiveTextFields(element: HTMLElement): {
   const id = normalizeText(element.id || "");
   const href = normalizeText(element.getAttribute("href") || "");
   const ariaDescription = normalizeText(element.getAttribute("aria-description") || "");
-  const labels = [text, ariaLabel, title, placeholder, value, name, alt, dataTestId, id, href, ariaDescription]
+  const labels = [text, associatedLabel, ariaLabel, title, placeholder, value, name, alt, dataTestId, id, href, ariaDescription]
     .filter(Boolean);
 
   return {
     text,
+    associatedLabel,
     ariaLabel,
     title,
     placeholder,
@@ -3759,53 +4067,71 @@ function getInteractiveTextFields(element: HTMLElement): {
   };
 }
 
-function buildInteractiveSelector(element: HTMLElement): string {
+function countSelectorMatches(selector: string): number {
+  try {
+    return document.querySelectorAll(selector).length;
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
+function buildSelectorSegment(element: HTMLElement, allowNth = true): string {
   const tag = element.tagName.toLowerCase();
   const id = element.id.trim();
   if (id) {
     return `${tag}#${escapeCssIdentifier(id)}`;
   }
 
-  const dataTestId = element.getAttribute("data-testid");
-  if (dataTestId) {
-    return `${tag}[data-testid="${escapeCssAttributeValue(dataTestId)}"]`;
+  for (const attr of ["data-testid", "data-test", "data-qa", "name", "aria-label", "title"]) {
+    const value = element.getAttribute(attr);
+    if (value) {
+      return `${tag}[${attr}="${escapeCssAttributeValue(value)}"]`;
+    }
   }
 
-  const dataTest = element.getAttribute("data-test");
-  if (dataTest) {
-    return `${tag}[data-test="${escapeCssAttributeValue(dataTest)}"]`;
-  }
-
-  const dataQa = element.getAttribute("data-qa");
-  if (dataQa) {
-    return `${tag}[data-qa="${escapeCssAttributeValue(dataQa)}"]`;
-  }
-
-  const ariaLabel = element.getAttribute("aria-label");
-  if (ariaLabel) {
-    return `${tag}[aria-label="${escapeCssAttributeValue(ariaLabel)}"]`;
-  }
-
-  const name = element.getAttribute("name");
-  if (name) {
-    return `${tag}[name="${escapeCssAttributeValue(name)}"]`;
-  }
-
-  const title = element.getAttribute("title");
-  if (title) {
-    return `${tag}[title="${escapeCssAttributeValue(title)}"]`;
+  const href = element.getAttribute("href");
+  if (href && href.length <= 180) {
+    return `${tag}[href="${escapeCssAttributeValue(href)}"]`;
   }
 
   const type = element.getAttribute("type");
-  const parent = element.parentElement;
-  if (parent) {
+  if (type) {
+    return `${tag}[type="${escapeCssAttributeValue(type)}"]`;
+  }
+
+  if (allowNth && element.parentElement) {
+    const parent = element.parentElement;
     const siblings = Array.from(parent.children).filter((node) => node.tagName === element.tagName);
     const nth = siblings.indexOf(element) + 1;
-    const typeSegment = type ? `[type="${escapeCssAttributeValue(type)}"]` : "";
-    return `${tag}${typeSegment}:nth-of-type(${Math.max(1, nth)})`;
+    return `${tag}:nth-of-type(${Math.max(1, nth)})`;
   }
 
   return tag;
+}
+
+function buildInteractiveSelector(element: HTMLElement): string {
+  const directCandidates = [
+    buildSelectorSegment(element, false),
+    buildSelectorSegment(element, true)
+  ];
+  for (const selector of directCandidates) {
+    if (countSelectorMatches(selector) === 1) {
+      return selector;
+    }
+  }
+
+  const chain: string[] = [];
+  let current: HTMLElement | null = element;
+  for (let depth = 0; current && depth < 4; depth += 1) {
+    chain.unshift(buildSelectorSegment(current, true));
+    const selector = chain.join(" > ");
+    if (countSelectorMatches(selector) === 1) {
+      return selector;
+    }
+    current = current.parentElement;
+  }
+
+  return chain.join(" > ") || buildSelectorSegment(element, true);
 }
 
 function tryResolveElementBySelector(selector: string): HTMLElement | null {
@@ -3816,8 +4142,8 @@ function tryResolveElementBySelector(selector: string): HTMLElement | null {
   }
 }
 
-function getInteractiveLabel(candidate: Pick<InteractiveCandidate, "text" | "ariaLabel" | "title" | "placeholder" | "dataTestId">): string {
-  return candidate.text || candidate.ariaLabel || candidate.title || candidate.placeholder || candidate.dataTestId || "";
+function getInteractiveLabel(candidate: Pick<InteractiveCandidate, "text" | "associatedLabel" | "ariaLabel" | "title" | "placeholder" | "dataTestId">): string {
+  return candidate.text || candidate.associatedLabel || candidate.ariaLabel || candidate.title || candidate.placeholder || candidate.dataTestId || "";
 }
 
 function roleMatches(elementRole: string, requestedRole: InteractiveRole): boolean {
@@ -3843,7 +4169,7 @@ function scoreInteractiveCandidate(
 ): { score: number; reasons: string[] } {
   const normalizedQuery = normalizeText(query).toLowerCase();
   const tokens = normalizedQuery.split(/\s+/).filter(Boolean);
-  const exactFields = [fields.text, fields.ariaLabel, fields.title, fields.placeholder, fields.dataTestId]
+  const exactFields = [fields.text, fields.associatedLabel, fields.ariaLabel, fields.title, fields.placeholder, fields.dataTestId]
     .map((value) => value.toLowerCase())
     .filter(Boolean);
   const haystack = fields.haystack;
@@ -3860,6 +4186,10 @@ function scoreInteractiveCandidate(
   if (fields.text && fields.text.toLowerCase().includes(normalizedQuery)) {
     score += 70;
     reasons.push("text_match");
+  }
+  if (fields.associatedLabel && fields.associatedLabel.toLowerCase().includes(normalizedQuery)) {
+    score += 60;
+    reasons.push("label_match");
   }
   if (fields.ariaLabel && fields.ariaLabel.toLowerCase().includes(normalizedQuery)) {
     score += 65;
@@ -3928,9 +4258,7 @@ function findInteractiveCandidates(args: Record<string, unknown>): {
   const includeHidden = args.includeHidden === true;
   const exact = args.exact === true;
 
-  const elements = Array.from(document.querySelectorAll<HTMLElement>(INTERACTIVE_ELEMENT_SELECTOR));
-  const deduped = Array.from(new Set(elements));
-  const matches = deduped
+  const matches = collectInteractiveElementsSnapshot()
     .map((element) => {
       const visible = isElementVisible(element);
       if (!includeHidden && !visible) {
@@ -3959,6 +4287,7 @@ function findInteractiveCandidates(args: Record<string, unknown>): {
         tagName: element.tagName.toLowerCase(),
         role: elementRole,
         text: fields.text,
+        associatedLabel: fields.associatedLabel,
         ariaLabel: fields.ariaLabel,
         title: fields.title,
         placeholder: fields.placeholder,
@@ -3983,6 +4312,14 @@ function agentFindInteractiveElements(args: Record<string, unknown>): string {
     return result.error;
   }
 
+  showAgentInteractionCandidateHighlights(
+    result.matches.map((item, index) => ({
+      element: item.element,
+      label: getInteractiveLabel(item) || item.selector || `${item.tagName}[${index}]`,
+      score: item.score
+    }))
+  );
+
   return JSON.stringify({
     query: result.query,
     role: result.role,
@@ -3994,6 +4331,7 @@ function agentFindInteractiveElements(args: Record<string, unknown>): string {
       tagName: item.tagName,
       role: item.role,
       text: item.text,
+      associatedLabel: item.associatedLabel,
       ariaLabel: item.ariaLabel,
       title: item.title,
       placeholder: item.placeholder,
@@ -4034,6 +4372,20 @@ async function agentSmartClick(args: Record<string, unknown>): Promise<string> {
   if (memoryMatch?.selector) {
     const rememberedElement = tryResolveElementBySelector(memoryMatch.selector);
     if (rememberedElement && (args.includeHidden === true || isElementVisible(rememberedElement))) {
+      const rememberedFields = getInteractiveTextFields(rememberedElement);
+      const rememberedRole = inferInteractiveRole(rememberedElement);
+      const rememberedScore = scoreInteractiveCandidate(
+        rememberedFields,
+        query,
+        role,
+        rememberedRole,
+        isElementVisible(rememberedElement),
+        rememberedElement.hasAttribute("disabled") || rememberedElement.getAttribute("aria-disabled") === "true",
+        args.exact === true
+      );
+      if (rememberedScore.score <= 0) {
+        // Stale selector now points to the wrong node; ignore site memory and continue ranking.
+      } else {
       neutralizeAnchorBlankTarget(rememberedElement);
       dispatchElementClickSequence(rememberedElement);
       void recordSiteActionMemory({
@@ -4051,10 +4403,11 @@ async function agentSmartClick(args: Record<string, unknown>): Promise<string> {
         tagName: rememberedElement.tagName.toLowerCase(),
         role,
         text: normalizeText(rememberedElement.innerText || rememberedElement.textContent || ""),
-        score: memoryMatch.successCount,
-        reasons: ["site_memory_hit"]
+        score: memoryMatch.successCount + rememberedScore.score,
+        reasons: ["site_memory_hit", ...rememberedScore.reasons]
       });
     }
+  }
   }
 
   const ranked = findInteractiveCandidates({
@@ -4389,6 +4742,580 @@ function pushLimitedRecord<T>(list: T[], record: T, max = 200): void {
   }
 }
 
+function ensureAgentInteractionOverlay(): AgentInteractionOverlay | null {
+  if (agentInteractionOverlay) {
+    return agentInteractionOverlay;
+  }
+  if (!document?.body || typeof document.createElement !== "function") {
+    return null;
+  }
+
+  const root = document.createElement("div");
+  const candidateLayer = document.createElement("div");
+  const trailLayer = document.createElement("div");
+  const targetBox = document.createElement("div");
+  const cursor = document.createElement("div");
+  const cursorArrow = document.createElement("div");
+  const cursorDot = document.createElement("div");
+  const cursorRipple = document.createElement("div");
+
+  root.setAttribute("data-neonagent-interaction-overlay", "true");
+  root.style.position = "fixed";
+  root.style.left = "0";
+  root.style.top = "0";
+  root.style.width = "100vw";
+  root.style.height = "100vh";
+  root.style.pointerEvents = "none";
+  root.style.zIndex = "2147483646";
+  root.style.overflow = "hidden";
+
+  candidateLayer.style.position = "fixed";
+  candidateLayer.style.left = "0";
+  candidateLayer.style.top = "0";
+  candidateLayer.style.width = "100vw";
+  candidateLayer.style.height = "100vh";
+  candidateLayer.style.pointerEvents = "none";
+
+  trailLayer.style.position = "fixed";
+  trailLayer.style.left = "0";
+  trailLayer.style.top = "0";
+  trailLayer.style.width = "100vw";
+  trailLayer.style.height = "100vh";
+  trailLayer.style.pointerEvents = "none";
+
+  targetBox.style.position = "fixed";
+  targetBox.style.left = "0";
+  targetBox.style.top = "0";
+  targetBox.style.width = "0";
+  targetBox.style.height = "0";
+  targetBox.style.border = "2px solid rgba(34, 197, 94, 0.95)";
+  targetBox.style.borderRadius = "12px";
+  targetBox.style.boxShadow = "0 0 0 3px rgba(34, 197, 94, 0.16), 0 18px 50px rgba(15, 23, 42, 0.22)";
+  targetBox.style.background = "rgba(34, 197, 94, 0.08)";
+  targetBox.style.opacity = "0";
+  targetBox.style.transformOrigin = "center";
+  targetBox.style.transition = "opacity 120ms ease, transform 160ms ease, left 180ms ease, top 180ms ease, width 180ms ease, height 180ms ease";
+
+  cursor.style.position = "fixed";
+  cursor.style.left = "0";
+  cursor.style.top = "0";
+  cursor.style.width = "28px";
+  cursor.style.height = "28px";
+  cursor.style.marginLeft = "-3px";
+  cursor.style.marginTop = "-3px";
+  cursor.style.borderRadius = "999px";
+  cursor.style.border = "2px solid rgba(56, 189, 248, 0.98)";
+  cursor.style.background = "linear-gradient(135deg, rgba(255,255,255,0.98), rgba(224,242,254,0.92))";
+  cursor.style.boxShadow = "0 12px 30px rgba(14, 165, 233, 0.28), 0 0 0 6px rgba(56, 189, 248, 0.14)";
+  cursor.style.transform = "translate3d(-9999px, -9999px, 0) scale(1)";
+  cursor.style.transformOrigin = "center";
+  cursor.style.transition = "transform 160ms cubic-bezier(.22,.61,.36,1), background 90ms ease, border-color 90ms ease";
+  cursor.style.backdropFilter = "blur(8px)";
+
+  cursorArrow.style.position = "absolute";
+  cursorArrow.style.left = "4px";
+  cursorArrow.style.top = "3px";
+  cursorArrow.style.width = "0";
+  cursorArrow.style.height = "0";
+  cursorArrow.style.borderLeft = "10px solid rgba(2, 132, 199, 0.98)";
+  cursorArrow.style.borderTop = "8px solid transparent";
+  cursorArrow.style.borderBottom = "8px solid transparent";
+  cursorArrow.style.transform = "rotate(-28deg)";
+  cursorArrow.style.transformOrigin = "2px 8px";
+  cursorArrow.style.filter = "drop-shadow(0 2px 3px rgba(2, 132, 199, 0.25))";
+
+  cursorDot.style.position = "absolute";
+  cursorDot.style.right = "4px";
+  cursorDot.style.bottom = "4px";
+  cursorDot.style.width = "7px";
+  cursorDot.style.height = "7px";
+  cursorDot.style.borderRadius = "999px";
+  cursorDot.style.background = "rgba(14, 165, 233, 0.95)";
+  cursorDot.style.boxShadow = "0 0 0 3px rgba(125, 211, 252, 0.22)";
+
+  cursorRipple.style.position = "absolute";
+  cursorRipple.style.left = "50%";
+  cursorRipple.style.top = "50%";
+  cursorRipple.style.width = "22px";
+  cursorRipple.style.height = "22px";
+  cursorRipple.style.marginLeft = "-11px";
+  cursorRipple.style.marginTop = "-11px";
+  cursorRipple.style.borderRadius = "999px";
+  cursorRipple.style.border = "2px solid rgba(14, 165, 233, 0.45)";
+  cursorRipple.style.opacity = "0";
+  cursorRipple.style.transform = "scale(0.6)";
+  cursorRipple.style.transition = "transform 240ms ease, opacity 240ms ease";
+
+  cursor.appendChild(cursorArrow);
+  cursor.appendChild(cursorRipple);
+  cursor.appendChild(cursorDot);
+  root.appendChild(candidateLayer);
+  root.appendChild(trailLayer);
+  root.appendChild(targetBox);
+  root.appendChild(cursor);
+  document.body.appendChild(root);
+
+  agentInteractionOverlay = { root, candidateLayer, trailLayer, cursor, cursorArrow, cursorDot, cursorRipple, targetBox };
+  return agentInteractionOverlay;
+}
+
+function scheduleAgentInteractionOverlayHide(delayMs = 900): void {
+  if (agentInteractionOverlayHideTimer) {
+    clearTimeout(agentInteractionOverlayHideTimer);
+  }
+  agentInteractionOverlayHideTimer = setTimeout(() => {
+    const overlay = agentInteractionOverlay;
+    if (!overlay) {
+      return;
+    }
+    overlay.targetBox.style.opacity = "0";
+    overlay.cursor.style.opacity = "1";
+    overlay.cursor.style.transition = "transform 120ms ease, background 120ms ease, border-color 120ms ease, opacity 120ms ease";
+    overlay.cursor.style.transform = `translate3d(${agentInteractionCursorX}px, ${agentInteractionCursorY}px, 0) scale(1)`;
+    overlay.cursor.style.background = "linear-gradient(135deg, rgba(255,255,255,0.98), rgba(224,242,254,0.92))";
+    overlay.cursor.style.borderColor = "rgba(56, 189, 248, 0.98)";
+    overlay.cursorArrow.style.borderLeftColor = "rgba(2, 132, 199, 0.98)";
+    clearAgentInteractionTrail();
+  }, delayMs);
+}
+
+function clearAgentInteractionAnimationTimers(): void {
+  for (const timer of agentInteractionAnimationTimers) {
+    clearTimeout(timer);
+  }
+  agentInteractionAnimationTimers = [];
+}
+
+function clearAgentInteractionCandidateHighlights(): void {
+  if (!agentInteractionOverlay) {
+    return;
+  }
+  agentInteractionOverlay.candidateLayer.textContent = "";
+}
+
+function clearAgentInteractionTrail(): void {
+  if (!agentInteractionOverlay) {
+    return;
+  }
+  agentInteractionOverlay.trailLayer.textContent = "";
+}
+
+function scheduleAgentInteractionCandidateHide(delayMs = 2200): void {
+  if (agentInteractionCandidateHideTimer) {
+    clearTimeout(agentInteractionCandidateHideTimer);
+  }
+  agentInteractionCandidateHideTimer = setTimeout(() => {
+    clearAgentInteractionCandidateHighlights();
+  }, delayMs);
+}
+
+function addAgentInteractionTrailSegment(fromX: number, fromY: number, toX: number, toY: number): void {
+  const overlay = ensureAgentInteractionOverlay();
+  if (!overlay) {
+    return;
+  }
+  const dx = toX - fromX;
+  const dy = toY - fromY;
+  const length = Math.hypot(dx, dy);
+  if (length < 8) {
+    return;
+  }
+
+  const segment = document.createElement("div");
+  segment.style.position = "fixed";
+  segment.style.left = `${fromX}px`;
+  segment.style.top = `${fromY}px`;
+  segment.style.width = `${length}px`;
+  segment.style.height = "3px";
+  segment.style.transformOrigin = "0 50%";
+  segment.style.transform = `translateY(-1px) rotate(${Math.atan2(dy, dx)}rad)`;
+  segment.style.borderRadius = "999px";
+  segment.style.background = "linear-gradient(90deg, rgba(125, 211, 252, 0.02), rgba(56, 189, 248, 0.24), rgba(2, 132, 199, 0.38), rgba(2, 132, 199, 0.06))";
+  segment.style.boxShadow = "0 0 10px rgba(56, 189, 248, 0.16)";
+  segment.style.opacity = "0.9";
+  segment.style.transition = "opacity 420ms ease";
+  overlay.trailLayer.appendChild(segment);
+
+  requestAnimationFrame(() => {
+    segment.style.opacity = "0";
+  });
+  const timer = setTimeout(() => {
+    segment.remove();
+  }, 460);
+  agentInteractionAnimationTimers.push(timer);
+}
+
+function showAgentInteractionOverlayAtPoint(
+  clientX: number,
+  clientY: number,
+  options?: {
+    targetRect?: { left: number; top: number; width: number; height: number };
+    pressed?: boolean;
+    pulse?: boolean;
+  }
+): void {
+  const overlay = ensureAgentInteractionOverlay();
+  if (!overlay) {
+    return;
+  }
+  if (agentInteractionOverlayHideTimer) {
+    clearTimeout(agentInteractionOverlayHideTimer);
+    agentInteractionOverlayHideTimer = null;
+  }
+
+  overlay.cursor.style.opacity = "1";
+  overlay.cursorArrow.style.borderLeftColor = options?.pressed ? "rgba(3, 105, 161, 0.98)" : "rgba(2, 132, 199, 0.98)";
+  overlay.cursor.style.transform = `translate3d(${clientX}px, ${clientY}px, 0) scale(${options?.pressed ? 0.92 : 1})`;
+  overlay.cursor.style.background = options?.pressed
+    ? "linear-gradient(135deg, rgba(224,242,254,0.98), rgba(186,230,253,0.96))"
+    : "linear-gradient(135deg, rgba(255,255,255,0.98), rgba(224,242,254,0.92))";
+  overlay.cursor.style.borderColor = options?.pressed ? "rgba(2, 132, 199, 0.98)" : "rgba(56, 189, 248, 0.98)";
+
+  if (options?.targetRect) {
+    overlay.targetBox.style.opacity = "1";
+    overlay.targetBox.style.left = `${options.targetRect.left - 4}px`;
+    overlay.targetBox.style.top = `${options.targetRect.top - 4}px`;
+    overlay.targetBox.style.width = `${Math.max(0, options.targetRect.width + 8)}px`;
+    overlay.targetBox.style.height = `${Math.max(0, options.targetRect.height + 8)}px`;
+    overlay.targetBox.style.transform = options?.pressed ? "scale(0.985)" : "scale(1)";
+  } else {
+    overlay.targetBox.style.opacity = "0";
+  }
+
+  if (options?.pulse) {
+    overlay.cursorRipple.style.transition = "none";
+    overlay.cursorRipple.style.opacity = "0.7";
+    overlay.cursorRipple.style.transform = "scale(0.75)";
+    void overlay.cursorRipple.offsetHeight;
+    overlay.cursorRipple.style.transition = "transform 260ms ease, opacity 260ms ease";
+    overlay.cursorRipple.style.opacity = "0";
+    overlay.cursorRipple.style.transform = "scale(2.25)";
+  }
+
+  scheduleAgentInteractionOverlayHide(options?.pulse ? 1200 : 900);
+}
+
+function playAgentInteractionClickAnimation(
+  clientX: number,
+  clientY: number,
+  options?: { targetRect?: { left: number; top: number; width: number; height: number } }
+): void {
+  const overlay = ensureAgentInteractionOverlay();
+  if (!overlay) {
+    return;
+  }
+
+  clearAgentInteractionAnimationTimers();
+  if (agentInteractionOverlayHideTimer) {
+    clearTimeout(agentInteractionOverlayHideTimer);
+    agentInteractionOverlayHideTimer = null;
+  }
+
+  const viewportWidth = window.innerWidth || document.documentElement?.clientWidth || 1280;
+  const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || 720;
+  if (!agentInteractionCursorX && !agentInteractionCursorY) {
+    agentInteractionCursorX = viewportWidth / 2;
+    agentInteractionCursorY = viewportHeight / 2;
+  }
+
+  overlay.cursor.style.opacity = "1";
+  overlay.cursor.style.transition = "none";
+  overlay.cursor.style.background = "linear-gradient(135deg, rgba(255,255,255,0.98), rgba(224,242,254,0.92))";
+  overlay.cursor.style.borderColor = "rgba(56, 189, 248, 0.98)";
+  overlay.cursorArrow.style.borderLeftColor = "rgba(2, 132, 199, 0.98)";
+  overlay.cursor.style.transform = `translate3d(${agentInteractionCursorX}px, ${agentInteractionCursorY}px, 0) scale(1)`;
+
+  if (options?.targetRect) {
+    overlay.targetBox.style.opacity = "1";
+    overlay.targetBox.style.left = `${options.targetRect.left - 4}px`;
+    overlay.targetBox.style.top = `${options.targetRect.top - 4}px`;
+    overlay.targetBox.style.width = `${Math.max(0, options.targetRect.width + 8)}px`;
+    overlay.targetBox.style.height = `${Math.max(0, options.targetRect.height + 8)}px`;
+    overlay.targetBox.style.transform = "scale(1)";
+  } else {
+    overlay.targetBox.style.opacity = "0";
+  }
+
+  const moveTimer = setTimeout(() => {
+    addAgentInteractionTrailSegment(agentInteractionCursorX, agentInteractionCursorY, clientX, clientY);
+    overlay.cursor.style.transition = "transform 220ms cubic-bezier(.22,.61,.36,1), background 90ms ease, border-color 90ms ease";
+    overlay.cursor.style.transform = `translate3d(${clientX}px, ${clientY}px, 0) scale(1)`;
+    agentInteractionCursorX = clientX;
+    agentInteractionCursorY = clientY;
+  }, 16);
+
+  const downTimer = setTimeout(() => {
+    showAgentInteractionOverlayAtPoint(clientX, clientY, {
+      targetRect: options?.targetRect,
+      pressed: true
+    });
+  }, 250);
+
+  const upTimer = setTimeout(() => {
+    showAgentInteractionOverlayAtPoint(clientX, clientY, {
+      targetRect: options?.targetRect,
+      pressed: false,
+      pulse: true
+    });
+  }, 340);
+
+  const settleTimer = setTimeout(() => {
+    agentInteractionCursorX = clientX;
+    agentInteractionCursorY = clientY;
+    overlay.cursor.style.opacity = "1";
+    overlay.cursor.style.transition = "transform 120ms ease, background 120ms ease, border-color 120ms ease, opacity 120ms ease";
+    overlay.cursor.style.transform = `translate3d(${clientX}px, ${clientY}px, 0) scale(1)`;
+    overlay.cursor.style.background = "linear-gradient(135deg, rgba(255,255,255,0.98), rgba(224,242,254,0.92))";
+    overlay.cursor.style.borderColor = "rgba(56, 189, 248, 0.98)";
+    overlay.cursorArrow.style.borderLeftColor = "rgba(2, 132, 199, 0.98)";
+  }, 420);
+
+  agentInteractionAnimationTimers.push(moveTimer, downTimer, upTimer, settleTimer);
+}
+
+function showAgentInteractionOverlayForElement(
+  element: HTMLElement,
+  options?: { pressed?: boolean; pulse?: boolean; clientX?: number; clientY?: number }
+): void {
+  const rect = element.getBoundingClientRect();
+  const clientX = typeof options?.clientX === "number" ? options.clientX : rect.left + (rect.width / 2);
+  const clientY = typeof options?.clientY === "number" ? options.clientY : rect.top + (rect.height / 2);
+  showAgentInteractionOverlayAtPoint(clientX, clientY, {
+    targetRect: rect,
+    pressed: options?.pressed,
+    pulse: options?.pulse
+  });
+}
+
+function isRectMeaningfullyVisible(rect: { left: number; top: number; right: number; bottom: number; width: number; height: number }): boolean {
+  const viewportWidth = window.innerWidth || document.documentElement?.clientWidth || 0;
+  const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || 0;
+  if (rect.width <= 0 || rect.height <= 0) {
+    return false;
+  }
+  return rect.right > 0 && rect.bottom > 0 && rect.left < viewportWidth && rect.top < viewportHeight;
+}
+
+function getFollowCursorAnchorAfterScroll(): { element?: HTMLElement; clientX: number; clientY: number } {
+  const viewportWidth = window.innerWidth || document.documentElement?.clientWidth || 0;
+  const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || 0;
+  const examCandidates = resolveExamQuestionRoots()
+    .filter((element) => isElementVisible(element))
+    .map((element) => ({ element, rect: element.getBoundingClientRect() }))
+    .filter(({ rect }) => isRectMeaningfullyVisible(rect))
+    .map(({ element, rect }) => {
+      const visibleTop = Math.max(0, rect.top);
+      const visibleBottom = Math.min(viewportHeight, rect.bottom);
+      const visibleHeight = Math.max(0, visibleBottom - visibleTop);
+      const visibleWidth = Math.max(0, Math.min(viewportWidth, rect.right) - Math.max(0, rect.left));
+      const visibleArea = visibleWidth * visibleHeight;
+      const centerDistance = Math.abs((visibleTop + (visibleHeight / 2)) - (viewportHeight * 0.38));
+      const score = visibleArea - (centerDistance * 120);
+      return { element, rect, score };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  const bestExamCandidate = examCandidates[0];
+  if (bestExamCandidate) {
+    const rect = bestExamCandidate.rect;
+    return {
+      element: bestExamCandidate.element,
+      clientX: rect.left + Math.min(rect.width * 0.18, Math.max(24, rect.width / 2)),
+      clientY: rect.top + Math.min(rect.height * 0.22, Math.max(28, rect.height / 2))
+    };
+  }
+
+  const fallbackPoints: Array<{ x: number; y: number }> = [
+    { x: viewportWidth * 0.42, y: viewportHeight * 0.35 },
+    { x: viewportWidth * 0.5, y: viewportHeight * 0.35 },
+    { x: viewportWidth * 0.5, y: viewportHeight * 0.5 }
+  ];
+
+  for (const point of fallbackPoints) {
+    const node = document.elementFromPoint(point.x, point.y);
+    if (node instanceof HTMLElement) {
+      return { element: node, clientX: point.x, clientY: point.y };
+    }
+  }
+
+  return {
+    clientX: viewportWidth * 0.5,
+    clientY: viewportHeight * 0.35
+  };
+}
+
+function followVirtualCursorAfterScroll(): void {
+  const anchor = getFollowCursorAnchorAfterScroll();
+  agentInteractionCursorX = anchor.clientX;
+  agentInteractionCursorY = anchor.clientY;
+  if (anchor.element) {
+    showAgentInteractionOverlayForElement(anchor.element, {
+      clientX: anchor.clientX,
+      clientY: anchor.clientY
+    });
+    return;
+  }
+  showAgentInteractionOverlayAtPoint(anchor.clientX, anchor.clientY);
+}
+
+function canElementScroll(element: HTMLElement, axis: "y" | "x" = "y"): boolean {
+  const style = window.getComputedStyle(element);
+  const overflow = axis === "y" ? style.overflowY : style.overflowX;
+  const size = axis === "y"
+    ? element.scrollHeight - element.clientHeight
+    : element.scrollWidth - element.clientWidth;
+  return size > 4 && /(auto|scroll|overlay)/i.test(overflow);
+}
+
+function findBestScrollableContainer(): HTMLElement | null {
+  const viewportWidth = window.innerWidth || document.documentElement?.clientWidth || 0;
+  const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || 0;
+  const elements = Array.from(document.querySelectorAll<HTMLElement>("body *"));
+  const candidates = elements
+    .filter((element) => isElementVisible(element))
+    .filter((element) => canElementScroll(element, "y") || canElementScroll(element, "x"))
+    .map((element) => {
+      const rect = element.getBoundingClientRect();
+      const visibleWidth = Math.max(0, Math.min(viewportWidth, rect.right) - Math.max(0, rect.left));
+      const visibleHeight = Math.max(0, Math.min(viewportHeight, rect.bottom) - Math.max(0, rect.top));
+      const visibleArea = visibleWidth * visibleHeight;
+      const scrollDepth = Math.max(0, element.scrollHeight - element.clientHeight);
+      const score = visibleArea + Math.min(scrollDepth, viewportHeight * 3);
+      return { element, score };
+    })
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  return candidates[0]?.element ?? null;
+}
+
+function getWindowScrollState(): { x: number; y: number } {
+  return {
+    x: window.scrollX || window.pageXOffset || 0,
+    y: window.scrollY || window.pageYOffset || 0
+  };
+}
+
+function scrollBestAvailableContainer(
+  direction: string,
+  pixels: number
+): { mode: "window" | "element"; target: string } {
+  const before = getWindowScrollState();
+  switch (direction) {
+    case "up":
+      window.scrollBy(0, -pixels);
+      break;
+    case "down":
+      window.scrollBy(0, pixels);
+      break;
+    case "top":
+      window.scrollTo(0, 0);
+      break;
+    case "bottom":
+      window.scrollTo(0, document.body.scrollHeight);
+      break;
+    default:
+      break;
+  }
+
+  const after = getWindowScrollState();
+  if (before.x !== after.x || before.y !== after.y) {
+    return { mode: "window", target: "window" };
+  }
+
+  const container = findBestScrollableContainer();
+  if (!container) {
+    return { mode: "window", target: "window" };
+  }
+
+  switch (direction) {
+    case "up":
+      container.scrollBy({ top: -pixels, behavior: "auto" });
+      break;
+    case "down":
+      container.scrollBy({ top: pixels, behavior: "auto" });
+      break;
+    case "top":
+      container.scrollTo({ top: 0, behavior: "auto" });
+      break;
+    case "bottom":
+      container.scrollTo({ top: container.scrollHeight, behavior: "auto" });
+      break;
+    default:
+      break;
+  }
+
+  const idPart = container.id ? `#${container.id}` : "";
+  const classPart = container.className && typeof container.className === "string"
+    ? `.${container.className.trim().split(/\s+/).filter(Boolean).slice(0, 2).join(".")}`
+    : "";
+  return {
+    mode: "element",
+    target: `${container.tagName.toLowerCase()}${idPart}${classPart}` || container.tagName.toLowerCase()
+  };
+}
+
+function showAgentInteractionCandidateHighlights(
+  items: Array<{
+    element: HTMLElement;
+    label: string;
+    score?: number;
+  }>,
+  options?: { durationMs?: number }
+): void {
+  const overlay = ensureAgentInteractionOverlay();
+  if (!overlay) {
+    return;
+  }
+  if (agentInteractionCandidateHideTimer) {
+    clearTimeout(agentInteractionCandidateHideTimer);
+    agentInteractionCandidateHideTimer = null;
+  }
+
+  overlay.candidateLayer.textContent = "";
+  const visibleItems = items
+    .filter((item) => item.element && isElementVisible(item.element))
+    .slice(0, 5);
+
+  visibleItems.forEach((item, index) => {
+    const rect = item.element.getBoundingClientRect();
+    const box = document.createElement("div");
+    box.style.position = "fixed";
+    box.style.left = `${rect.left - 4}px`;
+    box.style.top = `${rect.top - 4}px`;
+    box.style.width = `${Math.max(0, rect.width + 8)}px`;
+    box.style.height = `${Math.max(0, rect.height + 8)}px`;
+    box.style.border = "2px solid rgba(245, 158, 11, 0.98)";
+    box.style.borderRadius = "12px";
+    box.style.background = "rgba(245, 158, 11, 0.08)";
+    box.style.boxShadow = "0 0 0 3px rgba(245, 158, 11, 0.16)";
+    box.style.pointerEvents = "none";
+
+    const badge = document.createElement("div");
+    badge.textContent = `${index + 1}. ${item.label}`;
+    badge.style.position = "absolute";
+    badge.style.left = "0";
+    badge.style.top = "-28px";
+    badge.style.maxWidth = "260px";
+    badge.style.padding = "4px 8px";
+    badge.style.borderRadius = "999px";
+    badge.style.background = "rgba(15, 23, 42, 0.92)";
+    badge.style.color = "#f8fafc";
+    badge.style.fontSize = "12px";
+    badge.style.lineHeight = "16px";
+    badge.style.fontWeight = "600";
+    badge.style.whiteSpace = "nowrap";
+    badge.style.overflow = "hidden";
+    badge.style.textOverflow = "ellipsis";
+    badge.style.boxShadow = "0 8px 24px rgba(15, 23, 42, 0.26)";
+
+    box.appendChild(badge);
+    overlay.candidateLayer.appendChild(box);
+  });
+
+  scheduleAgentInteractionCandidateHide(options?.durationMs ?? 2200);
+}
+
 function serializeConsoleArgs(args: unknown[]): string {
   return args.map((value) => {
     if (typeof value === "string") {
@@ -4484,6 +5411,7 @@ function dispatchCanvasMouseSequence(
   const rect = canvas.getBoundingClientRect();
   const clientX = rect.left + x;
   const clientY = rect.top + y;
+  playAgentInteractionClickAnimation(clientX, clientY, { targetRect: rect });
   const commonInit: MouseEventInit = {
     bubbles: true,
     cancelable: true,
@@ -4535,7 +5463,8 @@ function dispatchMousePhase(
   clientY: number,
   button: number,
   buttons: number,
-  preferredTarget?: EventTarget | null
+  preferredTarget?: EventTarget | null,
+  visualize = true
 ): EventTarget {
   const eventInit: MouseEventInit = {
     bubbles: true,
@@ -4553,23 +5482,80 @@ function dispatchMousePhase(
     ?? document.body
     ?? document.documentElement;
 
+  if (visualize) {
+    if (liveTarget && typeof (liveTarget as Node).nodeType === "number" && (liveTarget as Node).nodeType === 1) {
+      showAgentInteractionOverlayAtPoint(clientX, clientY, {
+        targetRect: typeof (liveTarget as Element).getBoundingClientRect === "function"
+          ? (liveTarget as Element).getBoundingClientRect()
+          : undefined,
+        pressed: type === "down",
+        pulse: type === "up"
+      });
+    } else {
+      showAgentInteractionOverlayAtPoint(clientX, clientY, {
+        pressed: type === "down",
+        pulse: type === "up"
+      });
+    }
+  }
+
   dispatchPointerAndMouseEvent(liveTarget, type, eventInit);
   dispatchPointerAndMouseEvent(document, type, eventInit);
   return liveTarget;
+}
+
+function ensureElementVisibleForInteraction(element: HTMLElement): void {
+  if (typeof element.scrollIntoView === "function") {
+    element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" as ScrollBehavior });
+  }
+
+  const rect = element.getBoundingClientRect();
+  const viewportWidth = window.innerWidth || document.documentElement?.clientWidth || 0;
+  const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || 0;
+  const marginX = Math.min(48, Math.max(16, viewportWidth * 0.08));
+  const marginY = Math.min(72, Math.max(24, viewportHeight * 0.12));
+  let deltaX = 0;
+  let deltaY = 0;
+
+  if (rect.left < marginX) {
+    deltaX = rect.left - marginX;
+  } else if (rect.right > viewportWidth - marginX) {
+    deltaX = rect.right - (viewportWidth - marginX);
+  }
+
+  if (rect.top < marginY) {
+    deltaY = rect.top - marginY;
+  } else if (rect.bottom > viewportHeight - marginY) {
+    deltaY = rect.bottom - (viewportHeight - marginY);
+  }
+
+  if (deltaX !== 0 || deltaY !== 0) {
+    window.scrollBy({
+      left: deltaX,
+      top: deltaY,
+      behavior: "instant" as ScrollBehavior
+    });
+  }
 }
 
 function dispatchElementClickSequence(
   element: HTMLElement,
   button = 0
 ): { target: EventTarget; clientX: number; clientY: number } {
-  const rect = element.getBoundingClientRect();
+  const preferredElement = resolvePreferredClickTarget(element);
+  ensureElementVisibleForInteraction(preferredElement);
+  const rect = preferredElement.getBoundingClientRect();
   const clientX = rect.left + (rect.width / 2);
   const clientY = rect.top + (rect.height / 2);
+  playAgentInteractionClickAnimation(clientX, clientY, { targetRect: rect });
   const buttons = getCanvasButtonMask(button);
-  element.focus?.();
-  dispatchMousePhase("move", clientX, clientY, button, buttons, element);
-  const liveTarget = dispatchMousePhase("down", clientX, clientY, button, buttons, element);
-  dispatchMousePhase("up", clientX, clientY, button, 0, liveTarget);
+  const hitTarget = document.elementFromPoint(clientX, clientY);
+  const isElementLike = hitTarget && typeof (hitTarget as Node).nodeType === "number";
+  const liveTarget = isElementLike && preferredElement.contains(hitTarget as Node) ? hitTarget : preferredElement;
+  preferredElement.focus?.({ preventScroll: true });
+  dispatchMousePhase("move", clientX, clientY, button, buttons, liveTarget, false);
+  dispatchMousePhase("down", clientX, clientY, button, buttons, liveTarget, false);
+  dispatchMousePhase("up", clientX, clientY, button, 0, liveTarget, false);
 
   const clickInit: MouseEventInit = {
     bubbles: true,
@@ -4586,8 +5572,170 @@ function dispatchElementClickSequence(
   }
   liveTarget.dispatchEvent(new MouseEvent("click", clickInit));
   document.dispatchEvent(new MouseEvent("click", clickInit));
+  if (liveTarget && typeof (liveTarget as { click?: unknown }).click === "function") {
+    (liveTarget as unknown as { click: () => void }).click();
+  }
 
   return { target: liveTarget, clientX, clientY };
+}
+
+function dispatchElementHotspotClickSequence(
+  element: HTMLElement,
+  xRatio = 0.14,
+  yRatio = 0.5,
+  button = 0
+): { target: EventTarget; clientX: number; clientY: number } {
+  ensureElementVisibleForInteraction(element);
+  const rect = element.getBoundingClientRect();
+  const offsetX = Math.max(14, Math.min(rect.width * xRatio, 28));
+  const clientX = rect.left + Math.min(Math.max(offsetX, 1), Math.max(1, rect.width - 1));
+  const clientY = rect.top + Math.min(Math.max(rect.height * yRatio, 1), Math.max(1, rect.height - 1));
+  playAgentInteractionClickAnimation(clientX, clientY, { targetRect: rect });
+  const buttons = getCanvasButtonMask(button);
+  const hitTarget = document.elementFromPoint(clientX, clientY);
+  const isElementLike = hitTarget && typeof (hitTarget as Node).nodeType === "number";
+  const liveTarget = isElementLike && element.contains(hitTarget as Node) ? hitTarget : element;
+  element.focus?.({ preventScroll: true });
+  dispatchMousePhase("move", clientX, clientY, button, buttons, liveTarget, false);
+  dispatchMousePhase("down", clientX, clientY, button, buttons, liveTarget, false);
+  dispatchMousePhase("up", clientX, clientY, button, 0, liveTarget, false);
+
+  const clickInit: MouseEventInit = {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    clientX,
+    clientY,
+    button,
+    buttons: 0,
+    detail: 1
+  };
+  if (typeof PointerEvent === "function") {
+    liveTarget.dispatchEvent(new PointerEvent("pointermove", clickInit));
+  }
+  liveTarget.dispatchEvent(new MouseEvent("click", clickInit));
+  document.dispatchEvent(new MouseEvent("click", clickInit));
+  if (liveTarget && typeof (liveTarget as { click?: unknown }).click === "function") {
+    (liveTarget as unknown as { click: () => void }).click();
+  }
+
+  return { target: liveTarget, clientX, clientY };
+}
+
+function applyExamOptionInteraction(target: HTMLElement): void {
+  dispatchElementClickSequence(target);
+
+  const input = target.querySelector<HTMLInputElement>('input[type="radio"], input[type="checkbox"]');
+  if (input) {
+    if (!input.checked) {
+      dispatchElementHotspotClickSequence(target);
+    }
+    if (!input.checked) {
+      input.checked = true;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    return;
+  }
+
+  // Custom exam widgets often bind the answer action to the icon area on the
+  // left instead of the visible text container or a native input.
+  dispatchElementHotspotClickSequence(target);
+}
+
+function scorePreferredClickTarget(element: HTMLElement, containerText: string): number {
+  const tag = element.tagName.toLowerCase();
+  const role = inferInteractiveRole(element);
+  const text = normalizeText(element.innerText || element.textContent || "").toLowerCase();
+  const normalizedContainerText = containerText.toLowerCase();
+  const rect = element.getBoundingClientRect();
+  const area = Math.max(1, rect.width * rect.height);
+  let score = 0;
+
+  if (tag === "button") score += 200;
+  if (tag === "input") {
+    const type = (element.getAttribute("type") || "").toLowerCase();
+    if (type === "submit" || type === "button") score += 180;
+  }
+  if (role === "button") score += 160;
+  if (tag === "a" && element.hasAttribute("href")) score += 120;
+  if (typeof (element as { onclick?: unknown }).onclick === "function" || element.hasAttribute("onclick")) score += 80;
+
+  if (containerText && text) {
+    if (text === normalizedContainerText) {
+      score += 90;
+    } else if (text.includes(normalizedContainerText) || normalizedContainerText.includes(text)) {
+      score += 45;
+    }
+  }
+
+  if (isCandidateVisibleAndEnabled(element)) score += 40;
+
+  const tabindex = element.getAttribute("tabindex");
+  if (tabindex !== null && Number.parseInt(tabindex, 10) >= 0) score += 25;
+  if (window.getComputedStyle(element).cursor === "pointer") score += 15;
+
+  score += Math.max(0, 40 - Math.log10(area) * 10);
+  return score;
+}
+
+function resolveControlProxyClickTarget(element: HTMLElement): HTMLElement | null {
+  const asInput = element instanceof HTMLInputElement ? element : null;
+  const input = asInput ?? element.querySelector<HTMLInputElement>('input[type="checkbox"], input[type="radio"]');
+  if (!input) {
+    return null;
+  }
+
+  const inputType = (input.getAttribute("type") || "").toLowerCase();
+  if (inputType !== "checkbox" && inputType !== "radio") {
+    return null;
+  }
+
+  const explicitLabel = input.id
+    ? document.querySelector<HTMLLabelElement>(`label[for="${escapeCssAttributeValue(input.id)}"]`)
+    : null;
+  if (explicitLabel && isElementVisible(explicitLabel)) {
+    return explicitLabel;
+  }
+
+  const nestedLabel = input.closest("label") || element.querySelector<HTMLLabelElement>("label");
+  if (nestedLabel && isElementVisible(nestedLabel)) {
+    return nestedLabel;
+  }
+
+  return null;
+}
+
+function resolvePreferredClickTarget(element: HTMLElement): HTMLElement {
+  if (typeof element.querySelectorAll !== "function") {
+    return element;
+  }
+  const controlProxy = resolveControlProxyClickTarget(element);
+  if (controlProxy) {
+    return controlProxy;
+  }
+  const candidateSelectors = [
+    "button",
+    "input[type='submit']",
+    "input[type='button']",
+    "label[for]",
+    "a[href]",
+    "[role='button']",
+    "[onclick]",
+    "[tabindex]"
+  ].join(", ");
+  const containerText = normalizeText(element.innerText || element.textContent || "");
+  const descendants = Array.from(element.querySelectorAll<HTMLElement>(candidateSelectors))
+    .filter((candidate) => candidate !== element)
+    .filter((candidate) => isCandidateVisibleAndEnabled(candidate))
+    .map((candidate) => ({
+      candidate,
+      score: scorePreferredClickTarget(candidate, containerText)
+    }))
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  return descendants[0]?.candidate ?? element;
 }
 
 function neutralizeAnchorBlankTarget(element: HTMLElement): void {
@@ -4595,6 +5743,175 @@ function neutralizeAnchorBlankTarget(element: HTMLElement): void {
   if (anchor && anchor.getAttribute("target") === "_blank") {
     anchor.removeAttribute("target");
   }
+}
+
+function dispatchKeyboardSequence(
+  target: HTMLElement,
+  key: string,
+  modifiers?: { ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean; altKey?: boolean }
+): void {
+  const eventInit: KeyboardEventInit = {
+    key,
+    code: key,
+    bubbles: true,
+    cancelable: true,
+    ctrlKey: modifiers?.ctrlKey === true,
+    metaKey: modifiers?.metaKey === true,
+    shiftKey: modifiers?.shiftKey === true,
+    altKey: modifiers?.altKey === true
+  };
+  target.dispatchEvent(new KeyboardEvent("keydown", eventInit));
+  target.dispatchEvent(new KeyboardEvent("keypress", eventInit));
+  target.dispatchEvent(new KeyboardEvent("keyup", eventInit));
+}
+
+const SUBMIT_ACTION_HINTS = [
+  "发送", "回复", "提交", "确认", "发布", "send", "reply", "submit", "post", "publish", "confirm"
+];
+
+function getElementActionText(element: HTMLElement): string {
+  return normalizeText([
+    element.innerText || element.textContent || "",
+    element.getAttribute("aria-label") || "",
+    element.getAttribute("title") || "",
+    element.getAttribute("value") || "",
+    element.getAttribute("data-testid") || "",
+    element.getAttribute("name") || ""
+  ].join(" "));
+}
+
+function buildSubmitActionHints(actionHint?: string): string[] {
+  const custom = typeof actionHint === "string" && actionHint.trim()
+    ? actionHint.trim().split(/[,\s/]+/).filter(Boolean)
+    : [];
+  return Array.from(new Set([...custom, ...SUBMIT_ACTION_HINTS]));
+}
+
+function isCandidateVisibleAndEnabled(element: HTMLElement): boolean {
+  if (!isElementVisible(element)) {
+    return false;
+  }
+  const htmlElement = element as HTMLElement & { disabled?: boolean };
+  return !htmlElement.disabled && element.getAttribute("aria-disabled") !== "true";
+}
+
+function collectSubmitActionCandidates(scope: ParentNode, hints: string[]): Array<{
+  element: HTMLElement;
+  score: number;
+  text: string;
+}> {
+  const selectors = [
+    "button",
+    "input[type='submit']",
+    "input[type='button']",
+    "[role='button']",
+    "a[href]",
+    "[data-testid]",
+    "[aria-label]",
+    "[title]"
+  ].join(", ");
+  const candidates = Array.from(scope.querySelectorAll<HTMLElement>(selectors));
+  return Array.from(new Set(candidates))
+    .filter((element) => isCandidateVisibleAndEnabled(element))
+    .map((element) => {
+      const text = getElementActionText(element);
+      const normalized = text.toLowerCase();
+      let score = 0;
+      for (const hint of hints) {
+        const normalizedHint = hint.toLowerCase();
+        if (!normalizedHint) continue;
+        if (normalized === normalizedHint) {
+          score += 120;
+        } else if (normalized.includes(normalizedHint)) {
+          score += 60;
+        }
+      }
+      const type = (element.getAttribute("type") || "").toLowerCase();
+      if (type === "submit") {
+        score += 50;
+      }
+      if (element.tagName.toLowerCase() === "button") {
+        score += 15;
+      }
+      return { element, score, text };
+    })
+    .filter((candidate) => candidate.score > 0)
+    .sort((a, b) => b.score - a.score);
+}
+
+function findNearbySubmitScope(element: HTMLElement): HTMLElement | HTMLFormElement {
+  const form = element.closest("form");
+  if (form) {
+    return form;
+  }
+
+  let current: HTMLElement | null = element;
+  for (let depth = 0; current && depth < 5; depth += 1) {
+    const candidateCount = current.querySelectorAll("button, input[type='submit'], [role='button']").length;
+    if (candidateCount > 0) {
+      return current;
+    }
+    current = current.parentElement;
+  }
+
+  return element.parentElement ?? element;
+}
+
+function agentSubmitNearbyFormAction(args: Record<string, unknown>): string {
+  const selector = typeof args.selector === "string" ? args.selector : "";
+  const index = typeof args.index === "number" ? args.index : 0;
+  const tryKeyboardShortcut = args.tryKeyboardShortcut !== false;
+  const actionHint = typeof args.actionHint === "string" ? args.actionHint : "";
+  if (!selector) return "Error: selector is required";
+
+  const target = resolveElementTarget(selector, index);
+  if ("error" in target) return target.error;
+
+  const source = target.element;
+  const scope = findNearbySubmitScope(source);
+  const hints = buildSubmitActionHints(actionHint);
+  const candidates = collectSubmitActionCandidates(scope, hints);
+
+  if (candidates.length > 0) {
+    const best = candidates[0];
+    neutralizeAnchorBlankTarget(best.element);
+    dispatchElementClickSequence(best.element);
+    return JSON.stringify({
+      submitted: true,
+      method: "nearby_click",
+      selector,
+      scopeTag: scope.tagName.toLowerCase(),
+      targetTag: best.element.tagName.toLowerCase(),
+      targetText: best.text,
+      score: best.score
+    });
+  }
+
+  source.focus?.();
+  if (tryKeyboardShortcut) {
+    dispatchKeyboardSequence(source, "Enter", { ctrlKey: true });
+    dispatchKeyboardSequence(source, "Enter", { metaKey: true });
+    dispatchKeyboardSequence(source, "Enter");
+    return JSON.stringify({
+      submitted: true,
+      method: "keyboard_shortcut",
+      selector,
+      tried: ["Ctrl+Enter", "Meta+Enter", "Enter"]
+    });
+  }
+
+  const form = source.closest("form");
+  if (form) {
+    form.requestSubmit?.();
+    form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    return JSON.stringify({
+      submitted: true,
+      method: "form_submit",
+      selector
+    });
+  }
+
+  return `Error: no nearby submit action found for ${selector}[${index}]`;
 }
 
 async function dispatchDragSequence(
@@ -4893,6 +6210,7 @@ function agentHoverElement(args: Record<string, unknown>): string {
     element.dispatchEvent(new PointerEvent("pointerover", eventInit));
     element.dispatchEvent(new PointerEvent("pointerenter", eventInit));
   }
+  showAgentInteractionOverlayForElement(element, { clientX, clientY });
   element.dispatchEvent(new MouseEvent("mousemove", eventInit));
   element.dispatchEvent(new MouseEvent("mouseover", eventInit));
   element.dispatchEvent(new MouseEvent("mouseenter", eventInit));
@@ -4928,6 +6246,17 @@ function agentGetElementRect(args: Record<string, unknown>): string {
       devicePixelRatio: window.devicePixelRatio || 1
     }
   });
+}
+
+function agentPreviewElement(args: Record<string, unknown>): string {
+  const selector = typeof args.selector === "string" ? args.selector : "";
+  const index = typeof args.index === "number" ? args.index : 0;
+  if (!selector) return "Error: selector is required";
+
+  const target = resolveElementTarget(selector, index);
+  if ("error" in target) return target.error;
+  showAgentInteractionOverlayForElement(target.element);
+  return `Previewed ${selector}[${index}]`;
 }
 
 function agentMouseDown(args: Record<string, unknown>): string {
@@ -5093,9 +6422,12 @@ function agentSetCheckbox(args: Record<string, unknown>): string {
   }
 
   if (el.checked !== checked) {
-    el.checked = checked;
-    el.dispatchEvent(new Event("input", { bubbles: true }));
-    el.dispatchEvent(new Event("change", { bubbles: true }));
+    dispatchElementClickSequence(el);
+    if (el.checked !== checked) {
+      el.checked = checked;
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    }
   }
   return `Checkbox ${selector}[${index}] set to ${checked}`;
 }
@@ -5115,9 +6447,12 @@ function agentSetRadio(args: Record<string, unknown>): string {
   }
 
   if (!el.checked) {
-    el.checked = true;
-    el.dispatchEvent(new Event("input", { bubbles: true }));
-    el.dispatchEvent(new Event("change", { bubbles: true }));
+    dispatchElementClickSequence(el);
+    if (!el.checked) {
+      el.checked = true;
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    }
   }
   return `Radio ${selector}[${index}] selected`;
 }
@@ -5157,22 +6492,21 @@ function agentScrollPage(args: Record<string, unknown>): string {
     const el = document.querySelector(selector);
     if (!el) return `No element found for selector: ${selector}`;
     el.scrollIntoView({ behavior: "smooth", block: "center" });
+    followVirtualCursorAfterScroll();
     return `Scrolled to element: ${selector}`;
   }
 
   switch (direction) {
     case "up":
-      window.scrollBy(0, -pixels);
-      return `Scrolled up ${pixels}px`;
     case "down":
-      window.scrollBy(0, pixels);
-      return `Scrolled down ${pixels}px`;
     case "top":
-      window.scrollTo(0, 0);
-      return "Scrolled to top";
-    case "bottom":
-      window.scrollTo(0, document.body.scrollHeight);
-      return "Scrolled to bottom";
+    case "bottom": {
+      const result = scrollBestAvailableContainer(direction, pixels);
+      followVirtualCursorAfterScroll();
+      if (direction === "top") return `Scrolled to top via ${result.target}`;
+      if (direction === "bottom") return `Scrolled to bottom via ${result.target}`;
+      return `Scrolled ${direction} ${pixels}px via ${result.target}`;
+    }
     default:
       return `Unknown direction: ${direction}`;
   }
@@ -5192,21 +6526,27 @@ function agentScrollElement(args: Record<string, unknown>): string {
   switch (direction) {
     case "up":
       element.scrollBy({ top: -pixels, behavior: "auto" });
+      followVirtualCursorAfterScroll();
       return `Scrolled ${selector}[${index}] up ${pixels}px`;
     case "down":
       element.scrollBy({ top: pixels, behavior: "auto" });
+      followVirtualCursorAfterScroll();
       return `Scrolled ${selector}[${index}] down ${pixels}px`;
     case "left":
       element.scrollBy({ left: -pixels, behavior: "auto" });
+      followVirtualCursorAfterScroll();
       return `Scrolled ${selector}[${index}] left ${pixels}px`;
     case "right":
       element.scrollBy({ left: pixels, behavior: "auto" });
+      followVirtualCursorAfterScroll();
       return `Scrolled ${selector}[${index}] right ${pixels}px`;
     case "top":
       element.scrollTo({ top: 0, behavior: "auto" });
+      followVirtualCursorAfterScroll();
       return `Scrolled ${selector}[${index}] to top`;
     case "bottom":
       element.scrollTo({ top: element.scrollHeight, behavior: "auto" });
+      followVirtualCursorAfterScroll();
       return `Scrolled ${selector}[${index}] to bottom`;
     default:
       return `Unknown direction: ${direction}`;
@@ -5908,12 +7248,16 @@ function executeAgentTool(
       return agentReadPageContent(args);
     case "query_selector":
       return agentQuerySelector(args);
+    case "collect_elements":
+      return agentCollectElements(args);
     case "find_interactive_elements":
       return agentFindInteractiveElements(args);
     case "smart_click":
       return agentSmartClick(args);
     case "click_element":
       return agentClickElement(args);
+    case "submit_nearby_form_action":
+      return agentSubmitNearbyFormAction(args);
     case "set_checkbox":
       return agentSetCheckbox(args);
     case "set_radio":
@@ -5922,6 +7266,8 @@ function executeAgentTool(
       return agentHoverElement(args);
     case "get_element_rect":
       return agentGetElementRect(args);
+    case "preview_element":
+      return agentPreviewElement(args);
     case "mouse_down":
       return agentMouseDown(args);
     case "mouse_move":

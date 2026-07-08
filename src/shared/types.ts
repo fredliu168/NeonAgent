@@ -50,6 +50,8 @@ export interface LLMConfig {
    * "blocks" – convert to content[].thinking blocks (Anthropic-compatible APIs)
    */
   thinkingFormat: "none" | "field" | "blocks";
+  /** Whether the solve button (askAndAutoFill) has been unlocked with the secret code. */
+  solveButtonUnlocked?: boolean;
 }
 
 export interface FeatureFlags {

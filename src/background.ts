@@ -579,8 +579,7 @@ async function cropImageDataUrl(input: {
   imageDataUrl: string;
   rect: { left: number; top: number; width: number; height: number };
 }): Promise<string> {
-  const response = await fetch(input.imageDataUrl);
-  const blob = await response.blob();
+  const blob = dataUrlToBlob(input.imageDataUrl);
   const bitmap = await createImageBitmap(blob);
 
   const left = Math.max(0, Math.floor(input.rect.left));
@@ -603,6 +602,29 @@ async function cropImageDataUrl(input: {
     binary += String.fromCharCode(byte);
   }
   return `data:image/png;base64,${btoa(binary)}`;
+}
+
+function dataUrlToBlob(dataUrl: string): Blob {
+  const match = dataUrl.match(/^data:([^;,]+)?(?:;charset=[^;,]+)?(;base64)?,(.*)$/s);
+  if (!match) {
+    throw new Error("Invalid data URL");
+  }
+
+  const mimeType = match[1] || "application/octet-stream";
+  const isBase64 = match[2] === ";base64";
+  const payload = match[3] || "";
+
+  if (isBase64) {
+    const decoded = atob(payload);
+    const bytes = new Uint8Array(decoded.length);
+    for (let index = 0; index < decoded.length; index += 1) {
+      bytes[index] = decoded.charCodeAt(index);
+    }
+    return new Blob([bytes], { type: mimeType });
+  }
+
+  const decoded = decodeURIComponent(payload);
+  return new Blob([decoded], { type: mimeType });
 }
 
 function parseTranslationResponse(content: string, expectedCount: number): string[] {
@@ -1346,6 +1368,16 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
 
         if (selector) {
           try {
+            void sendTabMessage(tabId, {
+              type: "AGENT_TOOL_EXECUTE",
+              payload: {
+                toolName: "preview_element",
+                arguments: {
+                  selector,
+                  index: selectorIndex
+                }
+              }
+            }).catch(() => undefined);
             const rectResponse = await sendTabMessage(tabId, {
               type: "AGENT_TOOL_EXECUTE",
               payload: {
@@ -1412,6 +1444,16 @@ export function createBackgroundMessageHandler(storage: StorageLike, deps: Backg
       }
 
       try {
+        void sendTabMessage(tabId, {
+          type: "AGENT_TOOL_EXECUTE",
+          payload: {
+            toolName: "preview_element",
+            arguments: {
+              selector,
+              index: selectorIndex
+            }
+          }
+        }).catch(() => undefined);
         const rectResponse = await sendTabMessage(tabId, {
           type: "AGENT_TOOL_EXECUTE",
           payload: {

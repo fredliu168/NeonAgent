@@ -25,8 +25,15 @@ import { formatScheduledTasksForPrompt } from "./agentScheduler.js";
 import type { ScriptSkill } from "./agentScriptSkill.js";
 import { formatScriptSkillsForPrompt, generateScriptSkillToolDefs, getScriptSkillToolNames } from "./agentScriptSkill.js";
 
-const DEFAULT_MAX_ITERATIONS = 100;
+const DEFAULT_MAX_ITERATIONS = 300;
 const TOOL_RESULT_MODEL_OUTPUT_LIMIT = 1200;
+
+interface RecentToolObservation {
+  toolName: string;
+  argsSignature: string;
+  outputSignature: string;
+  repeatCount: number;
+}
 
 export interface AgentLoopDeps {
   /** Emit a progress event to the UI (sidepanel) */
@@ -183,6 +190,7 @@ export async function runAgentLoop(
 
   // Add the new user message
   messages.push({ role: "user", content: config.userMessage });
+  let recentToolObservation: RecentToolObservation | null = null;
 
   // Agent loop
   for (let iteration = 0; iteration < maxIter; iteration++) {
@@ -307,8 +315,31 @@ export async function runAgentLoop(
       try {
         const args = safeParseArgs(tc.function.arguments);
         const toolName = tc.function.name;
+        const argsSignature = buildToolArgsSignature(args);
 
-        if (toolName === "load_tool_category") {
+        if (
+          toolName === "collect_elements" &&
+          recentToolObservation &&
+          recentToolObservation.toolName === toolName &&
+          recentToolObservation.argsSignature === argsSignature &&
+          recentToolObservation.repeatCount >= 0
+        ) {
+          result = {
+            toolCallId: tc.id,
+            toolName,
+            output: [
+              "Error: repeated collect_elements with the same selector/arguments produced no new progress.",
+              "Use the returned index/attributes from the previous result to choose an action tool instead of collecting again.",
+              `Previous result summary: ${recentToolObservation.outputSignature}`
+            ].join(" "),
+            isError: true,
+            modelOutput: [
+              `[tool:${toolName}] error: repeated identical observation call.`,
+              "Do not call collect_elements again with the same arguments right now.",
+              "Read the previous result and switch to an execution tool such as set_radio, set_checkbox, click_element, smart_click, or query a different selector if evidence is missing."
+            ].join(" ")
+          };
+        } else if (toolName === "load_tool_category") {
           const category = String(args.category);
           if (!TOOL_CATEGORIES[category as ToolCategory]) {
             result = {
@@ -362,6 +393,22 @@ export async function runAgentLoop(
           isError: true
         };
       }
+
+      const currentObservation: RecentToolObservation = {
+        toolName: tc.function.name,
+        argsSignature: buildToolArgsSignature(safeParseArgs(tc.function.arguments)),
+        outputSignature: truncateForModel(
+          result.modelOutput ?? summarizeToolOutputForModel(result),
+          280
+        ),
+        repeatCount:
+          recentToolObservation &&
+          recentToolObservation.toolName === tc.function.name &&
+          recentToolObservation.argsSignature === buildToolArgsSignature(safeParseArgs(tc.function.arguments))
+            ? recentToolObservation.repeatCount + 1
+            : 0
+      };
+      recentToolObservation = currentObservation;
 
       // Emit tool result
       await deps.emit({
@@ -462,6 +509,37 @@ function summarizeJsonValue(value: unknown): string {
   }
   if (value && typeof value === "object") {
     const record = value as Record<string, unknown>;
+    if (Array.isArray(record.items)) {
+      const itemPreview = record.items
+        .slice(0, 3)
+        .map((item, index) => `item${index}=${summarizeJsonValue(item)}`)
+        .join(" | ");
+      const selector = typeof record.selector === "string" ? record.selector : "";
+      const count = typeof record.count === "number" ? record.count : Array.isArray(record.items) ? record.items.length : 0;
+      return `JSON object collect_result(selector=${selector}, count=${count}) ${itemPreview}`;
+    }
+    if (
+      typeof record.index === "number" ||
+      typeof record.tagName === "string" ||
+      record.attributes
+    ) {
+      const previewParts: string[] = [];
+      if (typeof record.index === "number") previewParts.push(`index=${record.index}`);
+      if (typeof record.tagName === "string") previewParts.push(`tag=${record.tagName}`);
+      if (typeof record.selector === "string") previewParts.push(`selector=${truncateForModel(record.selector, 80)}`);
+      if (record.attributes && typeof record.attributes === "object") {
+        const attrs = record.attributes as Record<string, unknown>;
+        const attrPreview = Object.keys(attrs)
+          .slice(0, 5)
+          .map((key) => `${key}:${summarizeJsonPrimitive(attrs[key])}`)
+          .join(", ");
+        if (attrPreview) previewParts.push(`attrs={${attrPreview}}`);
+      }
+      if (typeof record.text === "string" && record.text.trim()) {
+        previewParts.push(`text=${truncateForModel(record.text.trim(), 100)}`);
+      }
+      return `JSON element ${previewParts.join(", ")}`;
+    }
     const keys = Object.keys(record);
     const preview = keys.slice(0, 6).map((key) => `${key}=${summarizeJsonPrimitive(record[key])}`);
     return `JSON object(keys=${keys.length}) ${preview.join(", ")}`;
@@ -526,6 +604,14 @@ function safeParseArgs(argsStr: string): Record<string, unknown> {
     return JSON.parse(argsStr) as Record<string, unknown>;
   } catch {
     return { _raw: argsStr };
+  }
+}
+
+function buildToolArgsSignature(args: Record<string, unknown>): string {
+  try {
+    return JSON.stringify(args, Object.keys(args).sort());
+  } catch {
+    return String(args._raw ?? "[unserializable_args]");
   }
 }
 
